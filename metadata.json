@@ -1,0 +1,6 @@
+{
+  "name": "Portal Fimaster",
+  "description": "Portal de autoatendimento exclusivo para clientes Portal Fimaster para gerenciar licenças, robôs de trading (EA MT5) e solicitar reembolsos.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,39 @@
+{
+  "rules": {
+    "dados": {
+      "usuarios": {
+        ".read": "true",
+        "$userId": {
+          ".read": "true",
+          ".write": "true"
+        }
+      },
+      "indices": {
+        ".read": "true",
+        ".write": "true"
+      },
+      "parametros": {
+        ".read": "true",
+        "$mt5Id": {
+          ".write": "true"
+        }
+      },
+      "status": {
+        ".read": "true",
+        "$mt5Id": {
+          ".write": "true"
+        }
+      },
+      "eventos": {
+        ".read": "true",
+        "$mt5Id": {
+          ".write": "true"
+        }
+      },
+      "versao": {
+        ".read": "true",
+        ".write": "true"
+      }
+    }
+  }
+}

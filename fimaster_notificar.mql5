@@ -1,0 +1,1180 @@
+//+------------------------------------------------------------------+
+//|                                         fimaster_notificar.mql5  |
+//|                                 Copyright 2026, Jossias Macucul  |
+//|                                      https://bit.ly/4jJQJsl      |
+//+------------------------------------------------------------------+
+//| PROPRIEDADE DO COPYRIGHT E AUTORIA DO SCRIPT                     |
+#property copyright "Criado por: jossias macucul"
+//| VERSÃO ATUALIZADA DO MÓDULO EA FIMASTER                          |
+#property version   "13.0"
+//| DESCRIÇÃO SINTÉTICA DO MÓDULO DE NOTIFICAÇÃO E TELEMETRIA        |
+#property description "Modulo de Notificacao e Transicao de Estados - EA FIMASTER"
+//| COMPILAÇÃO EM MODO ESTRITO COM VERIFICAÇÃO RIGOROSA DE TIPOS     |
+#property strict
+
+// ====================================================================
+// 📊 ESTRUTURAS E ENUMS DO SISTEMA (CONFORME MAPEAMENTO DO APLICATIVO)
+// ====================================================================
+
+// Enumeração que identifica o subsistema envolvido na transição de estado
+enum TIPO_ESTADO_SISTEMA
+  {
+   SISTEMA_ROBO,    // Subsistema de execução de ordens do robô
+   SISTEMA_SICLO,   // Subsistema de ciclo de canais (Compra/Venda)
+   SISTEMA_PRECOS   // Subsistema de organização da estrutura de preços
+  };
+
+// Enumeração que define a etapa atual de análise da estrutura de preços do ativo
+enum ESTADO_DE_PRECOS
+  {
+   ESTADO_NOVO_CICLO,           // Início de um novo ciclo de preços
+   ESTADO_EXPANSAO_RANGE,       // Expansão da faixa de negociação
+   ESTADO_AJUSTE_CANAL,         // Ajuste fino do canal dinâmico
+   ESTADO_CANAL_PRONTO,         // Canal pronto para rompimento
+   ESTADO_ROMPIMENTO_CIMA,      // Rompimento confirmado para cima
+   ESTADO_ROMPIMENTO_BAIXO,     // Rompimento confirmado para baixo
+   ESTADO_DE_PRECOS_CONCLUIDO   // Conclusão da análise da estrutura de preços
+  };
+
+// Enumeração do ciclo de canais operacionais
+enum ESTADO_SICLO
+  {
+   ESTADO_SICLO_DE_CANAL_INICIAL,           // Canal inicial aguardando sinal
+   ESTADO_SICLO_DE_CANAL_COMPRA,            // Tendência de alta ativa (Compra)
+   ESTADO_SICLO_DE_CANAL_VENDA,             // Tendência de baixa ativa (Venda)
+   ESTADO_SICLO_DE_CANAL_COMPRA_FINALIZADO, // Operações de compra encerradas
+   ESTADO_SICLO_DE_CANAL_VENDA_FINALIZADO   // Operações de venda encerradas
+  };
+
+// Enumeração dos estados operacionais e execução de ordens do robô
+enum ESTADO_ROBO
+  {
+   ESTADO_DE_EXECUCAO_INICIAL = 0,        // Inicialização de variáveis e rotinas
+   ESTADO_DE_EXECUCAO_COMPRA_INICIAL,     // Disparo de ordem de compra inicial
+   ESTADO_DE_EXECUCAO_VENDA_INICIAL,      // Disparo de ordem de venda inicial
+   ESTADO_DE_EXECUCAO_COMPRA_POSICAO,     // Gestão de posição aberta de compra
+   ESTADO_DE_EXECUCAO_VENDA_POSICAO,      // Gestão de posição aberta de venda
+   ESTADO_DE_EXECUCAO_MODIFICAR,          // Modificação de ordens
+   ESTADO_DE_EXECUCAO_MODIFICAR_COMPRA,   // Modificação de ordens de compra
+   ESTADO_DE_EXECUCAO_MODIFICAR_VENDA,    // Modificação de ordens de venda
+   ESTADO_DE_EXECUCAO_REPOUSO             // Aguardando novas oportunidades
+  };
+
+// Enumeração que controla o estado da linha do equador e zonas dinâmicas
+enum EST_EQUADOR
+  {
+   EQ_NEUTRO = 0,        // Estado neutro sem viés definido
+   EQ_ATUALIZAR_ALTA,    // Sinal de atualização para zona de alta
+   EQ_ATUALIZAR_BAIXA,   // Sinal de atualização para zona de baixa
+   EQ_ALTA_Z1,           // Zona 1 de expansão de alta
+   EQ_ALTA_Z2,           // Zona 2 de expansão de alta
+   EQ_ALTA_Z3,           // Zona 3 de expansão de alta
+   EQ_BAIXA_Z1,          // Zona 1 de expansão de baixa
+   EQ_BAIXA_Z2,          // Zona 2 de expansão de baixa
+   EQ_BAIXA_Z3           // Zona 3 de expansão de baixa
+  };
+
+// Estrutura com horário de início e fim da sessão Forex
+struct SessaoForex
+  {
+   int               inicio_hora;   // Hora de abertura da sessão (0-23)
+   int               inicio_minuto; // Minuto de abertura da sessão (0-59)
+   int               fim_hora;      // Hora de fecho da sessão (0-23)
+   int               fim_minuto;    // Minuto de fecho da sessão (0-59)
+  };
+
+// Estrutura para controle e deteção de transição da sessão Forex
+struct ControleSessao
+  {
+   bool              estavaNaSessao; // Indica se o robô já estava dentro da sessão na última leitura
+  };
+
+// ====================================================================
+// ⚙️ VARIÁVEIS DE ENTRADA (INPUTS) E ESTADO GLOBAL
+// ====================================================================
+// Habilita ou desabilita o envio de relatórios via e-mail SMTP nativo do MetaTrader 5
+input bool GMAIL = true;
+
+// Habilita ou desabilita os alertas visuais e sonoros na tela do MetaTrader 5
+input bool notific = true;
+
+// Habilita ou desabilita a sincronização HTTP REST com o Firebase Realtime Database
+input bool enviar_http = true;
+
+// URL base do banco de dados Firebase Realtime Database
+input string server_url = "https://fimaster-sms-gateway-default-rtdb.firebaseio.com";
+
+// Senha de autenticação ou token de segurança para requisições restritas do Firebase (opcional)
+input string auth_key = "";
+
+// Estado global de ativação do robô (sincronizado automaticamente via aplicativo)
+bool g_ea_ativo = true;
+
+// Nome do objeto gráfico da interface móvel no MetaTrader 5
+#define PAINEL_STATUS_NOME "Fimaster_Status_Panel"
+
+// Timestamp do último teste e leitura de parâmetros vindos do Firebase
+datetime g_last_config_check = 0;
+
+// Instâncias globais das máquinas de estado do EA
+ESTADO_DE_PRECOS estado_organizacao_de_precos = ESTADO_EXPANSAO_RANGE;
+
+// Enumeração dos temas de cores suportados pelo EA
+enum ENUM_ESQUEMA_CORES
+  {
+   CORES_CYAN_NEON = 0,    // Cyan Neon (#22D3EE, #FF00E5, #FFFF00)
+   CORES_DARK_MATRIX,      // Dark Matrix (#00FF66, #008000, #00FFCC)
+   CORES_GOLDEN_PRO,       // Golden Pro (#FFD700, #FF8C00, #FFFFFF)
+   CORES_PURPLE_NIGHT,     // Purple Night (#A855F7, #EC4899, #38BDF8)
+   CORES_CLASSIC_BLUE,     // Classic Blue (#3B82F6, #1D4ED8, #60A5FA)
+   CORES_CUSTOM            // Personalizado (Usa Códigos Hex Digitados)
+  };
+
+ENUM_ESQUEMA_CORES g_esquema_cores_enum = CORES_CYAN_NEON;
+color g_cor_canal   = C'34,211,238';  // #22D3EE
+color g_cor_linhas  = C'255,0,229';   // #FF00E5
+color g_cor_equador = C'255,255,0';   // #FFFF00
+
+// Converte string Hex (#RRGGBB) para tipo color no MQL5
+color HexToColor(string hexStr)
+  {
+   StringReplace(hexStr, "#", "");
+   if(StringLen(hexStr) != 6) return clrCyan;
+   long r = StringToInteger("0x" + StringSubstr(hexStr, 0, 2));
+   long g = StringToInteger("0x" + StringSubstr(hexStr, 2, 2));
+   long b = StringToInteger("0x" + StringSubstr(hexStr, 4, 2));
+   return (color)((b << 16) | (g << 8) | r);
+  }
+
+void AplicarEsquemaCoresEA(string enumStr, string hexCanal, string hexLinhas, string hexEquador)
+  {
+   if(enumStr == "DARK_MATRIX")
+     {
+      g_esquema_cores_enum = CORES_DARK_MATRIX;
+      g_cor_canal   = HexToColor("#00FF66");
+      g_cor_linhas  = HexToColor("#008000");
+      g_cor_equador = HexToColor("#00FFCC");
+     }
+   else if(enumStr == "GOLDEN_PRO")
+     {
+      g_esquema_cores_enum = CORES_GOLDEN_PRO;
+      g_cor_canal   = HexToColor("#FFD700");
+      g_cor_linhas  = HexToColor("#FF8C00");
+      g_cor_equador = HexToColor("#FFFFFF");
+     }
+   else if(enumStr == "PURPLE_NIGHT")
+     {
+      g_esquema_cores_enum = CORES_PURPLE_NIGHT;
+      g_cor_canal   = HexToColor("#A855F7");
+      g_cor_linhas  = HexToColor("#EC4899");
+      g_cor_equador = HexToColor("#38BDF8");
+     }
+   else if(enumStr == "CLASSIC_BLUE")
+     {
+      g_esquema_cores_enum = CORES_CLASSIC_BLUE;
+      g_cor_canal   = HexToColor("#3B82F6");
+      g_cor_linhas  = HexToColor("#1D4ED8");
+      g_cor_equador = HexToColor("#60A5FA");
+     }
+   else if(enumStr == "CUSTOM")
+     {
+      g_esquema_cores_enum = CORES_CUSTOM;
+      g_cor_canal   = HexToColor(hexCanal);
+      g_cor_linhas  = HexToColor(hexLinhas);
+      g_cor_equador = HexToColor(hexEquador);
+     }
+   else // CYAN_NEON default
+     {
+      g_esquema_cores_enum = CORES_CYAN_NEON;
+      g_cor_canal   = HexToColor(hexCanal != "" ? hexCanal : "#22D3EE");
+      g_cor_linhas  = HexToColor(hexLinhas != "" ? hexLinhas : "#FF00E5");
+      g_cor_equador = HexToColor(hexEquador != "" ? hexEquador : "#FFFF00");
+     }
+   Print(StringFormat("🎨 ESQUEMA DE CORES APLICADO NO EA: Enum=%s | Canal=%X | Linhas=%X | Equador=%X", enumStr, g_cor_canal, g_cor_linhas, g_cor_equador));
+  }
+ESTADO_SICLO     ESTADO_SICLO_DE_CANAL        = ESTADO_SICLO_DE_CANAL_INICIAL;
+ESTADO_ROBO      ESTADO_DE_EXECUCAO           = ESTADO_DE_EXECUCAO_INICIAL;
+EST_EQUADOR      estado_equador               = EQ_NEUTRO;
+
+// ====================================================================
+// 🔑 SEÇÃO DE EXTRAÇÃO DA CONTA MT5 E CONSTRUÇÃO DE NÓS DO FIREBASE
+// ====================================================================
+
+//+------------------------------------------------------------------+
+//| Retorna o número da conta MT5 ativa no terminal como string      |
+//| Utiliza estritamente a função nativa ACCOUNT_LOGIN                |
+//+------------------------------------------------------------------+
+string ObterContaMt5Login()
+  {
+   // Obtém o número da conta no MetaTrader 5
+   long login = AccountInfoInteger(ACCOUNT_LOGIN);
+   
+   // Converte o identificador numérico da conta MT5 em formato texto
+   return IntegerToString(login);
+  }
+
+//+------------------------------------------------------------------+
+//| Higieniza e retorna a URL base do Firebase Realtime Database     |
+//+------------------------------------------------------------------+
+string ObterBaseUrlFirebase()
+  {
+   // Inicia com o valor do input server_url
+   string cleaned = server_url;
+   
+   // Localiza a extensão principal do domínio Firebase
+   int pos = StringFind(cleaned, ".firebaseio.com");
+   if(pos != -1)
+     {
+      // Retorna até o final do domínio .firebaseio.com
+      return StringSubstr(cleaned, 0, pos + 15);
+     }
+     
+   // Trata possíveis sufixos /dados/ na URL base
+   pos = StringFind(cleaned, "/dados/");
+   if(pos != -1)
+     {
+      return StringSubstr(cleaned, 0, pos);
+     }
+     
+   // Remove barras finais redundantes
+   while(StringLen(cleaned) > 0 && StringSubstr(cleaned, StringLen(cleaned) - 1, 1) == "/")
+     {
+      cleaned = StringSubstr(cleaned, 0, StringLen(cleaned) - 1);
+     }
+     
+   return cleaned;
+  }
+
+//+------------------------------------------------------------------+
+//| Retorna o endpoint do nó /dados/parametros/{ACCOUNT_LOGIN}.json  |
+//| Extrai a conta diretamente de ACCOUNT_LOGIN                       |
+//+------------------------------------------------------------------+
+string ObterConfigEndpointFirebase()
+  {
+   // Obtém a URL base limpa do Firebase Database
+   string baseUrl = ObterBaseUrlFirebase();
+   
+   // Extrai o número da conta MT5 usando a função ACCOUNT_LOGIN
+   string loginStr = ObterContaMt5Login();
+   
+   // Constrói o caminho exato do nó de parâmetros no banco de dados
+   string path = StringFormat("%s/dados/parametros/%s.json", baseUrl, loginStr);
+   
+   // Anexa a senha/token de autenticação caso fornecida
+   if(auth_key != "")
+     {
+      path = path + "?auth=" + auth_key;
+     }
+     
+   return path;
+  }
+
+//+------------------------------------------------------------------+
+//| Retorna o endpoint do nó /dados/status/{ACCOUNT_LOGIN}.json      |
+//| Extrai a conta diretamente de ACCOUNT_LOGIN                       |
+//+------------------------------------------------------------------+
+string ObterStatusEndpointFirebase()
+  {
+   // Obtém a URL base limpa do Firebase Database
+   string baseUrl = ObterBaseUrlFirebase();
+   
+   // Extrai o número da conta MT5 usando a função ACCOUNT_LOGIN
+   string loginStr = ObterContaMt5Login();
+   
+   // Constrói o caminho do nó de status e telemetria do robô
+   string path = StringFormat("%s/dados/status/%s.json", baseUrl, loginStr);
+   
+   // Anexa a senha/token de autenticação caso fornecida
+   if(auth_key != "")
+     {
+      path = path + "?auth=" + auth_key;
+     }
+     
+   return path;
+  }
+
+//+------------------------------------------------------------------+
+//| Retorna o endpoint do nó /dados/eventos/{ACCOUNT_LOGIN}.json     |
+//| Extrai a conta diretamente de ACCOUNT_LOGIN                       |
+//+------------------------------------------------------------------+
+string ObterEventosEndpointFirebase(string nomeEvento = "")
+  {
+   // Obtém a URL base limpa do Firebase Database
+   string baseUrl = ObterBaseUrlFirebase();
+   
+   // Extrai o número da conta MT5 usando a função ACCOUNT_LOGIN
+   string loginStr = ObterContaMt5Login();
+   
+   // Remove extensão .json caso o parâmetro nomeEvento contenha
+   string cleanEvent = nomeEvento;
+   int jsonPos = StringFind(cleanEvent, ".json");
+   if(jsonPos != -1)
+     {
+      cleanEvent = StringSubstr(cleanEvent, 0, jsonPos);
+     }
+     
+   // Define o caminho do nó de eventos históricos
+   string path = "";
+   if(cleanEvent != "")
+      path = StringFormat("%s/dados/eventos/%s/%s.json", baseUrl, loginStr, cleanEvent);
+   else
+      path = StringFormat("%s/dados/eventos/%s.json", baseUrl, loginStr);
+      
+   // Anexa a senha/token de autenticação caso fornecida
+   if(auth_key != "")
+     {
+      path = path + "?auth=" + auth_key;
+     }
+     
+   return path;
+  }
+
+// ====================================================================
+// ✉️ SEÇÃO DE REQUISIÇÕES HTTP REST E E-MAILS
+// ====================================================================
+
+//+------------------------------------------------------------------+
+//| Executa uma chamada HTTP/REST via WebRequest nativa do MetaTrader|
+//+------------------------------------------------------------------+
+int EnviarRequisicaoHTTP(string metodo, string endpoint, string payload)
+  {
+   // Cancela o envio se as requisições HTTP estiverem desativadas nos inputs
+   if(!enviar_http)
+      return 0;
+
+   // Define o cabeçalho padrão para envio e leitura em formato JSON
+   string headers = "Content-Type: application/json\r\n";
+   char data[];
+   char result[];
+   string result_headers;
+   
+   // Converte a string contendo o JSON em um array de caracteres (bytes)
+   StringToCharArray(payload, data, 0, StringLen(payload));
+   
+   // Executa a chamada WebRequest HTTP com timeout de 5000ms
+   int res = WebRequest(metodo, endpoint, headers, 5000, data, result, result_headers);
+   
+   // Tratamento de falhas na execução da requisição
+   if(res == -1)
+     {
+      Print("❌ WebRequest Error: ", GetLastError());
+      if(GetLastError() == 4014)
+        {
+         Print("⚠️ Erro 4014: URL não permitida nas configurações do MetaTrader. Adicione a URL em Ferramentas -> Opções -> Expert Advisors.");
+        }
+     }
+   else
+     {
+      // Converte o resultado retornado em string e exibe no log do terminal
+      string responseStr = CharArrayToString(result);
+      Print("🔹 Resposta do Servidor (", metodo, ", Status: ", res, "): ", responseStr);
+     }
+     
+   return res;
+  }
+
+//+------------------------------------------------------------------+
+//| Atalho para enviar uma requisição HTTP POST (Criação de Registros)|
+//+------------------------------------------------------------------+
+int EnviarPostHTTP(string endpoint, string payload)
+  {
+   return EnviarRequisicaoHTTP("POST", endpoint, payload);
+  }
+
+//+------------------------------------------------------------------+
+//| Atalho para enviar uma requisição HTTP PUT (Atualização Direta)  |
+//+------------------------------------------------------------------+
+int EnviarPutHTTP(string endpoint, string payload)
+  {
+   return EnviarRequisicaoHTTP("PUT", endpoint, payload);
+  }
+
+//+------------------------------------------------------------------+
+//| Função principal de envio de e-mail via SendMail nativo do MT5  |
+//+------------------------------------------------------------------+
+void SendMailMQL5(string subject, string body)
+  {
+   // Verifica se o recurso de envio de e-mail está ativado
+   if(GMAIL == true)
+     {
+      // Chama a função nativa SendMail do MetaTrader 5
+      if(!SendMail(subject, body))
+         Print("❌ Erro ao enviar e-mail: ", GetLastError());
+      else
+         Print("📧 E-mail enviado com sucesso! Assunto: ", subject);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Envia relatório por e-mail e salva o evento de inicialização EA   |
+//+------------------------------------------------------------------+
+void EnviarEmailInicializacao()
+  {
+   // Define o assunto do e-mail de inicialização
+   string assunto = "🚀 EA FIMASTER INICIALIZADO - " + _Symbol;
+   
+   // Monta o corpo HTML com estilo formatado
+   string corpo =
+      "<html>"
+      "<body style='font-family: Arial, sans-serif; font-size:12px; color:#222; background-color:#f7f7f7;'>"
+      "<div style='background-color:#eaeaea; border-radius:15px; padding:20px;'>"
+      "<h2 style='text-align:center;'>🚀 EA FIMASTER INICIALIZADO</h2>"
+      "<p><b>Conta MT5:</b> " + ObterContaMt5Login() + "</p>"
+      "<p><b>Ativo:</b> " + _Symbol + "</p>"
+      "<p><b>Servidor:</b> " + AccountInfoString(ACCOUNT_SERVER) + "</p>"
+      "</div></body></html>";
+
+   // Envia o e-mail via SendMail
+   SendMailMQL5(assunto, corpo);
+
+   // Constrói o JSON com os dados da conta extraída de ACCOUNT_LOGIN
+   string payload = StringFormat(
+      "{\"event\":\"inicializacao\",\"symbol\":\"%s\",\"login\":%s,\"server\":\"%s\",\"timeframe\":\"%s\",\"currency\":\"%s\",\"timestamp\":%d}",
+      _Symbol,
+      ObterContaMt5Login(),
+      AccountInfoString(ACCOUNT_SERVER),
+      EnumToString((ENUM_TIMEFRAMES)_Period),
+      AccountInfoString(ACCOUNT_CURRENCY),
+      (int)TimeCurrent()
+   );
+   
+   // Envia o evento de inicialização para o nó /dados/eventos/{ACCOUNT_LOGIN}.json
+   EnviarPostHTTP(ObterEventosEndpointFirebase("inicializacao"), payload);
+  }
+
+//+------------------------------------------------------------------+
+//| Notifica mudanças de estado por e-mail e salva em /dados/eventos |
+//+------------------------------------------------------------------+
+void EnviarEmailEstado(
+   TIPO_ESTADO_SISTEMA tipoSistema,
+   string estadoAnterior,
+   string estadoNovo,
+   string descAnterior,
+   string descNovo
+)
+  {
+   // Define o nome legível do subsistema
+   string sistemaNome;
+   switch(tipoSistema)
+     {
+      case SISTEMA_ROBO:   sistemaNome = "ESTADO DE EXECUÇÃO"; break;
+      case SISTEMA_SICLO:  sistemaNome = "ESTADO DE CANAL"; break;
+      case SISTEMA_PRECOS: sistemaNome = "ESTADO DE PREÇOS"; break;
+      default:             sistemaNome = "SISTEMA DESCONHECIDO"; break;
+     }
+
+   // Monta o assunto do e-mail
+   string assunto = StringFormat("[%s] MUDANÇA DE ESTADO - %s", _Symbol, sistemaNome);
+   string mensagem = StringFormat("Transição no ativo %s (Conta MT5: %s): De %s para %s", _Symbol, ObterContaMt5Login(), estadoAnterior, estadoNovo);
+
+   // Envia o e-mail
+   SendMailMQL5(assunto, mensagem);
+
+   // Constrói o objeto JSON da mudança de estado
+   string payload = StringFormat(
+      "{\"event\":\"mudanca_estado\",\"sistema\":\"%s\",\"login\":%s,\"symbol\":\"%s\",\"anterior\":\"%s\",\"novo\":\"%s\",\"descAnterior\":\"%s\",\"descNovo\":\"%s\",\"timestamp\":%d}",
+      sistemaNome,
+      ObterContaMt5Login(),
+      _Symbol,
+      estadoAnterior,
+      estadoNovo,
+      descAnterior,
+      descNovo,
+      (int)TimeCurrent()
+   );
+   
+   // Publica o evento no Firebase
+   EnviarPostHTTP(ObterEventosEndpointFirebase("mudanca_estado"), payload);
+  }
+
+// ====================================================================
+// 📊 SEÇÃO DE MAQUINA DE ESTADO, SESSÕES E SINCRONIZAÇÃO EM TEMPO REAL
+// ====================================================================
+
+//+------------------------------------------------------------------+
+//| Retorna o fuso horário em horas do servidor MT5 em relação ao UTC|
+//+------------------------------------------------------------------+
+int ObterFusoServidor()
+  {
+   // Calcula a diferença em segundos entre a hora atual do servidor e GMT, convertendo em horas
+   int offset = (int)((TimeCurrent() - TimeGMT()) / 3600);
+   return offset;
+  }
+
+//+------------------------------------------------------------------+
+//| Retorna o fuso horário formatado em texto (ex: GMT+2)            |
+//+------------------------------------------------------------------+
+string ObterFusoTexto()
+  {
+   int offset = ObterFusoServidor();
+   if(offset >= 0)
+      return "GMT+" + IntegerToString(offset);
+   else
+      return "GMT" + IntegerToString(offset);
+  }
+
+//+------------------------------------------------------------------+
+//| Verifica se existe posição aberta no terminal para o ativo atual|
+//+------------------------------------------------------------------+
+bool ExistePosicaoAberta(string symbol)
+  {
+   // Obtém o número total de posições ativas na conta
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+     {
+      // Verifica o símbolo correspondente de cada posição
+      string pos_symbol = PositionGetSymbol(i);
+      if(pos_symbol == symbol)
+        {
+         return true; // Posição encontrada
+        }
+     }
+   return false; // Nenhuma posição aberta para este ativo
+  }
+
+// ====================================================================
+// 📊 ENUMS DE CONFIGURAÇÃO SOLICITADOS PELO APLICATIVO
+// ====================================================================
+enum tendencia
+  {
+   TENDENCIA_DE_ALTA,
+   TENDENCIA_DE_BAIXA
+  };
+
+enum Estrategia
+  {
+   FIMATHE,
+   F_SURFADA
+  };
+
+enum AUTO_PERIODO
+  {
+   MANUAL,
+   SESSOES,
+   SEMANAL,
+   DIARIO,
+   HORAS_8,
+   HORA_1
+  };
+
+// Variáveis globais dos parâmetros operacionais
+// 1. Conexão e Licença
+string       g_param_senha         = "123456";
+
+// 2. Painel & Moeda / Câmbio
+double       g_param_cambio        = 64.0;
+string       g_param_moeda         = "Meticais";
+
+// 3. Canais de Tendência
+tendencia    g_param_tendencia     = TENDENCIA_DE_ALTA;
+bool         g_param_linhas_eq     = false;
+double       g_param_equador_alta  = 1.2500;
+double       g_param_equador_baixa = 1.2400;
+
+// 4. Estratégia Principal
+Estrategia   g_param_estrategia    = FIMATHE;
+string       g_param_timeframe     = "PERIOD_M15";
+double       g_param_lote          = 0.01;
+double       g_param_niveis        = 1.0;
+bool         g_param_costurar      = true;
+bool         g_param_virada_jogo   = false;
+
+// 5. Posicionamento de Ordem
+double       g_param_compra        = 1.2550;
+double       g_param_venda         = 1.2500;
+double       g_param_santo         = 20.0;
+double       g_param_dedo          = 10.0;
+bool         g_param_posicao_take  = false;
+double       g_param_buy_take      = 0.0;
+double       g_param_sell_take     = 0.0;
+
+// 6. Gestão de Capital e Risco
+double       g_param_saldo         = 1000.0;
+bool         g_param_gerenc_diario = true;
+double       g_param_porcentos     = 1.0;
+double       g_param_porcentosg    = 1.0;
+bool         g_param_gerenc_semanal= false;
+double       g_param_porcentoo     = 2.0;
+double       g_param_porcentoss    = 2.0;
+
+// 7. Automação e Sessões
+bool         g_param_ea_auto       = false;
+AUTO_PERIODO g_param_auto_periodo  = HORA_1;
+bool         g_param_auto_surfada  = false;
+bool         g_param_sessao_asia   = false;
+bool         g_param_sessao_londres= false;
+bool         g_param_sessao_ny     = false;
+int          g_param_expansao_min  = 10;
+int          g_param_expansao_max  = 30;
+
+// 8. Resultados e Notificações (Parâmetros Operacionais)
+bool         g_param_gmail         = true;
+bool         g_param_notific       = true;
+bool         g_param_ativar_venda  = true;
+bool         g_param_ativar_compra = true;
+bool         g_param_modify_sl     = true;
+bool         g_param_rompimento_c  = true;
+bool         g_param_rompimento_v  = true;
+
+//+------------------------------------------------------------------+
+//| Função para extrair valor de texto (String) de um JSON           |
+//+------------------------------------------------------------------+
+string ExtrairValorStringJson(string json, string chave, string valorPadrao)
+  {
+   string busca = "\"" + chave + "\":\"";
+   int pos = StringFind(json, busca);
+   if(pos == -1)
+     {
+      busca = "\"" + chave + "\": \"";
+      pos = StringFind(json, busca);
+     }
+   if(pos != -1)
+     {
+      int start = pos + StringLen(busca);
+      int end = StringFind(json, "\"", start);
+      if(end != -1)
+        {
+         return StringSubstr(json, start, end - start);
+        }
+     }
+   return valorPadrao;
+  }
+
+//+------------------------------------------------------------------+
+//| Função para extrair valor numérico (Double) de um JSON           |
+//+------------------------------------------------------------------+
+double ExtrairValorDoubleJson(string json, string chave, double valorPadrao)
+  {
+   string busca = "\"" + chave + "\":";
+   int pos = StringFind(json, busca);
+   if(pos == -1)
+     {
+      busca = "\"" + chave + "\": ";
+      pos = StringFind(json, busca);
+     }
+   if(pos != -1)
+     {
+      int start = pos + StringLen(busca);
+      int end1 = StringFind(json, ",", start);
+      int end2 = StringFind(json, "}", start);
+      int end = (end1 != -1 && end2 != -1) ? MathMin(end1, end2) : ((end1 != -1) ? end1 : end2);
+      if(end != -1)
+        {
+         string valStr = StringSubstr(json, start, end - start);
+         StringTrimLeft(valStr);
+         StringTrimRight(valStr);
+         return StringToDouble(valStr);
+        }
+     }
+   return valorPadrao;
+  }
+
+//+------------------------------------------------------------------+
+//| Função para extrair valor booleano (Bool) de um JSON             |
+//+------------------------------------------------------------------+
+bool ExtrairValorBoolJson(string json, string chave, bool valorPadrao)
+  {
+   string jsonLower = json;
+   StringToLower(jsonLower);
+   string chaveLower = chave;
+   StringToLower(chaveLower);
+   
+   if(StringFind(jsonLower, "\"" + chaveLower + "\":true") != -1 || StringFind(jsonLower, "\"" + chaveLower + "\": true") != -1)
+      return true;
+   if(StringFind(jsonLower, "\"" + chaveLower + "\":false") != -1 || StringFind(jsonLower, "\"" + chaveLower + "\": false") != -1)
+      return false;
+   return valorPadrao;
+  }
+
+//+------------------------------------------------------------------+
+//| Função para ler todos os parâmetros salvos vindo do Aplicativo    |
+//| REGRA DE SEGURANÇA: Apenas lê parâmetros se PERMITIR_LEITURA_PARAMETROS|
+//| estiver LIGADO (true). O botão g_ea_ativo não impede a leitura.   |
+//| Verifica os seletores booleanos por JANELA para determinar o que  |
+//| deve ser lido.                                                    |
+//+------------------------------------------------------------------+
+bool CarregarParametrosSalvosApp(string json)
+  {
+   // 🔒 INTERRUPTOR DE SEGURANÇA AO SINCRONIZAR PARÂMETROS
+   // Apenas lê os parâmetros se PERMITIR_LEITURA_PARAMETROS estiver LIGADO (true).
+   // O botão de ativar e desativar o EA (g_ea_ativo) não toma mais essa responsabilidade.
+   bool permitirLeitura = ExtrairValorBoolJson(json, "PERMITIR_LEITURA_PARAMETROS", false);
+   if(!permitirLeitura)
+     {
+      Print("🔒 SEGURANÇA: Interruptor PERMITIR_LEITURA_PARAMETROS está DESATIVADO! Leitura de parâmetros ignorada pelo EA.");
+      return false;
+     }
+
+   string secoesLidas = "";
+
+   // 1. Conexão e Licença (SENHA é OBRIGATÓRIA e sempre lida, sem filtro booleano)
+   string senhaApp = ExtrairValorStringJson(json, "SENHA", "");
+   if(StringLen(senhaApp) > 0)
+     {
+      g_param_senha = senhaApp;
+      secoesLidas += "Conexão/Autenticação (Mandatória), ";
+     }
+
+   // 2. Esquema de Cores (Enum de Cores e Códigos Hex)
+   if(ExtrairValorBoolJson(json, "LER_ESQUEMA_CORES", true))
+     {
+      string enumCoresStr = ExtrairValorStringJson(json, "ESQUEMA_CORES_ENUM", "CYAN_NEON");
+      string corCanalStr   = ExtrairValorStringJson(json, "cor_de_canal", "#22D3EE");
+      string corLinhasStr  = ExtrairValorStringJson(json, "cor_de_linhas", "#FF00E5");
+      string corEquadorStr = ExtrairValorStringJson(json, "corr_de_equador", "#FFFF00");
+
+      AplicarEsquemaCoresEA(enumCoresStr, corCanalStr, corLinhasStr, corEquadorStr);
+      secoesLidas += "Esquema de Cores (" + enumCoresStr + "), ";
+     }
+
+   // 3. Painel & Moeda / Câmbio
+   if(ExtrairValorBoolJson(json, "LER_PAINEL_CAMBIO", true))
+     {
+      g_param_cambio = ExtrairValorDoubleJson(json, "CAMBIO", g_param_cambio);
+      g_param_moeda  = ExtrairValorStringJson(json, "mony", g_param_moeda);
+      secoesLidas += "Painel/Câmbio, ";
+     }
+
+   // 3. Canais de Tendência (enum tendencia: TENDENCIA_DE_ALTA, TENDENCIA_DE_BAIXA)
+   if(ExtrairValorBoolJson(json, "LER_CANAIS_TENDENCIA", true))
+     {
+      string trendStr = ExtrairValorStringJson(json, "TREND", "TENDENCIA_DE_ALTA");
+      if(trendStr == "TENDENCIA_DE_BAIXA" || trendStr == "DOWN_TREND")
+         g_param_tendencia = TENDENCIA_DE_BAIXA;
+      else
+         g_param_tendencia = TENDENCIA_DE_ALTA;
+
+      g_param_linhas_eq    = ExtrairValorBoolJson(json, "LINHAS_DE_EQUADOR", g_param_linhas_eq);
+      g_param_equador_alta = ExtrairValorDoubleJson(json, "M_equador_alta", g_param_equador_alta);
+      g_param_equador_baixa= ExtrairValorDoubleJson(json, "M_equador_baixa", g_param_equador_baixa);
+      secoesLidas += "Tendência, ";
+     }
+
+   // 4. Estratégia Principal (enum Estrategia: FIMATHE, F_SURFADA)
+   if(ExtrairValorBoolJson(json, "LER_ESTRATEGIA_PRINCIPAL", true))
+     {
+      string estStr = ExtrairValorStringJson(json, "ESTRATÉGIA", "FIMATHE");
+      if(StringFind(estStr, "F_SURFADA") != -1)
+         g_param_estrategia = F_SURFADA;
+      else
+         g_param_estrategia = FIMATHE;
+
+      g_param_timeframe   = ExtrairValorStringJson(json, "OperationalPeriod", "PERIOD_M15");
+      g_param_lote        = ExtrairValorDoubleJson(json, "lot", 0.01);
+      g_param_niveis      = ExtrairValorDoubleJson(json, "Nives", 1.0);
+      g_param_costurar    = ExtrairValorBoolJson(json, "Costurar", true);
+      g_param_virada_jogo = ExtrairValorBoolJson(json, "virada_de_jogo", false);
+      secoesLidas += "Estratégia, ";
+     }
+
+   // 5. Posicionamento de Ordem
+   if(ExtrairValorBoolJson(json, "LER_POSICIONAMENTO_ORDEM", true))
+     {
+      g_param_compra       = ExtrairValorDoubleJson(json, "compra", g_param_compra);
+      g_param_venda        = ExtrairValorDoubleJson(json, "venda", g_param_venda);
+      g_param_santo        = ExtrairValorDoubleJson(json, "santo", g_param_santo);
+      g_param_dedo         = ExtrairValorDoubleJson(json, "dedo", g_param_dedo);
+      g_param_posicao_take = ExtrairValorBoolJson(json, "posicaoTake", g_param_posicao_take);
+      g_param_buy_take     = ExtrairValorDoubleJson(json, "buy_take", g_param_buy_take);
+      g_param_sell_take    = ExtrairValorDoubleJson(json, "sell_take", g_param_sell_take);
+      secoesLidas += "Posicionamento, ";
+     }
+
+   // 6. Gestão de Capital e Risco
+   if(ExtrairValorBoolJson(json, "LER_GESTAO_RISCO", true))
+     {
+      g_param_saldo         = ExtrairValorDoubleJson(json, "SALDO", g_param_saldo);
+      g_param_gerenc_diario = ExtrairValorBoolJson(json, "GERENCIAMENTO_DE_RISCO_DIARIO", g_param_gerenc_diario);
+      g_param_porcentos     = ExtrairValorDoubleJson(json, "porcentos", g_param_porcentos);
+      g_param_porcentosg    = ExtrairValorDoubleJson(json, "poercentosg", g_param_porcentosg);
+      g_param_gerenc_semanal= ExtrairValorBoolJson(json, "GERENCIAMENTO_DE_RISCO_SEMANAL", g_param_gerenc_semanal);
+      g_param_porcentoo     = ExtrairValorDoubleJson(json, "PORCENTOO", g_param_porcentoo);
+      g_param_porcentoss    = ExtrairValorDoubleJson(json, "PORCENTOSS", g_param_porcentoss);
+      secoesLidas += "Gestão/Risco, ";
+     }
+
+   // 7. Automação e Sessões (enum AUTO_PERIODO: MANUAL, SESSOES, SEMANAL, DIARIO, HORAS_8, HORA_1)
+   if(ExtrairValorBoolJson(json, "LER_AUTOMACAO_SESSOES", true))
+     {
+      g_param_ea_auto      = ExtrairValorBoolJson(json, "EA_AUTO", g_param_ea_auto);
+      string autoPerStr    = ExtrairValorStringJson(json, "AUTO_PERIOD", "HORA_1");
+      if(autoPerStr == "MANUAL") g_param_auto_periodo = MANUAL;
+      else if(autoPerStr == "SESSOES" || autoPerStr == "SESSION") g_param_auto_periodo = SESSOES;
+      else if(autoPerStr == "SEMANAL") g_param_auto_periodo = SEMANAL;
+      else if(autoPerStr == "DIARIO") g_param_auto_periodo = DIARIO;
+      else if(autoPerStr == "HORAS_8" || autoPerStr == "8_HORAS") g_param_auto_periodo = HORAS_8;
+      else g_param_auto_periodo = HORA_1;
+
+      g_param_auto_surfada = ExtrairValorBoolJson(json, "AUTO_SURFADA", g_param_auto_surfada);
+      g_param_sessao_asia   = ExtrairValorBoolJson(json, "SESSAO_ASIA_TOQUIO", g_param_sessao_asia);
+      g_param_sessao_londres= ExtrairValorBoolJson(json, "SESSAO_LONDRES", g_param_sessao_londres);
+      g_param_sessao_ny     = ExtrairValorBoolJson(json, "SESSAO_NOVA_YORQUI", g_param_sessao_ny);
+      g_param_expansao_min  = (int)ExtrairValorDoubleJson(json, "EXPANSAO_MINIMA", g_param_expansao_min);
+      g_param_expansao_max  = (int)ExtrairValorDoubleJson(json, "EXPANSAO_MAXIMA", g_param_expansao_max);
+      secoesLidas += "Automação, ";
+     }
+
+   // 8. Resultados e Notificações
+   if(ExtrairValorBoolJson(json, "LER_RESULTADOS_NOTIFICACOES", true))
+     {
+      g_param_gmail        = ExtrairValorBoolJson(json, "GMAIL", g_param_gmail);
+      g_param_notific      = ExtrairValorBoolJson(json, "notific", g_param_notific);
+      g_param_ativar_venda = ExtrairValorBoolJson(json, "ativar_ou_desativar_venda", g_param_ativar_venda);
+      g_param_ativar_compra= ExtrairValorBoolJson(json, "ativar_ou_desativar_compra", g_param_ativar_compra);
+      g_param_modify_sl    = ExtrairValorBoolJson(json, "Modify_Sl_For_OxO", g_param_modify_sl);
+      g_param_rompimento_c = ExtrairValorBoolJson(json, "condicao_De_rompimento_c", g_param_rompimento_c);
+      g_param_rompimento_v = ExtrairValorBoolJson(json, "condicao_De_rompimento_v", g_param_rompimento_v);
+      secoesLidas += "Notificações, ";
+     }
+
+   PrintFormat("📥 Parâmetros lidos e aplicados com sucesso pelo EA Fimaster (EA DESATIVADO). Seções: [%s]", secoesLidas);
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+//| Lê os parâmetros do nó /dados/parametros/{ACCOUNT_LOGIN}.json    |
+//| Atualiza o estado operacional e responde com confirmação de sync |
+//+------------------------------------------------------------------+
+void SincronizarParametrosDoApp()
+  {
+   // Se o envio HTTP estiver desativado, interrompe a leitura
+   if(!enviar_http) return;
+
+   // Obtém o endpoint exato de parâmetros construído com ACCOUNT_LOGIN
+   string endpoint = ObterConfigEndpointFirebase();
+   if(endpoint == "") return;
+
+   char data[];
+   char result[];
+   string result_headers;
+   string headers = "Content-Type: application/json\r\n";
+
+   // Faz a leitura HTTP GET no nó do Firebase
+   int res = WebRequest("GET", endpoint, headers, 3000, data, result, result_headers);
+   if(res == 200)
+     {
+      string json = CharArrayToString(result);
+      if(StringLen(json) > 5 && json != "null" && json != "{}")
+        {
+         // ====================================================================
+         // 🔒 1. VERIFICAÇÃO DE SEGURANÇA E AUTENTICAÇÃO PRIMEIRO (MANDATÓRIO)
+         // ====================================================================
+         string senhaRecebida = ExtrairValorStringJson(json, "SENHA", "");
+         if(StringLen(senhaRecebida) == 0)
+           {
+            Print("🔴 ERRO DE SEGURANÇA: Autenticação negada! Senha obrigatória do robô ausente no JSON.");
+            g_ea_ativo = false;
+            AtualizarPainelVisualStatus();
+
+            int agoraErro = (int)TimeCurrent();
+            string statusEndpointErro = ObterStatusEndpointFirebase();
+            if(statusEndpointErro != "")
+              {
+               string payloadErro = StringFormat(
+                  "{\"online\":true,\"ea_ativo\":false,\"config_sync\":false,\"last_ping\":%d,\"msg\":\"🔒 ERRO DE AUTENTICAÇÃO: Senha obrigatória não fornecida! EA bloqueado por segurança.\",\"timestamp\":%d}",
+                  agoraErro, agoraErro
+               );
+               char postDataErro[];
+               char respResultErro[];
+               string respHeadersErro;
+               StringToCharArray(payloadErro, postDataErro, 0, StringLen(payloadErro));
+               WebRequest("PUT", statusEndpointErro, "Content-Type: application/json\r\n", 3000, postDataErro, respResultErro, respHeadersErro);
+              }
+            return;
+           }
+         
+         // Atualiza a senha global autorizada
+         g_param_senha = senhaRecebida;
+
+         bool estadoAnterior = g_ea_ativo;
+
+         // 2. Atualiza a chave "EA_ATIVO" recebida do App
+         if(StringFind(json, "\"EA_ATIVO\":false") != -1 || StringFind(json, "\"EA_ATIVO\": false") != -1 ||
+            StringFind(json, "\"ea_ativo\":false") != -1 || StringFind(json, "\"ea_ativo\": false") != -1)
+           {
+            g_ea_ativo = false; // Desativa o EA
+           }
+         else if(StringFind(json, "\"EA_ATIVO\":true") != -1 || StringFind(json, "\"EA_ATIVO\": true") != -1 ||
+                 StringFind(json, "\"ea_ativo\":true") != -1 || StringFind(json, "\"ea_ativo\": true") != -1)
+           {
+            g_ea_ativo = true; // Ativa o EA
+           }
+
+         // Exibe log no terminal em caso de alteração no estado de execução
+         if(estadoAnterior != g_ea_ativo)
+           {
+            Print(g_ea_ativo ? "🟢 EA Fimaster ATIVADO pelo Aplicativo!" : "🔴 EA Fimaster DESATIVADO pelo Aplicativo!");
+           }
+
+         // Atualiza a interface gráfica móvel no gráfico no canto inferior esquerdo
+         AtualizarPainelVisualStatus();
+
+         // 2. Executa a leitura dos parâmetros salvos conforme a regra
+         // (Controlado exclusivamente pelo interruptor PERMITIR_LEITURA_PARAMETROS; g_ea_ativo não impede a leitura)
+         bool leuParametros = CarregarParametrosSalvosApp(json);
+
+         string msgNotificacao = "";
+         if(leuParametros)
+           {
+            msgNotificacao = "🟢 Parâmetros lidos e sincronizados com sucesso pelo EA Fimaster!";
+
+            // 🔒 SEGURANÇA: Como o EA leu os parâmetros, altera PERMITIR_LEITURA_PARAMETROS para false no banco de dados
+            // para que o EA leia apenas UMA VEZ por solicitação de sincronização do aplicativo.
+            string paramReadEndpoint = StringFormat("%s/dados/parametros/%s/PERMITIR_LEITURA_PARAMETROS.json", ObterBaseUrlFirebase(), ObterContaMt5Login());
+            if(auth_key != "") paramReadEndpoint += "?auth=" + auth_key;
+            EnviarPutHTTP(paramReadEndpoint, "false");
+
+            string mainParamEndpoint = ObterConfigEndpointFirebase();
+            if(mainParamEndpoint != "")
+              {
+               EnviarRequisicaoHTTP("PATCH", mainParamEndpoint, "{\"PERMITIR_LEITURA_PARAMETROS\":false}");
+              }
+           }
+         else
+           {
+            msgNotificacao = "Comando do EA processado. Leitura de parâmetros ignorada (PERMITIR_LEITURA_PARAMETROS=false).";
+           }
+
+         // 3. Prepara dados de confirmação/notificação para o nó de status
+         int agora = (int)TimeCurrent();
+         int fuso = ObterFusoServidor();
+         string fusoTxt = ObterFusoTexto();
+         string servidor = AccountInfoString(ACCOUNT_SERVER);
+         double saldoDisponivel = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+
+         string statusEndpoint = ObterStatusEndpointFirebase();
+         if(statusEndpoint != "")
+           {
+            // Payload de atualização de status do EA com a mensagem de confirmação
+            string payloadSync = StringFormat(
+               "{\"online\":true,\"ea_ativo\":%s,\"config_sync\":true,\"last_config_sync\":%d,\"last_ping\":%d,\"fuso_horario\":%d,\"fuso_texto\":\"%s\",\"symbol\":\"%s\",\"tem_posicao\":%s,\"servidor\":\"%s\",\"login\":%s,\"saldo_disponivel\":%.2f,\"msg\":\"%s\",\"timestamp\":%d}",
+               g_ea_ativo ? "true" : "false",
+               agora,
+               agora,
+               fuso,
+               fusoTxt,
+               _Symbol,
+               ExistePosicaoAberta(_Symbol) ? "true" : "false",
+               servidor,
+               ObterContaMt5Login(),
+               saldoDisponivel,
+               msgNotificacao,
+               agora
+            );
+            
+            // Grava diretamente no nó /dados/status/{ACCOUNT_LOGIN}.json
+            EnviarPutHTTP(statusEndpoint, payloadSync);
+           }
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Envia o Heartbeat (Ping) ao nó /dados/status/{ACCOUNT_LOGIN}.json |
+//+------------------------------------------------------------------+
+void NotificarEAOnline()
+  {
+   bool temPosicao = ExistePosicaoAberta(_Symbol);
+   int fuso = ObterFusoServidor();
+   string fusoTxt = ObterFusoTexto();
+   string servidor = AccountInfoString(ACCOUNT_SERVER);
+   int agora = (int)TimeCurrent();
+   double saldoDisponivel = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+
+   // 1. Registra evento de ping no histórico em /dados/eventos/{ACCOUNT_LOGIN}.json
+   string payloadEvent = StringFormat(
+      "{\"event\":\"ping\",\"symbol\":\"%s\",\"login\":%s,\"msg\":\"EA Fimaster online e ativo.\",\"ea_ativo\":%s,\"tem_posicao\":%s,\"fuso_horario\":%d,\"fuso_texto\":\"%s\",\"servidor\":\"%s\",\"saldo_disponivel\":%.2f,\"timestamp\":%d}",
+      _Symbol,
+      ObterContaMt5Login(),
+      g_ea_ativo ? "true" : "false",
+      temPosicao ? "true" : "false",
+      fuso,
+      fusoTxt,
+      servidor,
+      saldoDisponivel,
+      agora
+   );
+   EnviarPostHTTP(ObterEventosEndpointFirebase("ping"), payloadEvent);
+
+   // 2. Atualiza o estado em tempo real no nó /dados/status/{ACCOUNT_LOGIN}.json via PUT
+   string statusEndpoint = ObterStatusEndpointFirebase();
+   if(statusEndpoint != "")
+     {
+      string payloadStatus = StringFormat(
+         "{\"online\":true,\"ea_ativo\":%s,\"config_sync\":true,\"last_config_sync\":%d,\"last_ping\":%d,\"fuso_horario\":%d,\"fuso_texto\":\"%s\",\"symbol\":\"%s\",\"tem_posicao\":%s,\"servidor\":\"%s\",\"login\":%s,\"saldo_disponivel\":%.2f,\"timestamp\":%d}",
+         g_ea_ativo ? "true" : "false",
+         agora,
+         agora,
+         fuso,
+         fusoTxt,
+         _Symbol,
+         temPosicao ? "true" : "false",
+         servidor,
+         ObterContaMt5Login(),
+         saldoDisponivel,
+         agora
+      );
+      EnviarPutHTTP(statusEndpoint, payloadStatus);
+     }
+  }
+
+// ====================================================================
+// 🖥️ INTERFACE GRÁFICA INTERATIVA E MÓVEL (CANTO INFERIOR ESQUERDO)
+// ====================================================================
+
+//+------------------------------------------------------------------+
+//| Cria a interface gráfica móvel no canto inferior esquerdo        |
+//+------------------------------------------------------------------+
+void CriarPainelVisualStatus()
+  {
+   // Cria o objeto botão caso ainda não exista no gráfico
+   if(ObjectFind(0, PAINEL_STATUS_NOME) < 0)
+     {
+      ObjectCreate(0, PAINEL_STATUS_NOME, OBJ_BUTTON, 0, 0, 0);
+      ObjectSetInteger(0, PAINEL_STATUS_NOME, OBJPROP_CORNER, CORNER_LEFT_LOWER);
+      ObjectSetInteger(0, PAINEL_STATUS_NOME, OBJPROP_XDISTANCE, 20);
+      ObjectSetInteger(0, PAINEL_STATUS_NOME, OBJPROP_YDISTANCE, 35);
+      ObjectSetInteger(0, PAINEL_STATUS_NOME, OBJPROP_XSIZE, 340);
+      ObjectSetInteger(0, PAINEL_STATUS_NOME, OBJPROP_YSIZE, 38);
+      ObjectSetInteger(0, PAINEL_STATUS_NOME, OBJPROP_FONTSIZE, 10);
+      ObjectSetString(0, PAINEL_STATUS_NOME, OBJPROP_FONT, "Segoe UI");
+      
+      // Habilita seleção e movimentação pelo utilizador no gráfico
+      ObjectSetInteger(0, PAINEL_STATUS_NOME, OBJPROP_SELECTABLE, true);
+      ObjectSetInteger(0, PAINEL_STATUS_NOME, OBJPROP_SELECTED, false);
+      ObjectSetInteger(0, PAINEL_STATUS_NOME, OBJPROP_HIDDEN, false);
+      ObjectSetInteger(0, PAINEL_STATUS_NOME, OBJPROP_ZORDER, 100);
+     }
+   
+   // Atualiza os textos e cores dinâmicas
+   AtualizarPainelVisualStatus();
+  }
+
+//+------------------------------------------------------------------+
+//| Atualiza o texto e a cor do painel visual conforme g_ea_ativo    |
+//+------------------------------------------------------------------+
+void AtualizarPainelVisualStatus()
+  {
+   if(ObjectFind(0, PAINEL_STATUS_NOME) >= 0)
+     {
+      // Texto dinâmico conforme o estado do EA
+      string texto = g_ea_ativo ? "🟢 EA Fimaster ATIVADO pelo Aplicativo!" : "🔴 EA Fimaster DESATIVADO pelo Aplicativo!";
+      
+      // Cores para estado ATIVADO (Verde) e DESATIVADO (Vermelho)
+      color bgCor     = g_ea_ativo ? C'20,110,50' : C'160,30,30';
+      color txtCor    = clrWhite;
+      color borderCor = g_ea_ativo ? C'50,220,100' : C'240,90,90';
+
+      ObjectSetString(0, PAINEL_STATUS_NOME, OBJPROP_TEXT, texto);
+      ObjectSetInteger(0, PAINEL_STATUS_NOME, OBJPROP_BGCOLOR, bgCor);
+      ObjectSetInteger(0, PAINEL_STATUS_NOME, OBJPROP_COLOR, txtCor);
+      ObjectSetInteger(0, PAINEL_STATUS_NOME, OBJPROP_BORDER_COLOR, borderCor);
+      ObjectSetInteger(0, PAINEL_STATUS_NOME, OBJPROP_STATE, false); // Restaura estado do botão
+      ChartRedraw(0);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Remove o painel gráfico do gráfico do MetaTrader 5              |
+//+------------------------------------------------------------------+
+void DestruirPainelVisualStatus()
+  {
+   if(ObjectFind(0, PAINEL_STATUS_NOME) >= 0)
+     {
+      ObjectDelete(0, PAINEL_STATUS_NOME);
+      ChartRedraw(0);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Trata eventos de clique ou movimentação do objeto gráfico        |
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+  {
+   // Quando o painel for clicado no gráfico
+   if(id == CHARTEVENT_OBJECT_CLICK && sparam == PAINEL_STATUS_NOME)
+     {
+      ObjectSetInteger(0, PAINEL_STATUS_NOME, OBJPROP_STATE, false);
+      ChartRedraw(0);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Inicializa o timer de monitoramento (Chamar no OnInit do EA)      |
+//+------------------------------------------------------------------+
+void InicializarTimerNotificacao(int segundos = 1)
+  {
+   // Cria o painel visual no canto inferior esquerdo do gráfico
+   CriarPainelVisualStatus();
+
+   // Ativa o evento OnTimer com o intervalo informado
+   EventSetTimer(segundos);
+   Print("⏰ Timer de Notificações ativado para a conta MT5 ", ObterContaMt5Login(), " com intervalo de ", segundos, "s.");
+   
+   // Dispara primeiro ping e sincronização imediata
+   NotificarEAOnline();
+   SincronizarParametrosDoApp();
+  }
+
+//+------------------------------------------------------------------+
+//| Finaliza o timer de monitoramento (Chamar no OnDeinit do EA)    |
+//+------------------------------------------------------------------+
+void FinalizarTimerNotificacao()
+  {
+   // Remove o painel visual do gráfico do MetaTrader
+   DestruirPainelVisualStatus();
+
+   // Cancela os eventos de timer do terminal
+   EventKillTimer();
+   Print("⏰ Timer de Notificações encerrado.");
+  }
+
+//+------------------------------------------------------------------+
+//| Evento OnTimer do EA - Executado ciclicamente no MetaTrader 5     |
+//+------------------------------------------------------------------+
+void OnTimer()
+  {
+   datetime agora = TimeCurrent();
+
+   // 1. Consulta e sincroniza parâmetros do App a cada 5 segundos
+   if(agora - g_last_config_check >= 5)
+     {
+      SincronizarParametrosDoApp();
+      g_last_config_check = agora;
+     }
+
+   // 2. Envia Heartbeat (Ping) online a cada 60 segundos
+   static datetime last_heartbeat = 0;
+   if(agora - last_heartbeat >= 60)
+     {
+      NotificarEAOnline();
+      last_heartbeat = agora;
+     }
+
+   // 3. Monitora alterações de posições abertas no terminal
+   static bool estavaComPosicaoAberta = false;
+   bool temPosicao = ExistePosicaoAberta(_Symbol);
+   
+   if(temPosicao != estavaComPosicaoAberta)
+     {
+      string statusMsg = temPosicao ? "Nova posição aberta no ativo!" : "Posições encerradas.";
+      Print("🔄 Mudança de Posição (Conta MT5: ", ObterContaMt5Login(), ", Ativo: ", _Symbol, "): ", statusMsg);
+      
+      // Envia notificação de alteração de posição
+      string payload = StringFormat(
+         "{\"event\":\"posicao_alterada\",\"login\":%s,\"symbol\":\"%s\",\"tem_posicao\":%s,\"msg\":\"%s\",\"timestamp\":%d}",
+         ObterContaMt5Login(),
+         _Symbol,
+         temPosicao ? "true" : "false",
+         statusMsg,
+         (int)agora
+      );
+      EnviarPostHTTP(ObterEventosEndpointFirebase("posicao_alterada"), payload);
+      
+      estavaComPosicaoAberta = temPosicao;
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Fim do Módulo fimaster_notificar.mql5                            |
+//+------------------------------------------------------------------+
