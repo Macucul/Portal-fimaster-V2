@@ -1,11 +1,17 @@
 package com.example.ui
 
+import com.example.data.isTemplateValido
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.*
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -13,10 +19,12 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
@@ -29,11 +37,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -65,6 +76,351 @@ enum class PortalTab(val label: String, val icon: androidx.compose.ui.graphics.v
     SECURITY("Segurança", Icons.Default.Lock)
 }
 
+enum class NotificationSeverity {
+    CRITICAL, WARNING, INFO
+}
+
+data class SystemNotification(
+    val id: String,
+    val title: String,
+    val message: String,
+    val severity: NotificationSeverity,
+    val icon: androidx.compose.ui.graphics.vector.ImageVector,
+    val targetTab: PortalTab? = null
+)
+
+fun calculateSystemNotifications(
+    loggedUser: com.example.data.GithubUser?,
+    eaRobotStatus: com.example.ui.EaRobotStatus?,
+    eaConfig: com.example.data.EaConfigEntity?,
+    eaRobotEvents: List<com.example.data.EaRobotEvent>
+): List<SystemNotification> {
+    if (loggedUser == null) return emptyList()
+    val list = mutableListOf<SystemNotification>()
+
+    // 1. License Expiry Check (quando faltar 1 semana ou menos - 7 dias)
+    val validadeStr = loggedUser.licencaValidade.trim()
+    if (validadeStr.isNotBlank()) {
+        val formats = listOf("yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd", "dd/MM/yyyy", "dd-MM-yyyy")
+        var parsedDate: java.util.Date? = null
+        for (f in formats) {
+            try {
+                parsedDate = java.text.SimpleDateFormat(f, java.util.Locale.getDefault()).parse(validadeStr)
+                if (parsedDate != null) break
+            } catch (_: Exception) {}
+        }
+
+        if (parsedDate != null) {
+            val now = java.util.Date()
+            val diffMs = parsedDate.time - now.time
+            val daysRemaining = java.util.concurrent.TimeUnit.MILLISECONDS.toDays(diffMs)
+
+            if (!loggedUser.licencaAtiva || daysRemaining <= 0) {
+                list.add(
+                    SystemNotification(
+                        id = "lic_expired",
+                        title = "🚨 LICENÇA EXPIRADA OU VENCIDA",
+                        message = "Sua licença do robô EA expirou (Validade: $validadeStr). Entre em contato com o suporte para renovação.",
+                        severity = NotificationSeverity.CRITICAL,
+                        icon = Icons.Default.LockClock,
+                        targetTab = PortalTab.CLIENT_LICENSE
+                    )
+                )
+            } else if (daysRemaining in 1..7) {
+                val diasTexto = if (daysRemaining == 1L) "1 dia" else "$daysRemaining dias"
+                list.add(
+                    SystemNotification(
+                        id = "lic_warning_7days",
+                        title = "⚠️ LICENÇA EXPIRANDO EM $diasTexto",
+                        message = "Atenção: Sua licença vence em $diasTexto (Validade: $validadeStr). Faltam menos de 7 dias! Renove para não interromper o robô no MT5.",
+                        severity = NotificationSeverity.WARNING,
+                        icon = Icons.Default.Warning,
+                        targetTab = PortalTab.CLIENT_LICENSE
+                    )
+                )
+            }
+        }
+    } else if (!loggedUser.licencaAtiva) {
+        list.add(
+            SystemNotification(
+                id = "lic_inactive",
+                title = "🚨 LICENÇA INATIVA",
+                message = "Sua licença no Portal Fimaster está desativada. Solicite a liberação no suporte.",
+                severity = NotificationSeverity.CRITICAL,
+                icon = Icons.Default.Lock,
+                targetTab = PortalTab.CLIENT_LICENSE
+            )
+        )
+    }
+
+    // 2. Robot Attention Checks (robô exigir atenção)
+    val hasMt5Account = loggedUser.mt5IdConta.isNotBlank() && loggedUser.mt5Registrado
+    if (hasMt5Account) {
+        val isRobotOnline = eaRobotStatus?.online == true
+        val isEaAtivo = eaConfig?.EA_ATIVO == true
+
+        if (!isEaAtivo) {
+            list.add(
+                SystemNotification(
+                    id = "robot_disabled",
+                    title = "⚠️ ATENÇÃO AO ROBÔ: EXECUÇÃO DESATIVADA",
+                    message = "O robô está conectado no MT5, mas a chave 'EA ATIVO' está desligada no aplicativo.",
+                    severity = NotificationSeverity.WARNING,
+                    icon = Icons.Default.PauseCircle,
+                    targetTab = PortalTab.EA_CONFIG
+                )
+            )
+        }
+
+        val recentErrors = eaRobotEvents.filter {
+            val evtLower = it.event.lowercase()
+            evtLower.contains("erro") || evtLower.contains("alerta") || evtLower.contains("warning") || evtLower.contains("margin")
+        }
+        if (recentErrors.isNotEmpty()) {
+            val lastError = recentErrors.first()
+            list.add(
+                SystemNotification(
+                    id = "robot_event_error",
+                    title = "⚡ ALERTA DE EXECUÇÃO NO MT5",
+                    message = "Último evento crítico do robô: ${lastError.resumo} (${lastError.hora}). Confira a aba de Eventos.",
+                    severity = NotificationSeverity.WARNING,
+                    icon = Icons.Default.ReportProblem,
+                    targetTab = PortalTab.EA_EVENTS
+                )
+            )
+        }
+    } else {
+        list.add(
+            SystemNotification(
+                id = "no_mt5",
+                title = "ℹ️ CONTA MT5 NÃO VINCULADA",
+                message = "Cadastre o número da sua conta MT5 na aba 'Conta EA' para sincronizar seu robô em tempo real.",
+                severity = NotificationSeverity.INFO,
+                icon = Icons.Default.AccountBalance,
+                targetTab = PortalTab.DASHBOARD
+            )
+        )
+    }
+
+    return list
+}
+
+@Composable
+fun SystemNotificationsBannerCard(
+    notifications: List<SystemNotification>,
+    onNavigateToTab: (PortalTab) -> Unit
+) {
+    if (notifications.isEmpty()) return
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        notifications.forEach { notif ->
+            val bgColor = when (notif.severity) {
+                NotificationSeverity.CRITICAL -> Color(0xFF451A03)
+                NotificationSeverity.WARNING -> Color(0xFF382300)
+                NotificationSeverity.INFO -> Color(0xFF0F172A)
+            }
+            val borderColor = when (notif.severity) {
+                NotificationSeverity.CRITICAL -> Color(0xFFEF4444)
+                NotificationSeverity.WARNING -> Color(0xFFF59E0B)
+                NotificationSeverity.INFO -> Color(0xFF0EA5E9)
+            }
+
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                color = bgColor.copy(alpha = 0.95f),
+                border = BorderStroke(1.dp, borderColor.copy(alpha = 0.7f))
+            ) {
+                Row(
+                    modifier = Modifier.padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(38.dp)
+                            .clip(CircleShape)
+                            .background(borderColor.copy(alpha = 0.2f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = notif.icon,
+                            contentDescription = null,
+                            tint = borderColor,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.width(12.dp))
+
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = notif.title,
+                            style = MaterialTheme.typography.labelMedium.copy(
+                                fontWeight = FontWeight.Black,
+                                color = borderColor,
+                                fontSize = 12.sp
+                            )
+                        )
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = notif.message,
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                color = Color.White.copy(alpha = 0.95f),
+                                fontSize = 11.5.sp
+                            )
+                        )
+                    }
+
+                    if (notif.targetTab != null) {
+                        Spacer(modifier = Modifier.width(8.dp))
+                        IconButton(
+                            onClick = { onNavigateToTab(notif.targetTab) },
+                            modifier = Modifier
+                                .clip(CircleShape)
+                                .background(borderColor.copy(alpha = 0.2f))
+                                .size(32.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.ArrowForward,
+                                contentDescription = "Ver detalhe",
+                                tint = borderColor,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun SystemNotificationsDialog(
+    notifications: List<SystemNotification>,
+    onNavigateToTab: (PortalTab) -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Color(0xFF0F172A),
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = Icons.Default.NotificationsActive,
+                    contentDescription = null,
+                    tint = Color(0xFFF59E0B),
+                    modifier = Modifier.size(22.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "Central de Notificações e Alertas",
+                    style = MaterialTheme.typography.titleMedium.copy(
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White
+                    )
+                )
+            }
+        },
+        text = {
+            if (notifications.isEmpty()) {
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.CheckCircle,
+                        contentDescription = null,
+                        tint = Color(0xFF10B981),
+                        modifier = Modifier.size(48.dp)
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "Nenhum alerta pendente!",
+                        style = MaterialTheme.typography.bodyMedium.copy(color = Color.White, fontWeight = FontWeight.Bold)
+                    )
+                    Text(
+                        text = "Sua licença está ativa e seu robô EA está operando normalmente.",
+                        style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8), fontSize = 11.sp),
+                        textAlign = TextAlign.Center
+                    )
+                }
+            } else {
+                LazyColumn(
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    items(notifications) { notif ->
+                        val borderColor = when (notif.severity) {
+                            NotificationSeverity.CRITICAL -> Color(0xFFEF4444)
+                            NotificationSeverity.WARNING -> Color(0xFFF59E0B)
+                            NotificationSeverity.INFO -> Color(0xFF0EA5E9)
+                        }
+
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp),
+                            color = Color(0xFF1E293B),
+                            border = BorderStroke(1.dp, borderColor.copy(alpha = 0.5f))
+                        ) {
+                            Column(modifier = Modifier.padding(12.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(
+                                        imageVector = notif.icon,
+                                        contentDescription = null,
+                                        tint = borderColor,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = notif.title,
+                                        style = MaterialTheme.typography.labelMedium.copy(
+                                            color = borderColor,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    )
+                                }
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = notif.message,
+                                    style = MaterialTheme.typography.bodySmall.copy(
+                                        color = Color(0xFFCBD5E1),
+                                        fontSize = 11.5.sp
+                                    )
+                                )
+                                if (notif.targetTab != null) {
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    TextButton(
+                                        onClick = {
+                                            onNavigateToTab(notif.targetTab)
+                                        },
+                                        modifier = Modifier.align(Alignment.End)
+                                    ) {
+                                        Text(
+                                            text = "Resolver na aba ${notif.targetTab.label} →",
+                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                color = Color(0xFF38BDF8),
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Fechar", color = Color(0xFF38BDF8), fontWeight = FontWeight.Bold)
+            }
+        }
+    )
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PortalApp(viewModel: PortalViewModel) {
@@ -79,10 +435,29 @@ fun PortalApp(viewModel: PortalViewModel) {
     val feedbackMessage by viewModel.messageState.collectAsStateWithLifecycle()
     val refundRequests by viewModel.refundRequests.collectAsStateWithLifecycle()
 
+    val context = androidx.compose.ui.platform.LocalContext.current
+    LaunchedEffect(Unit) {
+        AppTtsManager.initIfNeeded(context)
+    }
+
     var currentTab by remember { mutableStateOf(PortalTab.DASHBOARD) }
     var showAdminConfig by remember { mutableStateOf(false) }
+    var showSupportDialog by remember { mutableStateOf(false) }
+    var showNotificationsDialog by remember { mutableStateOf(false) }
 
-    val context = androidx.compose.ui.platform.LocalContext.current
+    val eaRobotStatus by viewModel.eaRobotStatus.collectAsStateWithLifecycle()
+    val eaConfig by viewModel.eaConfig.collectAsStateWithLifecycle()
+    val eaRobotEvents by viewModel.eaRobotEvents.collectAsStateWithLifecycle()
+    val chartScreenshot by viewModel.chartScreenshot.collectAsStateWithLifecycle()
+
+    val financialTimeframe by viewModel.financialTimeframe.collectAsStateWithLifecycle()
+    val financialCandles by viewModel.financialCandles.collectAsStateWithLifecycle()
+    val financialTransactions by viewModel.financialTransactions.collectAsStateWithLifecycle()
+
+    val systemNotifications = remember(loggedUser, eaRobotStatus, eaConfig, eaRobotEvents) {
+        calculateSystemNotifications(loggedUser, eaRobotStatus, eaConfig, eaRobotEvents)
+    }
+
     val prefs = remember(context) { context.getSharedPreferences("fimaster_prefs", android.content.Context.MODE_PRIVATE) }
     var showEaTourDialog by remember { mutableStateOf(false) }
 
@@ -98,13 +473,29 @@ fun PortalApp(viewModel: PortalViewModel) {
 
     val snackbarHostState = remember { SnackbarHostState() }
 
-    LaunchedEffect(feedbackMessage) {
-        feedbackMessage?.let {
-            snackbarHostState.showSnackbar(
-                message = it,
-                duration = SnackbarDuration.Short
-            )
-            viewModel.clearMessage()
+    LaunchedEffect(isLoggedIn) {
+        if (isLoggedIn) {
+            com.example.service.EaEventMonitorService.startService(context)
+        } else {
+            com.example.service.EaEventMonitorService.stopService(context)
+        }
+    }
+
+    LaunchedEffect(eaRobotEvents, isLoggedIn) {
+        if (isLoggedIn && eaRobotEvents.isNotEmpty()) {
+            PortalEventQueueManager.onEventsReceived(context, eaRobotEvents)
+        }
+    }
+
+    LaunchedEffect(feedbackMessage, isLoggedIn) {
+        if (isLoggedIn) {
+            feedbackMessage?.let {
+                snackbarHostState.showSnackbar(
+                    message = it,
+                    duration = SnackbarDuration.Short
+                )
+                viewModel.clearMessage()
+            }
         }
     }
 
@@ -147,6 +538,31 @@ fun PortalApp(viewModel: PortalViewModel) {
                         }
                     },
                     actions = {
+                        IconButton(onClick = { showNotificationsDialog = true }) {
+                            BadgedBox(
+                                badge = {
+                                    if (systemNotifications.isNotEmpty()) {
+                                        Badge(
+                                            containerColor = if (systemNotifications.any { it.severity == NotificationSeverity.CRITICAL }) Color(0xFFEF4444) else Color(0xFFF59E0B)
+                                        ) {
+                                            Text(
+                                                text = systemNotifications.size.toString(),
+                                                color = Color.White,
+                                                fontWeight = FontWeight.Bold,
+                                                fontSize = 10.sp
+                                            )
+                                        }
+                                    }
+                                }
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Notifications,
+                                    contentDescription = "Notificações",
+                                    tint = if (systemNotifications.isNotEmpty()) Color(0xFFF59E0B) else Color(0xFF94A3B8)
+                                )
+                            }
+                        }
+
                         IconButton(onClick = { viewModel.logout() }) {
                             Icon(
                                 imageVector = Icons.Default.ExitToApp,
@@ -200,7 +616,37 @@ fun PortalApp(viewModel: PortalViewModel) {
                         )
                     }
                 }
-            }
+            },
+            floatingActionButton = {
+                SmallFloatingActionButton(
+                    onClick = { showSupportDialog = true },
+                    containerColor = Color(0xFF0EA5E9),
+                    contentColor = Color.White,
+                    elevation = FloatingActionButtonDefaults.elevation(defaultElevation = 4.dp, pressedElevation = 8.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier.testTag("support_fab")
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Help,
+                            contentDescription = "Suporte Técnico",
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "Suporte",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 11.sp
+                            )
+                        )
+                    }
+                }
+            },
+            floatingActionButtonPosition = FabPosition.End
         ) { innerPadding ->
             Column(
                 modifier = Modifier
@@ -320,26 +766,40 @@ fun PortalApp(viewModel: PortalViewModel) {
                 }
 
                 Box(modifier = Modifier.weight(1f)) {
-                    val eaRobotStatus by viewModel.eaRobotStatus.collectAsStateWithLifecycle()
-                    val eaConfig by viewModel.eaConfig.collectAsStateWithLifecycle()
-                    val eaRobotEvents by viewModel.eaRobotEvents.collectAsStateWithLifecycle()
-
                     when (currentTab) {
                         PortalTab.DASHBOARD -> DashboardScreen(
                             loggedUser = loggedUser,
                             eaRobotStatus = eaRobotStatus,
+                            eaRobotEvents = eaRobotEvents,
                             eaConfig = eaConfig,
+                            chartScreenshot = chartScreenshot,
+                            financialTimeframe = financialTimeframe,
+                            financialCandles = financialCandles,
+                            financialTransactions = financialTransactions,
+                            onSelectFinancialTimeframe = { viewModel.setFinancialTimeframe(it) },
+                            onRegisterDeposit = { amt, note -> viewModel.registerDeposit(amt, note) },
+                            onRegisterWithdrawal = { amt, note -> viewModel.registerWithdrawal(amt, note) },
+                            onRegisterClosedPosition = { sym, profit, note -> viewModel.registerClosedPosition(sym, profit, note) },
+                            onRequestScreenshot = { viewModel.requestChartScreenshot() },
                             onSaveMt5Id = { viewModel.updateMt5IdServerless(it) },
-                            onStartTour = { showEaTourDialog = true }
+                            onStartTour = { showEaTourDialog = true },
+                            onTriggerSimulation = { viewModel.triggerSimulation() },
+                            systemNotifications = systemNotifications,
+                            onNavigateToTab = { currentTab = it },
+                            onSaveEaConfig = { viewModel.saveEaConfig(it) },
+                            onFetchExchangeRate = { code, cb -> viewModel.fetchExchangeRate(code, cb) }
                         )
                         PortalTab.CLIENT_LICENSE -> ClientLicenseScreen(
                             loggedUser = loggedUser,
                             refundRequests = refundRequests,
-                            onRequestNewRefund = { viewModel.requestRefundServerless() }
+                            onRequestNewRefund = { viewModel.requestRefundServerless() },
+                            systemNotifications = systemNotifications,
+                            onNavigateToTab = { currentTab = it }
                         )
                         PortalTab.EA_EVENTS -> EaRobotEventsScreen(
                             events = eaRobotEvents,
-                            mt5AccountId = loggedUser?.mt5IdConta ?: ""
+                            mt5AccountId = loggedUser?.mt5IdConta ?: "",
+                            onClearEvents = { viewModel.clearEvents() }
                         )
                         PortalTab.EA_CONFIG -> EaConfigScreen(viewModel = viewModel)
                         PortalTab.HISTORY -> HistoryScreen(loggedUser)
@@ -351,6 +811,17 @@ fun PortalApp(viewModel: PortalViewModel) {
                 }
             }
         }
+    }
+
+    if (showNotificationsDialog) {
+        SystemNotificationsDialog(
+            notifications = systemNotifications,
+            onNavigateToTab = { tab ->
+                currentTab = tab
+                showNotificationsDialog = false
+            },
+            onDismiss = { showNotificationsDialog = false }
+        )
     }
 
     if (showEaTourDialog) {
@@ -374,12 +845,36 @@ fun PortalApp(viewModel: PortalViewModel) {
             }
         )
     }
+
+    if (showSupportDialog) {
+        SupportTicketDialog(
+            userProfile = loggedUser,
+            onDismiss = { showSupportDialog = false },
+            onSubmit = { categoria, assunto, mensagem, contato ->
+                viewModel.submitSupportTicket(categoria, assunto, mensagem, contato)
+                showSupportDialog = false
+            }
+        )
+    }
+}
+
+fun getCurrencySymbol(monyCode: String?): String {
+    val code = monyCode?.uppercase()?.trim() ?: ""
+    return when {
+        code.contains("USD") || code == "$" -> "USD"
+        code.contains("MZN") || code.contains("METICAL") || code.contains("METICAIS") || code == "MT" -> "MT"
+        code.contains("BRL") || code.contains("REAL") || code == "R$" -> "R$"
+        code.contains("EUR") || code.contains("EURO") || code == "€" -> "€"
+        code.contains("AOA") || code.contains("KWANZA") || code == "KZ" -> "Kz"
+        code.isNotBlank() -> code.take(5)
+        else -> "MT"
+    }
 }
 
 @Composable
 fun HeroEaBalanceCard(
     saldo: Double,
-    creditoGuardado: Double = 0.0,
+    resultadoOrdem: Double = 0.0,
     isOnline: Boolean = false,
     temPosicao: Boolean = false,
     cambio: Double = 64.0,
@@ -515,7 +1010,7 @@ fun HeroEaBalanceCard(
 
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = String.format(Locale.US, "Original: $%,.2f USD (Câmbio: %.1f MT/USD)", saldo, cambio),
+                    text = String.format(Locale.US, "Original: $%,.2f USD (Câmbio: %.1f %s/USD)", saldo, cambio, currencySymbol),
                     style = MaterialTheme.typography.labelSmall.copy(
                         color = Color(0xFF94A3B8),
                         fontWeight = FontWeight.SemiBold
@@ -549,16 +1044,19 @@ fun HeroEaBalanceCard(
 
                     Column(horizontalAlignment = Alignment.End) {
                         Text(
-                            text = "CRÉDITO GUARDADO",
+                            text = "RESULTADOS DA ORDEM",
                             style = MaterialTheme.typography.labelSmall.copy(
                                 color = Color(0xFF64748B),
                                 fontWeight = FontWeight.Bold
                             )
                         )
+                        val resCambiado = resultadoOrdem * cambio
+                        val resColor = if (resultadoOrdem >= 0) Color(0xFF10B981) else Color(0xFFEF4444)
+                        val resSign = if (resultadoOrdem > 0) "+" else ""
                         Text(
-                            text = String.format(Locale.US, "%,.2f %s", creditoGuardado, currencySymbol),
+                            text = String.format(Locale.US, "%s%,.2f %s", resSign, resCambiado, currencySymbol),
                             style = MaterialTheme.typography.titleMedium.copy(
-                                color = Color(0xFF10B981),
+                                color = resColor,
                                 fontWeight = FontWeight.Bold
                             )
                         )
@@ -570,19 +1068,427 @@ fun HeroEaBalanceCard(
 }
 
 @Composable
+fun AccountCurrencySelectorCard(
+    currentMony: String,
+    currentCambio: Double,
+    onSelectCurrency: (code: String, rate: Double) -> Unit,
+    onUpdateRateOnline: (String) -> Unit
+) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF0F172A).copy(alpha = 0.95f)),
+        shape = RoundedCornerShape(20.dp),
+        border = BorderStroke(1.dp, Color(0xFF0EA5E9).copy(alpha = 0.4f)),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .size(36.dp)
+                            .background(Color(0xFF0EA5E9).copy(alpha = 0.2f), CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.CurrencyExchange,
+                            contentDescription = "Câmbio e Conversão",
+                            tint = Color(0xFF38BDF8),
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Column {
+                        Text(
+                            text = "CÂMBIO & MOEDA DA CONTA",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                color = Color(0xFF38BDF8),
+                                fontWeight = FontWeight.Black,
+                                letterSpacing = 1.sp
+                            )
+                        )
+                        Text(
+                            text = "Alterne o câmbio para recalcular o Saldo, Gráficos e Acumuladores",
+                            style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8), fontSize = 10.5.sp)
+                        )
+                    }
+                }
+            }
+
+            val currencies = listOf(
+                "USD" to "🇺🇸 USD ($)",
+                "MZN" to "🇲🇿 Metical (MT)",
+                "BRL" to "🇧🇷 Real (R$)",
+                "EUR" to "🇪🇺 Euro (€)",
+                "AOA" to "🇦🇴 Kwanza (Kz)"
+            )
+            val defaultPresetRates = mapOf(
+                "USD" to 1.0,
+                "MZN" to 64.0,
+                "BRL" to 5.5,
+                "EUR" to 0.92,
+                "AOA" to 920.0
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                currencies.forEach { (code, label) ->
+                    val isSelected = currentMony.uppercase().contains(code) || (code == "USD" && currentMony.uppercase().contains("USD"))
+                    val presetRate = defaultPresetRates[code] ?: 1.0
+
+                    Surface(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clickable {
+                                onSelectCurrency(code, presetRate)
+                                if (code != "USD") {
+                                    onUpdateRateOnline(code)
+                                }
+                            },
+                        shape = RoundedCornerShape(10.dp),
+                        color = if (isSelected) Color(0xFF0EA5E9) else Color(0xFF1E293B),
+                        border = BorderStroke(0.5.dp, if (isSelected) Color(0xFF38BDF8) else Color(0xFF334155))
+                    ) {
+                        Text(
+                            text = label,
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                color = Color.White,
+                                fontSize = 9.5.sp,
+                                fontWeight = FontWeight.Bold
+                            ),
+                            modifier = Modifier.padding(vertical = 10.dp, horizontal = 2.dp),
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                        )
+                    }
+                }
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF020617), RoundedCornerShape(10.dp))
+                    .padding(10.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text(
+                        text = "TAXA ATIVA:",
+                        style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF64748B), fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                    )
+                    Text(
+                        text = "1 USD = $currentCambio ${getCurrencySymbol(currentMony)}",
+                        style = MaterialTheme.typography.bodyMedium.copy(color = Color(0xFF10B981), fontWeight = FontWeight.Bold)
+                    )
+                }
+
+                Button(
+                    onClick = { onUpdateRateOnline(currentMony.ifBlank { "MZN" }) },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
+                    shape = RoundedCornerShape(8.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                ) {
+                    Icon(imageVector = Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(14.dp), tint = Color.White)
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Atualizar On-line", style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold, color = Color.White, fontSize = 10.sp))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun OrderResultsAccumulatorCard(
+    eaRobotEvents: List<com.example.data.EaRobotEvent>,
+    financialCandles: List<com.example.ui.FinancialCandle> = emptyList(),
+    financialTransactions: List<com.example.ui.FinancialTransaction> = emptyList(),
+    cambio: Double = 64.0,
+    currencySymbol: String = "MT",
+    onTriggerSimulation: () -> Unit = {}
+) {
+    val closedTrades = remember(financialTransactions) {
+        financialTransactions.filter { it.type == com.example.ui.TransactionType.CLOSED_POSITION }
+    }
+
+    val nowSec = remember { System.currentTimeMillis() / 1000L }
+
+    val totalDiarioEvents = remember(closedTrades, eaRobotEvents, nowSec) {
+        if (closedTrades.isNotEmpty()) {
+            val todayTrades = closedTrades.filter { (nowSec - it.timestamp) <= 86400L }
+            if (todayTrades.isNotEmpty()) todayTrades.sumOf { it.amount }
+            else closedTrades.lastOrNull()?.amount ?: 0.0
+        } else {
+            eaRobotEvents.firstOrNull { it.diarioValor != 0.0 }?.diarioValor ?: 0.0
+        }
+    }
+
+    val totalSemanalEvents = remember(closedTrades, eaRobotEvents, totalDiarioEvents, nowSec) {
+        if (closedTrades.isNotEmpty()) {
+            val weekTrades = closedTrades.filter { (nowSec - it.timestamp) <= 7 * 86400L }
+            if (weekTrades.isNotEmpty()) weekTrades.sumOf { it.amount }
+            else closedTrades.sumOf { it.amount }
+        } else {
+            val sem = eaRobotEvents.firstOrNull { it.semanalValor != 0.0 }?.semanalValor
+            sem ?: (totalDiarioEvents * 4.0)
+        }
+    }
+
+    val totalMensalEvents = remember(closedTrades, eaRobotEvents, totalSemanalEvents, nowSec) {
+        if (closedTrades.isNotEmpty()) {
+            val monthTrades = closedTrades.filter { (nowSec - it.timestamp) <= 30 * 86400L }
+            if (monthTrades.isNotEmpty()) monthTrades.sumOf { it.amount }
+            else closedTrades.sumOf { it.amount }
+        } else {
+            if (totalSemanalEvents != 0.0) totalSemanalEvents * 4.5 else totalDiarioEvents * 22.0
+        }
+    }
+
+    val orderCount = remember(closedTrades, financialCandles, eaRobotEvents) {
+        if (closedTrades.isNotEmpty()) {
+            closedTrades.size
+        } else if (financialCandles.isNotEmpty() && financialCandles.sumOf { it.tradeCount } > 0) {
+            financialCandles.sumOf { it.tradeCount }
+        } else if (eaRobotEvents.isNotEmpty()) {
+            val count = eaRobotEvents.count { 
+                val ev = it.event.lowercase()
+                ev.contains("ordem") || ev.contains("posicao") || ev.contains("order") || ev.contains("estado") || ev.contains("equador") || ev.contains("sessao") || ev.contains("relatorio") || ev.contains("captura")
+            }
+            if (count == 0) eaRobotEvents.size else count
+        } else {
+            0
+        }
+    }
+
+    Card(
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B).copy(alpha = 0.9f)),
+        shape = RoundedCornerShape(24.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(1.dp, Color(0xFF22D3EE).copy(alpha = 0.3f), RoundedCornerShape(24.dp))
+    ) {
+        Column(
+            modifier = Modifier.padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .size(36.dp)
+                            .background(Color(0xFF8B5CF6).copy(alpha = 0.2f), CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.QueryStats,
+                            contentDescription = "Acumulador de Ordens",
+                            tint = Color(0xFFC084FC),
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Column {
+                        Text(
+                            text = "ACUMULADOR & RESULTADOS",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                color = Color(0xFFC084FC),
+                                fontWeight = FontWeight.Black,
+                                letterSpacing = 1.2.sp
+                            )
+                        )
+                        Text(
+                            text = "Resultados e Projeção de Ordens MT5",
+                            style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8))
+                        )
+                    }
+                }
+
+                Button(
+                    onClick = onTriggerSimulation,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8B5CF6)),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(imageVector = Icons.Default.PlayArrow, contentDescription = "Disparar Simulação", tint = Color.White, modifier = Modifier.size(14.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "SIMULAR TUDO",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 10.sp
+                            )
+                        )
+                    }
+                }
+            }
+
+            Surface(
+                color = Color(0xFF0F172A).copy(alpha = 0.9f),
+                shape = RoundedCornerShape(16.dp),
+                border = BorderStroke(1.dp, Color(0xFF10B981).copy(alpha = 0.4f))
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    Text(
+                        text = "PROJEÇÃO DE RESULTADOS ACUMULADOS",
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            color = Color(0xFF10B981),
+                            fontWeight = FontWeight.Black,
+                            letterSpacing = 1.sp
+                        )
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "RES. DIÁRIO",
+                                style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF64748B), fontWeight = FontWeight.Bold)
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = String.format(Locale.US, "%s%,.2f %s", if (totalDiarioEvents >= 0) "+" else "", totalDiarioEvents * cambio, currencySymbol),
+                                style = MaterialTheme.typography.titleMedium.copy(
+                                    color = if (totalDiarioEvents >= 0) Color(0xFF10B981) else Color(0xFFEF4444),
+                                    fontWeight = FontWeight.Bold
+                                )
+                            )
+                            Text(
+                                text = String.format(Locale.US, "%s$%,.2f USD", if (totalDiarioEvents >= 0) "+" else "", totalDiarioEvents),
+                                style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF64748B))
+                            )
+                        }
+
+                        Column(modifier = Modifier.weight(1f), horizontalAlignment = Alignment.End) {
+                            Text(
+                                text = "RES. SEMANAL",
+                                style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF64748B), fontWeight = FontWeight.Bold)
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = String.format(Locale.US, "%s%,.2f %s", if (totalSemanalEvents >= 0) "+" else "", totalSemanalEvents * cambio, currencySymbol),
+                                style = MaterialTheme.typography.titleMedium.copy(
+                                    color = if (totalSemanalEvents >= 0) Color(0xFF38BDF8) else Color(0xFFEF4444),
+                                    fontWeight = FontWeight.Bold
+                                )
+                            )
+                            Text(
+                                text = String.format(Locale.US, "%s$%,.2f USD", if (totalSemanalEvents >= 0) "+" else "", totalSemanalEvents),
+                                style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF64748B))
+                            )
+                        }
+                    }
+
+                    HorizontalDivider(color = Color(0xFF334155).copy(alpha = 0.4f))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "RES. MENSAL",
+                                style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF64748B), fontWeight = FontWeight.Bold)
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = String.format(Locale.US, "%s%,.2f %s", if (totalMensalEvents >= 0) "+" else "", totalMensalEvents * cambio, currencySymbol),
+                                style = MaterialTheme.typography.titleMedium.copy(
+                                    color = if (totalMensalEvents >= 0) Color(0xFF10B981) else Color(0xFFEF4444),
+                                    fontWeight = FontWeight.Bold
+                                )
+                            )
+                            Text(
+                                text = String.format(Locale.US, "%s$%,.2f USD", if (totalMensalEvents >= 0) "+" else "", totalMensalEvents),
+                                style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF64748B))
+                            )
+                        }
+
+                        Column(modifier = Modifier.weight(1f), horizontalAlignment = Alignment.End) {
+                            Text(
+                                text = "NÚMERO DE ORDENS",
+                                style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF64748B), fontWeight = FontWeight.Bold)
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = "$orderCount ordens",
+                                style = MaterialTheme.typography.titleMedium.copy(
+                                    color = Color.White,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            )
+                            Text(
+                                text = "Sincronizadas com o histórico",
+                                style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF64748B))
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
 fun DashboardScreen(
     loggedUser: com.example.data.GithubUser?,
     eaRobotStatus: com.example.ui.EaRobotStatus?,
+    eaRobotEvents: List<com.example.data.EaRobotEvent> = emptyList(),
     eaConfig: com.example.data.EaConfigEntity?,
+    chartScreenshot: com.example.ui.ChartScreenshotData = com.example.ui.ChartScreenshotData(),
+    financialTimeframe: com.example.ui.EquityTimeframe = com.example.ui.EquityTimeframe.PER_POSITION,
+    financialCandles: List<com.example.ui.FinancialCandle> = emptyList(),
+    financialTransactions: List<com.example.ui.FinancialTransaction> = emptyList(),
+    onSelectFinancialTimeframe: (com.example.ui.EquityTimeframe) -> Unit = {},
+    onRegisterDeposit: (Double, String) -> Unit = { _, _ -> },
+    onRegisterWithdrawal: (Double, String) -> Unit = { _, _ -> },
+    onRegisterClosedPosition: (String, Double, String) -> Unit = { _, _, _ -> },
+    onRequestScreenshot: () -> Unit = {},
     onSaveMt5Id: (String) -> Unit,
-    onStartTour: () -> Unit = {}
+    onStartTour: () -> Unit = {},
+    onTriggerSimulation: () -> Unit = {},
+    systemNotifications: List<SystemNotification> = emptyList(),
+    onNavigateToTab: (PortalTab) -> Unit = {},
+    onSaveEaConfig: (com.example.data.EaConfigEntity) -> Unit = {},
+    onFetchExchangeRate: (String, (Double?) -> Unit) -> Unit = { _, _ -> }
 ) {
     if (loggedUser == null) return
+
+    val currentCambio = eaConfig?.CAMBIO ?: 64.0
+    val currentMony = eaConfig?.mony ?: "MZN"
+    val currencySymbol = getCurrencySymbol(currentMony)
 
     val availableBalance = if (eaRobotStatus?.saldoDisponivel != null && eaRobotStatus.saldoDisponivel > 0.0) {
         eaRobotStatus.saldoDisponivel
     } else {
         loggedUser.saldo
+    }
+
+    val totalResultadoOrdem = remember(eaRobotEvents) {
+        var sum = 0.0
+        for (event in eaRobotEvents) {
+            if (event.diarioValor != 0.0) {
+                sum += event.diarioValor
+            }
+        }
+        sum
     }
 
     LazyColumn(
@@ -593,31 +1499,186 @@ fun DashboardScreen(
     ) {
         item {
             Spacer(modifier = Modifier.height(12.dp))
-            Text(
-                text = "PAINEL DA CONTA EA MT5",
-                style = MaterialTheme.typography.labelLarge.copy(
-                    fontWeight = FontWeight.Black,
-                    color = Color(0xFF22D3EE),
-                    letterSpacing = 2.sp
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "PAINEL DA CONTA EA MT5",
+                    style = MaterialTheme.typography.labelLarge.copy(
+                        fontWeight = FontWeight.Black,
+                        color = Color(0xFF22D3EE),
+                        letterSpacing = 2.sp
+                    )
                 )
-            )
+
+                Surface(
+                    onClick = onTriggerSimulation,
+                    shape = RoundedCornerShape(12.dp),
+                    color = Color(0xFF8B5CF6).copy(alpha = 0.2f),
+                    border = BorderStroke(1.dp, Color(0xFFC084FC).copy(alpha = 0.6f))
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.AutoMode,
+                            contentDescription = "Simulação",
+                            tint = Color(0xFFC084FC),
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "SIMULAR TUDO",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                color = Color(0xFFC084FC),
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 10.sp
+                            )
+                        )
+                    }
+                }
+            }
+        }
+
+        if (systemNotifications.isNotEmpty()) {
+            item {
+                SystemNotificationsBannerCard(
+                    notifications = systemNotifications,
+                    onNavigateToTab = onNavigateToTab
+                )
+            }
         }
 
         item {
-            // ISOLATED, PROMINENT HERO SALDO CARD (WITH CAMBIO)
+            // Simulation Quick Bar Card
+            Card(
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1B4B).copy(alpha = 0.95f)),
+                shape = RoundedCornerShape(16.dp),
+                border = BorderStroke(1.dp, Color(0xFF8B5CF6).copy(alpha = 0.5f)),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(14.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.FlashOn,
+                                contentDescription = "Simular Eventos",
+                                tint = Color(0xFFF59E0B),
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "SIMULADOR INTEGRAL DE EVENTOS & STATUS",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = Color(0xFFC084FC),
+                                    fontWeight = FontWeight.Black,
+                                    letterSpacing = 0.5.sp
+                                )
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = "Gere dados de pré-visualização para Relatórios, Ordens, Posição, Sessão e Filtros do Robô EA.",
+                            style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8), fontSize = 11.sp)
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.width(8.dp))
+
+                    Button(
+                        onClick = onTriggerSimulation,
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8B5CF6)),
+                        shape = RoundedCornerShape(12.dp),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                    ) {
+                        Text(
+                            text = "DISPARAR",
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold, color = Color.White)
+                        )
+                    }
+                }
+            }
+        }
+
+        item {
+            // ISOLATED, PROMINENT HERO SALDO CARD (WITH CAMBIO AND RESULTADOS DA ORDEM)
             HeroEaBalanceCard(
                 saldo = availableBalance,
-                creditoGuardado = loggedUser.creditoGuardado,
+                resultadoOrdem = totalResultadoOrdem,
                 isOnline = eaRobotStatus?.online == true,
                 temPosicao = eaRobotStatus?.temPosicao == true,
-                cambio = eaConfig?.CAMBIO ?: 64.0,
-                currencySymbol = "MT"
+                cambio = currentCambio,
+                currencySymbol = currencySymbol
             )
         }
 
         item {
             // Real-time Robot Execution Card
-            EaRobotStatusCard(eaRobotStatus, cambio = eaConfig?.CAMBIO ?: 64.0)
+            EaRobotStatusCard(eaRobotStatus, cambio = currentCambio)
+        }
+
+        item {
+            // Chart Screenshot Card with MQL5 Objects
+            ChartScreenshotCard(
+                chartScreenshot = chartScreenshot,
+                onRequestScreenshot = onRequestScreenshot,
+                onViewFullChart = {},
+                onViewMql5Code = {}
+            )
+        }
+
+        item {
+            // Painel de Gráfico Candlestick de Patrimônio, Posições, Depósitos e Saques
+            FinancialEquityCandlestickCard(
+                candles = financialCandles,
+                currentTimeframe = financialTimeframe,
+                onSelectTimeframe = onSelectFinancialTimeframe,
+                cambio = currentCambio,
+                currencySymbol = currencySymbol
+            )
+        }
+
+        item {
+            // Acumulador e Pré-visualização de Resultados das Ordens
+            OrderResultsAccumulatorCard(
+                eaRobotEvents = eaRobotEvents,
+                financialCandles = financialCandles,
+                financialTransactions = financialTransactions,
+                cambio = currentCambio,
+                currencySymbol = currencySymbol,
+                onTriggerSimulation = onTriggerSimulation
+            )
+        }
+
+        item {
+            // Botões de Câmbio & Seletor de Moeda para a Aba de Conta
+            AccountCurrencySelectorCard(
+                currentMony = currentMony,
+                currentCambio = currentCambio,
+                onSelectCurrency = { code, defaultRate ->
+                    val baseConfig = eaConfig ?: com.example.data.EaConfigEntity(mt5AccountId = loggedUser.mt5IdConta)
+                    val updated = baseConfig.copy(mony = code, CAMBIO = defaultRate)
+                    onSaveEaConfig(updated)
+                },
+                onUpdateRateOnline = { targetCode ->
+                    onFetchExchangeRate(targetCode) { newRate ->
+                        if (newRate != null && newRate > 0.0) {
+                            val baseConfig = eaConfig ?: com.example.data.EaConfigEntity(mt5AccountId = loggedUser.mt5IdConta)
+                            val updated = baseConfig.copy(mony = targetCode, CAMBIO = newRate)
+                            onSaveEaConfig(updated)
+                        }
+                    }
+                }
+            )
         }
 
         item {
@@ -680,7 +1741,9 @@ fun DashboardScreen(
 fun ClientLicenseScreen(
     loggedUser: com.example.data.GithubUser?,
     refundRequests: List<RefundRequest>,
-    onRequestNewRefund: () -> Unit
+    onRequestNewRefund: () -> Unit,
+    systemNotifications: List<SystemNotification> = emptyList(),
+    onNavigateToTab: (PortalTab) -> Unit = {}
 ) {
     if (loggedUser == null) return
 
@@ -702,6 +1765,15 @@ fun ClientLicenseScreen(
             )
         }
 
+        if (systemNotifications.isNotEmpty()) {
+            item {
+                SystemNotificationsBannerCard(
+                    notifications = systemNotifications,
+                    onNavigateToTab = onNavigateToTab
+                )
+            }
+        }
+
         item {
             WelcomeHeader(loggedUser.nome, loggedUser.mt5IdConta)
         }
@@ -713,7 +1785,8 @@ fun ClientLicenseScreen(
         item {
             LicenseStatusCard(
                 status = if (loggedUser.licencaAtiva) "ATIVA" else "EXPIRADA",
-                expiryDate = loggedUser.licencaValidade
+                expiryDate = loggedUser.licencaValidade,
+                creditoGuardado = loggedUser.creditoGuardado
             )
         }
 
@@ -816,8 +1889,24 @@ fun ClientLicenseScreen(
 @Composable
 fun EaRobotEventsScreen(
     events: List<com.example.data.EaRobotEvent>,
-    mt5AccountId: String
+    mt5AccountId: String,
+    onClearEvents: () -> Unit = {}
 ) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val readKeys by PortalEventQueueManager.readEventKeys.collectAsStateWithLifecycle()
+
+    val visibleEvents = remember(events) {
+        events.filterNot { evt ->
+            evt.event.equals("posicao_alterada", ignoreCase = true) ||
+            evt.event.contains("posicao_alterada", ignoreCase = true)
+        }
+    }
+
+    val readCount = remember(visibleEvents, readKeys) {
+        visibleEvents.count { readKeys.contains(PortalEventQueueManager.getEventUniqueKey(it)) }
+    }
+    val unreadCount = visibleEvents.size - readCount
+
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -826,44 +1915,161 @@ fun EaRobotEventsScreen(
     ) {
         item {
             Spacer(modifier = Modifier.height(12.dp))
-            Row(
+            Surface(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+                color = Color(0xFF0F172A),
+                shape = RoundedCornerShape(16.dp),
+                border = BorderStroke(1.dp, Color(0xFF1E293B))
             ) {
-                Column {
-                    Text(
-                        text = "EVENTOS E LOGS DO ROBÔ EA",
-                        style = MaterialTheme.typography.labelLarge.copy(
-                            fontWeight = FontWeight.Black,
-                            color = Color(0xFF22D3EE),
-                            letterSpacing = 2.sp
-                        )
-                    )
-                    Text(
-                        text = if (mt5AccountId.isNotBlank()) "Conta MT5: $mt5AccountId" else "Todas as Contas",
-                        style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8))
-                    )
-                }
-
-                Surface(
-                    color = Color(0xFF1E293B),
-                    shape = RoundedCornerShape(12.dp),
-                    border = BorderStroke(1.dp, Color(0xFF334155))
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    Text(
-                        text = "${events.size} Eventos Visíveis",
-                        style = MaterialTheme.typography.labelSmall.copy(
-                            color = Color(0xFF22D3EE),
-                            fontWeight = FontWeight.Bold
-                        ),
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
-                    )
+                    // Title and Accounts + Badge Counts
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "EVENTOS E LOGS DO ROBÔ EA",
+                                style = MaterialTheme.typography.titleSmall.copy(
+                                    fontWeight = FontWeight.Black,
+                                    color = Color(0xFF22D3EE),
+                                    letterSpacing = 0.5.sp
+                                )
+                            )
+                            Text(
+                                text = if (mt5AccountId.isNotBlank()) "Conta MT5: $mt5AccountId" else "Todas as Contas",
+                                style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8))
+                            )
+                        }
+
+                        Surface(
+                            color = Color(0xFF1E293B),
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, Color(0xFF334155))
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "${visibleEvents.size} Total",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        color = Color(0xFF22D3EE),
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                )
+                                Text(
+                                    text = "•",
+                                    style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF64748B))
+                                )
+                                Text(
+                                    text = "$readCount Lidos",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        color = Color(0xFF34D399),
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                )
+                                if (unreadCount > 0) {
+                                    Text(
+                                        text = "•",
+                                        style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF64748B))
+                                    )
+                                    Text(
+                                        text = "$unreadCount Pendentes",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            color = Color(0xFFF59E0B),
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    // Action buttons row
+                    if (visibleEvents.isNotEmpty()) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Surface(
+                                onClick = {
+                                    PortalEventQueueManager.markAllAsRead(visibleEvents)
+                                    android.widget.Toast.makeText(context, "Todos os eventos foram marcados como lidos", android.widget.Toast.LENGTH_SHORT).show()
+                                },
+                                color = Color(0xFF10B981).copy(alpha = 0.15f),
+                                shape = RoundedCornerShape(10.dp),
+                                border = BorderStroke(1.dp, Color(0xFF10B981).copy(alpha = 0.4f)),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(vertical = 8.dp, horizontal = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.Center
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.CheckCircle,
+                                        contentDescription = "Marcar como Lidos",
+                                        tint = Color(0xFF34D399),
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "Marcar Lidos",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            color = Color(0xFF34D399),
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    )
+                                }
+                            }
+
+                            Surface(
+                                onClick = {
+                                    PortalEventQueueManager.clearAll(context)
+                                    onClearEvents()
+                                },
+                                color = Color(0xFFEF4444).copy(alpha = 0.15f),
+                                shape = RoundedCornerShape(10.dp),
+                                border = BorderStroke(1.dp, Color(0xFFEF4444).copy(alpha = 0.4f)),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(vertical = 8.dp, horizontal = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.Center
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Delete,
+                                        contentDescription = "Limpar Eventos",
+                                        tint = Color(0xFFF87171),
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "Limpar",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            color = Color(0xFFF87171),
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        if (events.isEmpty()) {
+        if (visibleEvents.isEmpty()) {
             item {
                 Card(
                     colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B).copy(alpha = 0.5f)),
@@ -903,7 +2109,7 @@ fun EaRobotEventsScreen(
                 }
             }
         } else {
-            items(events) { event ->
+            items(visibleEvents) { event ->
                 EaEventItemCard(event = event)
             }
         }
@@ -914,9 +2120,118 @@ fun EaRobotEventsScreen(
     }
 }
 
+fun sanitizeText(input: String): String {
+    if (input.isBlank()) return ""
+    var s = input
+
+    // 1. Fix double/corrupted suffixes produced by previous replacements or raw EA concatenation
+    s = s.replace("ãoo", "ão")
+        .replace("ááo", "ção")
+        .replace("ááes", "ções")
+        .replace("áá", "á")
+
+    // 2. Specific fixes for MT5 EA text errors and missing accents
+    s = s.replace("configuraçãoo", "configuração")
+        .replace("utilizaçãoo", "utilização")
+        .replace("organizaçãoo", "organização")
+        .replace("formaçãoo", "formação")
+        .replace("operaçãoo", "operação")
+        .replace("validaçãoo", "validação")
+        .replace("recalculari", "recalcular")
+        .replace("resistncias", "resistências")
+        .replace("resistncia", "resistência")
+        .replace("expanso", "expansão")
+        .replace("expanses", "expansões")
+        .replace("concluso", "conclusão")
+        .replace("concluses", "conclusões")
+        .replace(" Aps ", " Após ")
+        .replace("Aps ", "Após ")
+        .replace("aps ", "após ")
+        .replace(" poder ser", " poderá ser")
+        .replace("fase  aumentar", "fase é aumentar")
+        .replace(" fase  ", " fase é ")
+        .replace(" at ", " até ")
+        .replace(" necessrios", " necessários")
+        .replace("necessrio", "necessário")
+        .replace("necessria", "necessária")
+        .replace("necessrias", "necessárias")
+        .replace("vlida", "válida")
+        .replace("vlido", "válido")
+        .replace("organizao", "organização")
+        .replace("informaes", "informações")
+        .replace("informaçoes", "informações")
+        .replace("formao", "formação")
+        .replace("preos", "preços")
+        .replace("decises", "decisões")
+        .replace("posicao", "posição")
+        .replace("posicoes", "posições")
+        .replace("execucao", "execução")
+        .replace("modificacao", "modificação")
+        .replace("protecao", "proteção")
+        .replace("operacao", "operação")
+        .replace("transicao", "transição")
+        .replace("alteracao", "alteração")
+        .replace("notificacao", "notificação")
+        .replace("configuracao", "configuração")
+        .replace("utilizacao", "utilização")
+        .replace("validacao", "validação")
+        .replace("atuao", "atuação")
+        .replace("anlise", "análise")
+        .replace("anlises", "análises")
+        .replace("automtica", "automática")
+        .replace("automtico", "automático")
+        .replace("parmetro", "parâmetro")
+        .replace("parmetros", "parâmetros")
+        .replace("estratgia", "estratégia")
+        .replace("estratgias", "estratégias")
+        .replace("caractersticas", "características")
+        .replace("compatveis", "compatíveis")
+        .replace("visveis", "visíveis")
+        .replace("nvel", "nível")
+        .replace("nveis", "níveis")
+        .replace("incio", "início")
+        .replace("concludo", "concluído")
+        .replace("concluda", "concluída")
+        .replace("tendncia", "tendência")
+        .replace("tendncias", "tendências")
+        .replace("variao", "variação")
+        .replace("revises", "revisões")
+        .replace("condies", "condições")
+        .replace("perodo", "período")
+        .replace("perodos", "períodos")
+        .replace("referncias", "referências")
+        .replace("substitudas", "substituídas")
+        .replace("substitudo", "substituído")
+        .replace("proxima", "próxima")
+        .replace("proximo", "próximo")
+        .replace("prxmo", "próximo")
+
+    // 3. Fallback for raw \uFFFD or ?? bytes leftover
+    s = s.replace("\uFFFD\uFFFDes", "ções")
+        .replace("\uFFFD\uFFFD", "ção")
+        .replace("\uFFFDes", "ções")
+        .replace("\uFFFDos", "ços")
+        .replace("a\uFFFD\uFFFD", "ação")
+        .replace("a\uFFFD", "ação")
+        .replace("\uFFFD", "")
+        .replace("??", "")
+
+    // 4. Clean formatting and spacing
+    s = s.replace("  ", " ")
+        .replace(" ,", ",")
+        .replace(" .", ".")
+        .replace(Regex("(\\p{L})\\.(\\p{Lu})"), "$1. $2")
+        .trim()
+
+    // 5. Final check against extra trailing 'o'
+    s = s.replace("ãoo", "ão")
+
+    return s
+}
+
 fun cleanStateEnumText(raw: String): String {
     if (raw.isBlank()) return ""
-    var s = raw.trim()
+    var s = sanitizeText(raw.trim())
     val prefixes = listOf(
         "ESTADO_DE_EXECUCAO_",
         "ESTADO_DE_PRECOS_",
@@ -924,7 +2239,8 @@ fun cleanStateEnumText(raw: String): String {
         "ESTADO_SICLO_DE_",
         "ESTADO_SICLO_",
         "ESTADO_DE_",
-        "ESTADO_"
+        "ESTADO_",
+        "notificacao_"
     )
     for (p in prefixes) {
         if (s.startsWith(p, ignoreCase = true)) {
@@ -932,96 +2248,338 @@ fun cleanStateEnumText(raw: String): String {
             break
         }
     }
-    return s.replace("_", " ").trim().uppercase()
+    s = s.replace("_", " ").trim().uppercase()
+    
+    return when (s) {
+        "ENTRY POSITION", "ENTRY_POSITION", "ENTRY" -> "ENTRADA DE POSIÇÃO"
+        "CLOSED POSITION", "CLOSED_POSITION", "CLOSED" -> "POSIÇÃO ENCERRADA"
+        "ORDER EXECUTED", "ORDER_EXECUTED" -> "ORDEM EXECUTADA"
+        "ORDER MODIFIED", "ORDER_MODIFIED" -> "ORDEM MODIFICADA"
+        "ORDER ERROR", "ORDER_ERROR" -> "ERRO DE ORDEM"
+        "PERIOD M1" -> "M1"
+        "PERIOD M5" -> "M5"
+        "PERIOD M15" -> "M15"
+        "PERIOD M30" -> "M30"
+        "PERIOD H1" -> "H1"
+        "PERIOD H4" -> "H4"
+        "PERIOD D1" -> "D1"
+        else -> s
+    }
 }
 
 fun detectStateSystemType(event: com.example.data.EaRobotEvent): String {
     val sysUpper = event.sistema.uppercase().trim()
-    val combined = "$sysUpper ${event.novo} ${event.anterior} ${event.event}".uppercase()
+    val combined = "$sysUpper ${event.novo} ${event.anterior} ".uppercase()
 
     return when {
-        sysUpper.contains("EXECU") || combined.contains("EXECUCAO") || combined.contains("ROBO") || combined.contains("COMPRA") || combined.contains("VENDA") -> "ESTADO DE EXECUÇÃO"
-        sysUpper.contains("PREÇO") || sysUpper.contains("PRECO") || combined.contains("PRECOS") || combined.contains("RANGE") || combined.contains("EXPANSAO") -> "ESTADO DE PREÇO"
-        sysUpper.contains("CICLO") || sysUpper.contains("CANAL") || combined.contains("SICLO") || combined.contains("CICLO") -> "ESTADO DE CICLO"
-        else -> if (sysUpper.isNotBlank()) cleanStateEnumText(sysUpper) else "ESTADO DE EXECUÇÃO"
+        sysUpper.contains("ESTADO DE EXECUCAO") || combined.contains("EXECUCAO")   -> "ESTADO DE EXECUÇÃO"
+        sysUpper.contains("ESTADO DE PRECOS") || combined.contains("EXPANSAO") -> "ESTADO DE PREÇO"
+        sysUpper.contains("ESTADO DE CANAL") || combined.contains("SICLO")  -> "ESTADO DE CICLO"
+        else -> if (sysUpper.isNotBlank()) cleanStateEnumText(sysUpper) else "ESTADO DE EXECUÇÃO" 
     }
 }
 
 object AppTtsManager {
     private var tts: android.speech.tts.TextToSpeech? = null
-    private var isInitializing = false
-    private var isReady = false
+    @Volatile private var isInitializing = false
+    @Volatile private var isReady = false
     private var activeMediaPlayer: android.media.MediaPlayer? = null
+    @Volatile private var currentSessionId: Long = 0L
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
 
+    fun selectMalePtPtVoice(voices: Collection<android.speech.tts.Voice>): android.speech.tts.Voice? {
+        // Priority 1: European Portuguese (pt-PT) explicitly male tagged (ptm, male, man, ptd, pt-pt-x-ptm)
+        val malePtPtExplicit = voices.firstOrNull { v ->
+            val loc = v.locale
+            val isPtPt = loc != null && loc.language == "pt" && (loc.country.equals("PT", ignoreCase = true) || v.name.lowercase().contains("pt-pt"))
+            val isMale = v.name.lowercase().let { n ->
+                (n.contains("male") || n.contains("ptm") || n.contains("ptd") || n.contains("man") || n.contains("x-m") || n.contains("x-ptm")) &&
+                !n.contains("female") && !n.contains("woman") && !n.contains("ptf") && !n.contains("vega")
+            }
+            isPtPt && isMale
+        }
+        if (malePtPtExplicit != null) return malePtPtExplicit
+
+        // Priority 2: European Portuguese (pt-PT) non-female voice
+        val ptPtNonFemale = voices.firstOrNull { v ->
+            val loc = v.locale
+            val isPtPt = loc != null && loc.language == "pt" && (loc.country.equals("PT", ignoreCase = true) || v.name.lowercase().contains("pt-pt"))
+            val isNotFemale = v.name.lowercase().let { n ->
+                !n.contains("female") && !n.contains("woman") && !n.contains("ptf") && !n.contains("vega")
+            }
+            isPtPt && isNotFemale
+        }
+        if (ptPtNonFemale != null) return ptPtNonFemale
+
+        // Priority 3: Any European Portuguese (pt-PT) voice
+        val anyPtPt = voices.firstOrNull { v ->
+            val loc = v.locale
+            loc != null && loc.language == "pt" && (loc.country.equals("PT", ignoreCase = true) || v.name.lowercase().contains("pt-pt"))
+        }
+        if (anyPtPt != null) return anyPtPt
+
+        // Priority 4: Portuguese male voice
+        return voices.firstOrNull { v ->
+            val loc = v.locale
+            val isPt = loc != null && loc.language == "pt"
+            val isMale = v.name.lowercase().let { n ->
+                (n.contains("male") || n.contains("ptm") || n.contains("man")) && !n.contains("female")
+            }
+            isPt && isMale
+        } ?: voices.firstOrNull { v ->
+            v.locale?.language == "pt"
+        }
+    }
+
+    @Synchronized
+    fun initIfNeeded(context: android.content.Context) {
+        if (tts != null || isInitializing) return
+        isInitializing = true
+        val appContext = context.applicationContext
+        var newTts: android.speech.tts.TextToSpeech? = null
+        newTts = android.speech.tts.TextToSpeech(appContext) { status ->
+            isInitializing = false
+            if (status == android.speech.tts.TextToSpeech.SUCCESS) {
+                val ptPtLocale = java.util.Locale("pt", "PT")
+                var langRes = newTts?.setLanguage(ptPtLocale)
+                if (langRes == android.speech.tts.TextToSpeech.LANG_MISSING_DATA || langRes == android.speech.tts.TextToSpeech.LANG_NOT_SUPPORTED) {
+                    langRes = newTts?.setLanguage(java.util.Locale("pt", "POR"))
+                }
+                if (langRes == android.speech.tts.TextToSpeech.LANG_MISSING_DATA || langRes == android.speech.tts.TextToSpeech.LANG_NOT_SUPPORTED) {
+                    langRes = newTts?.setLanguage(java.util.Locale("pt"))
+                }
+                if (langRes == android.speech.tts.TextToSpeech.LANG_MISSING_DATA || langRes == android.speech.tts.TextToSpeech.LANG_NOT_SUPPORTED) {
+                    newTts?.setLanguage(java.util.Locale.getDefault())
+                }
+
+                try {
+                    val voices = newTts?.voices
+                    if (voices != null) {
+                        val malePtVoice = selectMalePtPtVoice(voices)
+                        if (malePtVoice != null) {
+                            newTts?.voice = malePtVoice
+                        }
+                    }
+                } catch (e: Exception) {}
+
+                val audioAttributes = android.media.AudioAttributes.Builder()
+                    .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+                newTts?.setAudioAttributes(audioAttributes)
+                newTts?.setSpeechRate(1.00f)
+                newTts?.setPitch(0.96f)
+
+                tts = newTts
+                isReady = true
+            } else {
+                isReady = false
+            }
+        }
+    }
+
+    @Synchronized
     fun speak(
         context: android.content.Context,
         text: String,
-        onStart: () -> Unit,
-        onDone: () -> Unit,
-        onError: (String) -> Unit
+        onStart: () -> Unit = {},
+        onDone: () -> Unit = {},
+        onError: (String) -> Unit = {}
     ) {
-        val textToSpeak = text.trim()
-        if (textToSpeak.isBlank()) return
+        val rawClean = sanitizeText(text)
+        if (rawClean.isBlank()) {
+            onDone()
+            return
+        }
 
         stopAll()
-
+        val thisSessionId = currentSessionId
         val appContext = context.applicationContext
 
-        fun playViaMediaPlayerFallback() {
-            try {
-                val encodedText = java.net.URLEncoder.encode(textToSpeak.take(250), "UTF-8")
-                val audioUrl = "https://translate.google.com/translate_tts?ie=UTF-8&q=$encodedText&tl=pt&client=tw-ob"
-                val headers = mapOf("User-Agent" to "Mozilla/5.0 (Linux; Android 10)")
+        val hasCompleted = java.util.concurrent.atomic.AtomicBoolean(false)
 
-                val player = android.media.MediaPlayer().apply {
-                    setAudioAttributes(
-                        android.media.AudioAttributes.Builder()
-                            .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
-                            .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
-                            .build()
-                    )
-                    setDataSource(appContext, android.net.Uri.parse(audioUrl), headers)
-                    prepareAsync()
-                    setOnPreparedListener {
-                        android.os.Handler(android.os.Looper.getMainLooper()).post { onStart() }
-                        start()
-                    }
-                    setOnCompletionListener {
-                        android.os.Handler(android.os.Looper.getMainLooper()).post { onDone() }
-                        try { release() } catch (e: Exception) {}
-                        if (activeMediaPlayer == this) activeMediaPlayer = null
-                    }
-                    setOnErrorListener { mp, _, _ ->
-                        android.os.Handler(android.os.Looper.getMainLooper()).post {
-                            onDone()
-                            onError("Não foi possível carregar voz no dispositivo.")
-                        }
-                        try { mp.release() } catch (e: Exception) {}
-                        if (activeMediaPlayer == mp) activeMediaPlayer = null
-                        true
+        fun safeOnStart() {
+            if (thisSessionId != currentSessionId) return
+            mainHandler.post {
+                if (thisSessionId == currentSessionId) {
+                    onStart()
+                }
+            }
+        }
+
+        fun safeOnDone() {
+            if (hasCompleted.compareAndSet(false, true)) {
+                mainHandler.post {
+                    if (thisSessionId == currentSessionId) {
+                        onDone()
                     }
                 }
-                activeMediaPlayer = player
+            }
+        }
+
+        fun safeOnError(msg: String) {
+            if (hasCompleted.compareAndSet(false, true)) {
+                mainHandler.post {
+                    if (thisSessionId == currentSessionId) {
+                        onError(msg)
+                    }
+                }
+            }
+        }
+
+        fun playViaMediaPlayerFallback(cleanText: String) {
+            if (thisSessionId != currentSessionId) return
+
+            try { tts?.stop() } catch (e: Exception) {}
+
+            try {
+                val chunks = mutableListOf<String>()
+                var remaining = cleanText.trim()
+                while (remaining.isNotEmpty()) {
+                    if (remaining.length <= 180) {
+                        chunks.add(remaining)
+                        break
+                    }
+                    var cutIdx = remaining.lastIndexOf('.', 180)
+                    if (cutIdx <= 30) cutIdx = remaining.lastIndexOf(' ', 180)
+                    if (cutIdx <= 30) cutIdx = 180
+                    chunks.add(remaining.substring(0, cutIdx + 1).trim())
+                    remaining = remaining.substring(cutIdx + 1).trim()
+                }
+
+                if (chunks.isEmpty()) {
+                    safeOnDone()
+                    return
+                }
+
+                fun playChunk(idx: Int) {
+                    if (thisSessionId != currentSessionId) return
+                    if (idx >= chunks.size) {
+                        safeOnDone()
+                        return
+                    }
+                    val shortText = chunks[idx]
+                    val encodedText = java.net.URLEncoder.encode(shortText, "UTF-8")
+                    val audioUrl = "https://translate.google.com/translate_tts?ie=UTF-8&q=$encodedText&tl=pt-PT&client=tw-ob"
+                    val headers = mapOf("User-Agent" to "Mozilla/5.0 (Android; Mobile)")
+
+                    val player = android.media.MediaPlayer().apply {
+                        setAudioAttributes(
+                            android.media.AudioAttributes.Builder()
+                                .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
+                                .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                                .build()
+                        )
+                        setDataSource(appContext, android.net.Uri.parse(audioUrl), headers)
+                        prepareAsync()
+                        setOnPreparedListener {
+                            if (thisSessionId != currentSessionId) {
+                                try { release() } catch (e: Exception) {}
+                                return@setOnPreparedListener
+                            }
+                            if (idx == 0) {
+                                safeOnStart()
+                            }
+                            start()
+                        }
+                        setOnCompletionListener {
+                            try { release() } catch (e: Exception) {}
+                            if (activeMediaPlayer == this) activeMediaPlayer = null
+                            if (thisSessionId == currentSessionId) {
+                                playChunk(idx + 1)
+                            }
+                        }
+                        setOnErrorListener { mp, _, _ ->
+                            try { mp.release() } catch (e: Exception) {}
+                            if (activeMediaPlayer == mp) activeMediaPlayer = null
+                            if (thisSessionId == currentSessionId) {
+                                safeOnError("Não foi possível carregar voz no dispositivo.")
+                            }
+                            true
+                        }
+                    }
+                    activeMediaPlayer = player
+                }
+
+                playChunk(0)
             } catch (e: Exception) {
-                onDone()
-                onError("Erro de áudio: ${e.localizedMessage}")
+                safeOnError("Erro de áudio: ${e.localizedMessage}")
             }
         }
 
         fun doSpeakWithTts(engine: android.speech.tts.TextToSpeech) {
+            if (thisSessionId != currentSessionId) return
             try {
                 engine.stop()
+
+                val ptPtLocale = java.util.Locale("pt", "PT")
+                var langRes = engine.setLanguage(ptPtLocale)
+                if (langRes == android.speech.tts.TextToSpeech.LANG_MISSING_DATA || langRes == android.speech.tts.TextToSpeech.LANG_NOT_SUPPORTED) {
+                    langRes = engine.setLanguage(java.util.Locale("pt", "POR"))
+                }
+                if (langRes == android.speech.tts.TextToSpeech.LANG_MISSING_DATA || langRes == android.speech.tts.TextToSpeech.LANG_NOT_SUPPORTED) {
+                    langRes = engine.setLanguage(java.util.Locale("pt", "BR"))
+                }
+                if (langRes == android.speech.tts.TextToSpeech.LANG_MISSING_DATA || langRes == android.speech.tts.TextToSpeech.LANG_NOT_SUPPORTED) {
+                    langRes = engine.setLanguage(java.util.Locale("pt"))
+                }
+
+                if (langRes == android.speech.tts.TextToSpeech.LANG_MISSING_DATA || langRes == android.speech.tts.TextToSpeech.LANG_NOT_SUPPORTED) {
+                    playViaMediaPlayerFallback(rawClean)
+                    return
+                }
+
+                engine.setPitch(0.96f)
+                engine.setSpeechRate(1.00f)
+
+                try {
+                    val voices = engine.voices
+                    if (voices != null) {
+                        val ptVoice = selectMalePtPtVoice(voices)
+                        if (ptVoice != null) {
+                            engine.voice = ptVoice
+                        }
+                    }
+                } catch (e: Exception) {}
+
+                val formattedText = rawClean
+                    .replace(Regex("\\.{2,}"), ".")
+                    .replace(Regex(",{2,}"), ",")
+                    .replace(Regex("(?<=\\w)\\.\\s+(?=\\w)"), ", ")
+                    .replace(Regex("\\s+"), " ")
+                    .trim()
+
+                if (formattedText.isBlank()) {
+                    safeOnDone()
+                    return
+                }
+
+                val chunks = if (formattedText.length <= 1500) {
+                    listOf(formattedText)
+                } else {
+                    formattedText.split(Regex("(?<=[.!?])\\s+")).filter { it.isNotBlank() }
+                }
+
+                val firstUttId = "PORTAL_TTS_${thisSessionId}_0"
+                val lastUttId = "PORTAL_TTS_${thisSessionId}_${chunks.size - 1}"
+
                 engine.setOnUtteranceProgressListener(object : android.speech.tts.UtteranceProgressListener() {
                     override fun onStart(utteranceId: String?) {
-                        android.os.Handler(android.os.Looper.getMainLooper()).post { onStart() }
+                        if (thisSessionId != currentSessionId) return
+                        if (utteranceId == firstUttId) {
+                            safeOnStart()
+                        }
                     }
                     override fun onDone(utteranceId: String?) {
-                        android.os.Handler(android.os.Looper.getMainLooper()).post { onDone() }
+                        if (thisSessionId != currentSessionId) return
+                        if (utteranceId == lastUttId) {
+                            safeOnDone()
+                        }
                     }
                     override fun onError(utteranceId: String?) {
-                        android.os.Handler(android.os.Looper.getMainLooper()).post {
-                            playViaMediaPlayerFallback()
-                        }
+                        if (thisSessionId != currentSessionId) return
+                        try { engine.stop() } catch (e: Exception) {}
+                        safeOnError("Erro durante a reprodução de voz.")
                     }
                 })
 
@@ -1029,12 +2587,26 @@ object AppTtsManager {
                     putInt(android.speech.tts.TextToSpeech.Engine.KEY_PARAM_STREAM, android.media.AudioManager.STREAM_MUSIC)
                     putFloat(android.speech.tts.TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
                 }
-                val result = engine.speak(textToSpeak, android.speech.tts.TextToSpeech.QUEUE_FLUSH, params, "PORTAL_TTS_${System.currentTimeMillis()}")
-                if (result != android.speech.tts.TextToSpeech.SUCCESS) {
-                    playViaMediaPlayerFallback()
+
+                var queueMode = android.speech.tts.TextToSpeech.QUEUE_FLUSH
+                var successCount = 0
+                for ((idx, chunk) in chunks.withIndex()) {
+                    if (thisSessionId != currentSessionId) break
+                    val uttId = "PORTAL_TTS_${thisSessionId}_$idx"
+                    val res = engine.speak(chunk, queueMode, params, uttId)
+                    if (res == android.speech.tts.TextToSpeech.SUCCESS) {
+                        successCount++
+                        queueMode = android.speech.tts.TextToSpeech.QUEUE_ADD
+                    }
+                }
+
+                if (successCount == 0 && thisSessionId == currentSessionId) {
+                    playViaMediaPlayerFallback(rawClean)
                 }
             } catch (e: Exception) {
-                playViaMediaPlayerFallback()
+                if (thisSessionId == currentSessionId) {
+                    playViaMediaPlayerFallback(rawClean)
+                }
             }
         }
 
@@ -1044,44 +2616,29 @@ object AppTtsManager {
             return
         }
 
-        if (isInitializing) {
-            playViaMediaPlayerFallback()
-            return
-        }
+        initIfNeeded(context)
 
-        isInitializing = true
-        var newTts: android.speech.tts.TextToSpeech? = null
-        newTts = android.speech.tts.TextToSpeech(appContext) { status ->
-            isInitializing = false
-            if (status == android.speech.tts.TextToSpeech.SUCCESS) {
-                var langRes = newTts?.setLanguage(java.util.Locale("pt", "BR"))
-                if (langRes == android.speech.tts.TextToSpeech.LANG_MISSING_DATA || langRes == android.speech.tts.TextToSpeech.LANG_NOT_SUPPORTED) {
-                    langRes = newTts?.setLanguage(java.util.Locale("pt", "PT"))
-                }
-                if (langRes == android.speech.tts.TextToSpeech.LANG_MISSING_DATA || langRes == android.speech.tts.TextToSpeech.LANG_NOT_SUPPORTED) {
-                    langRes = newTts?.setLanguage(java.util.Locale("pt"))
-                }
-                if (langRes == android.speech.tts.TextToSpeech.LANG_MISSING_DATA || langRes == android.speech.tts.TextToSpeech.LANG_NOT_SUPPORTED) {
-                    newTts?.setLanguage(java.util.Locale.getDefault())
-                }
-
-                val audioAttributes = android.media.AudioAttributes.Builder()
-                    .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
-                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build()
-                newTts?.setAudioAttributes(audioAttributes)
-                newTts?.setSpeechRate(0.95f)
-
-                tts = newTts
-                isReady = true
-                newTts?.let { doSpeakWithTts(it) }
+        var attempts = 0
+        fun checkReadyAndSpeak() {
+            if (thisSessionId != currentSessionId) return
+            val readyTts = tts
+            if (readyTts != null && isReady) {
+                doSpeakWithTts(readyTts)
+            } else if (attempts < 60) {
+                attempts++
+                mainHandler.postDelayed({ checkReadyAndSpeak() }, 100)
             } else {
-                playViaMediaPlayerFallback()
+                playViaMediaPlayerFallback(rawClean)
             }
         }
+
+        checkReadyAndSpeak()
     }
 
+    @Synchronized
     fun stopAll() {
+        currentSessionId++
+        mainHandler.removeCallbacksAndMessages(null)
         try {
             tts?.stop()
         } catch (e: Exception) {}
@@ -1093,120 +2650,501 @@ object AppTtsManager {
     }
 }
 
-@Composable
-fun ClassicEventCard(event: com.example.data.EaRobotEvent) {
-    val context = androidx.compose.ui.platform.LocalContext.current
-    var isSpeaking by remember { mutableStateOf(false) }
+enum class EventReadState {
+    UNREAD,    // Não lido (Sinal Cinza)
+    IN_QUEUE,  // Na fila (Sinal Amarelo)
+    READING,   // Lendo (Sinal Azul)
+    READ       // Lido (Sinal Verde)
+}
 
-    DisposableEffect(Unit) {
-        onDispose {
-            if (isSpeaking) {
-                AppTtsManager.stopAll()
-            }
+object PortalEventQueueManager {
+    private val _readEventKeys = kotlinx.coroutines.flow.MutableStateFlow<Set<String>>(emptySet())
+    val readEventKeys: kotlinx.coroutines.flow.StateFlow<Set<String>> get() = _readEventKeys
+
+    private val _currentlyReadingKey = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
+    val currentlyReadingKey: kotlinx.coroutines.flow.StateFlow<String?> get() = _currentlyReadingKey
+
+    private val _queuedEventKeys = kotlinx.coroutines.flow.MutableStateFlow<List<String>>(emptyList())
+    val queuedEventKeys: kotlinx.coroutines.flow.StateFlow<List<String>> get() = _queuedEventKeys
+
+    private val processedKeys = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+    private val queue = java.util.Collections.synchronizedList(mutableListOf<com.example.data.EaRobotEvent>())
+    @Volatile private var isProcessing = false
+
+    fun getEventUniqueKey(event: com.example.data.EaRobotEvent): String {
+        return if (event.id.isNotBlank() && event.id != "0") {
+            "id_${event.id}_ts_${event.timestamp}_evt_${event.event}"
+        } else {
+            "login_${event.login}_ts_${event.timestamp}_evt_${event.event}_sys_${event.sistema}_new_${event.novo}_msg_${event.msg.hashCode()}"
         }
     }
 
-    val eventLower = remember(event) { event.event.lowercase() }
-
-    val isRelatorio = remember(eventLower) {
-        eventLower.contains("relatorio") || eventLower.contains("financeiro")
-    }
-    val isSessao = remember(eventLower) {
-        eventLower.contains("sessao") || eventLower.contains("sessão")
-    }
-    val isEquador = remember(eventLower) {
-        eventLower.contains("equador")
-    }
-    val isInicializacao = remember(eventLower) {
-        eventLower.contains("inicializ")
-    }
-    val isStateChange = remember(eventLower, event) {
-        event.anterior.isNotEmpty() || event.novo.isNotEmpty() || event.descNovo.isNotEmpty() ||
-                eventLower.contains("mudanca") || eventLower.contains("estado") || eventLower.contains("status")
-    }
-
-    val (cardTitle, badgeIcon, badgeColor) = remember(event, eventLower) {
-        when {
-            isRelatorio -> Triple("RELATÓRIO FINANCEIRO EA", Icons.Default.TrendingUp, Color(0xFF10B981))
-            isSessao -> {
-                val isStart = eventLower.contains("inicio") || eventLower.contains("start")
-                Triple("SESSÃO FOREX ${if (isStart) "INICIADA" else "ENCERRADA"}", Icons.Default.Schedule, Color(0xFF38BDF8))
-            }
-            isEquador -> Triple("TRANSIÇÃO EQUADOR", Icons.Default.CompareArrows, Color(0xFFF59E0B))
-            isInicializacao -> Triple("INICIALIZAÇÃO DO ROBÔ", Icons.Default.PlayArrow, Color(0xFF10B981))
-            isStateChange -> {
-                val sysCat = detectStateSystemType(event)
-                Triple(sysCat, Icons.Default.Tune, Color(0xFF22D3EE))
-            }
-            eventLower.contains("erro") -> Triple("ERRO DE EXECUÇÃO", Icons.Default.Error, Color(0xFFEF4444))
-            eventLower.contains("alerta") || eventLower.contains("warning") -> Triple("ALERTA DO SISTEMA", Icons.Default.Warning, Color(0xFFF59E0B))
-            else -> Triple("EVENTO: ${event.event.uppercase().replace("_", " ")}", Icons.Default.Info, Color(0xFF38BDF8))
+    fun getReadState(event: com.example.data.EaRobotEvent): EventReadState {
+        val key = getEventUniqueKey(event)
+        return when {
+            _readEventKeys.value.contains(key) -> EventReadState.READ
+            _currentlyReadingKey.value == key -> EventReadState.READING
+            _queuedEventKeys.value.contains(key) -> EventReadState.IN_QUEUE
+            else -> EventReadState.UNREAD
         }
     }
 
-    val textToSpeak = remember(event, isRelatorio, isSessao, isEquador, isInicializacao, isStateChange) {
-        when {
-            isRelatorio -> {
-                buildString {
-                    append("Relatório financeiro do robô Fimaster. ")
-                    if (event.diarioStatus.isNotBlank()) append("Diário: ${event.diarioStatus} de ${event.diarioValor} ${event.moeda}. ")
-                    if (event.semanalStatus.isNotBlank()) append("Semanal: ${event.semanalStatus} de ${event.semanalValor} ${event.moeda}. ")
-                    if (event.motivacao.isNotBlank()) append("Motivação: ${event.motivacao}. ")
-                    if (event.resumo.isNotBlank()) append("Resumo: ${event.resumo}.")
+    @Synchronized
+    fun onEventsReceived(context: android.content.Context, events: List<com.example.data.EaRobotEvent>) {
+        if (events.isEmpty()) return
+
+        val currentReadSet = _readEventKeys.value
+
+        val newEvents = events.filter { evt ->
+            val key = getEventUniqueKey(evt)
+            !currentReadSet.contains(key) &&
+            _currentlyReadingKey.value != key &&
+            !processedKeys.contains(key) &&
+            !queue.any { getEventUniqueKey(it) == key }
+        }
+
+        if (newEvents.isNotEmpty()) {
+            val sortedNew = newEvents.sortedBy { if (it.timestamp > 0L) it.timestamp else 0L }
+            synchronized(queue) {
+                sortedNew.forEach { evt ->
+                    val key = getEventUniqueKey(evt)
+                    if (!queue.any { getEventUniqueKey(it) == key } && !processedKeys.contains(key)) {
+                        processedKeys.add(key)
+                        queue.add(evt)
+                    }
                 }
+                _queuedEventKeys.value = queue.map { getEventUniqueKey(it) }
             }
-            isSessao -> {
-                val action = if (eventLower.contains("inicio") || eventLower.contains("start")) "iniciada" else "encerrada"
-                "Sessão Forex ${event.sessao.ifEmpty { "Mercado" }} $action para o ativo ${event.symbol}."
-            }
-            isEquador -> {
-                "Linha do Equador alterada de ${cleanStateEnumText(event.anterior)} para ${cleanStateEnumText(event.novo)} no ativo ${event.symbol}."
-            }
-            isInicializacao -> {
-                "Robô EA Fimaster inicializado no ativo ${event.symbol} no servidor ${event.server} para a conta ${event.login}."
-            }
-            isStateChange -> {
-                val stateText = cleanStateEnumText(event.novo.ifEmpty { event.anterior })
-                val desc = cleanStateEnumText(event.descNovo.ifEmpty { event.descAnterior.ifEmpty { event.msg } })
-                val sysName = detectStateSystemType(event)
-                "Mudança de estado no $sysName. Estado: $stateText. $desc"
-            }
-            else -> {
-                "Evento ${event.event}: ${cleanStateEnumText(event.msg.ifEmpty { event.resumo.ifEmpty { "Registrado para o ativo " + event.symbol } })}"
-            }
+            processNextInQueue(context)
         }
     }
 
-    fun speakText(showToast: Boolean = true) {
-        if (textToSpeak.isBlank()) return
+    @Synchronized
+    private fun processNextInQueue(context: android.content.Context) {
+        if (isProcessing) return
 
-        if (isSpeaking) {
-            AppTtsManager.stopAll()
-            isSpeaking = false
+        val nextEvent = synchronized(queue) {
+            if (queue.isEmpty()) null else queue.removeAt(0)
+        }
+
+        if (nextEvent == null) {
+            _currentlyReadingKey.value = null
+            _queuedEventKeys.value = synchronized(queue) { queue.map { getEventUniqueKey(it) } }
+            isProcessing = false
             return
         }
 
-        if (showToast) {
-            android.widget.Toast.makeText(context, "🔊 Reproduzindo áudio...", android.widget.Toast.LENGTH_SHORT).show()
+        isProcessing = true
+        val key = getEventUniqueKey(nextEvent)
+        processedKeys.add(key)
+        _currentlyReadingKey.value = key
+        _queuedEventKeys.value = synchronized(queue) { queue.map { getEventUniqueKey(it) } }
+
+        val textToSpeak = getEventSpeechText(nextEvent)
+
+        if (textToSpeak.isBlank()) {
+            markAsRead(key)
+            isProcessing = false
+            processNextInQueue(context)
+            return
         }
 
         AppTtsManager.speak(
             context = context,
             text = textToSpeak,
-            onStart = { isSpeaking = true },
-            onDone = { isSpeaking = false },
+            onStart = {
+                _currentlyReadingKey.value = key
+                val title = nextEvent.resumo.ifEmpty { nextEvent.event.ifEmpty { "Evento" } }
+                android.widget.Toast.makeText(context, "🔊 Lendo evento: $title", android.widget.Toast.LENGTH_SHORT).show()
+            },
+            onDone = {
+                markAsRead(key)
+                _currentlyReadingKey.value = null
+                isProcessing = false
+                processNextInQueue(context)
+            },
             onError = { msg ->
-                isSpeaking = false
-                android.widget.Toast.makeText(context, msg, android.widget.Toast.LENGTH_SHORT).show()
+                processedKeys.remove(key)
+                _currentlyReadingKey.value = null
+                isProcessing = false
+                android.widget.Toast.makeText(context, "⚠️ Falha ao ler evento: $msg", android.widget.Toast.LENGTH_SHORT).show()
+                processNextInQueue(context)
             }
         )
     }
 
+    fun markAsRead(key: String) {
+        processedKeys.add(key)
+        val updated = _readEventKeys.value.toMutableSet()
+        updated.add(key)
+        _readEventKeys.value = updated
+        if (_currentlyReadingKey.value == key) {
+            _currentlyReadingKey.value = null
+        }
+    }
+
+    fun markAllAsRead(events: List<com.example.data.EaRobotEvent>) {
+        stopAllQueue()
+        val updated = _readEventKeys.value.toMutableSet()
+        events.forEach { evt ->
+            val key = getEventUniqueKey(evt)
+            updated.add(key)
+            processedKeys.add(key)
+        }
+        _readEventKeys.value = updated
+    }
+
+    fun stopAllQueue() {
+        AppTtsManager.stopAll()
+        synchronized(queue) { queue.clear() }
+        _queuedEventKeys.value = emptyList()
+        _currentlyReadingKey.value = null
+        isProcessing = false
+    }
+
+    fun speakSingleEvent(context: android.content.Context, event: com.example.data.EaRobotEvent) {
+        val key = getEventUniqueKey(event)
+
+        if (_currentlyReadingKey.value == key) {
+            AppTtsManager.stopAll()
+            markAsRead(key)
+            isProcessing = false
+            processNextInQueue(context)
+            return
+        }
+
+        AppTtsManager.stopAll()
+        synchronized(queue) {
+            queue.removeAll { getEventUniqueKey(it) == key }
+            queue.add(0, event)
+        }
+        isProcessing = false
+        processNextInQueue(context)
+    }
+
+    fun clearAll(context: android.content.Context) {
+        stopAllQueue()
+        processedKeys.clear()
+        _readEventKeys.value = emptySet()
+    }
+}
+
+@Composable
+fun EventReadSignalBadge(
+    readState: EventReadState,
+    modifier: Modifier = Modifier
+) {
+    val (bgColor, borderColor, textColor, statusText) = when (readState) {
+        EventReadState.READ -> Tuple4(
+            Color(0xFF10B981).copy(alpha = 0.2f),
+            Color(0xFF10B981),
+            Color(0xFF34D399),
+            "LIDO"
+        )
+        EventReadState.READING -> Tuple4(
+            Color(0xFF0284C7).copy(alpha = 0.25f),
+            Color(0xFF38BDF8),
+            Color(0xFF38BDF8),
+            "LENDO..."
+        )
+        EventReadState.IN_QUEUE -> Tuple4(
+            Color(0xFFF59E0B).copy(alpha = 0.2f),
+            Color(0xFFFBBF24),
+            Color(0xFFFBBF24),
+            "NA FILA"
+        )
+        EventReadState.UNREAD -> Tuple4(
+            Color(0xFF64748B).copy(alpha = 0.2f),
+            Color(0xFF64748B).copy(alpha = 0.6f),
+            Color(0xFF94A3B8),
+            "NÃO LIDO"
+        )
+    }
+
+    val dotColor = when (readState) {
+        EventReadState.READ -> Color(0xFF10B981)
+        EventReadState.READING -> Color(0xFF38BDF8)
+        EventReadState.IN_QUEUE -> Color(0xFFFBBF24)
+        EventReadState.UNREAD -> Color(0xFF94A3B8)
+    }
+
+    Surface(
+        color = bgColor,
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, borderColor),
+        modifier = modifier
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(6.dp)
+                    .background(dotColor, CircleShape)
+            )
+            Text(
+                text = statusText,
+                style = MaterialTheme.typography.labelSmall.copy(
+                    color = textColor,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 9.sp
+                )
+            )
+        }
+    }
+}
+
+private data class Tuple4<A, B, C, D>(val a: A, val b: B, val c: C, val d: D)
+
+fun getEventSpeechText(event: com.example.data.EaRobotEvent): String {
+    if (com.example.data.isPingOrStatusEvent(event)) return ""
+
+    val eventLower = event.event.lowercase()
+
+    val isOrdemExecutada = eventLower == "ordem_executada" || eventLower == "ordem executada" || eventLower == "order_executed" || eventLower == "ordem_aberta"
+    val isOrdemModificada = eventLower == "ordem_modificada" || eventLower == "ordem modificada" || eventLower == "order_modified" || eventLower == "sl_tp_modificado"
+    val isErroOrdem = eventLower == "erro_ordem" || eventLower == "erro ordem" || eventLower == "order_error" || (eventLower.contains("erro") && eventLower.contains("ordem"))
+    val isOrdemNaoExecutada = eventLower.contains("ordem_não_executada") || eventLower.contains("ordem_nao_executada") || eventLower.contains("ordem não executada")
+
+    val isRelatorio = eventLower.contains("relatorio") || eventLower.contains("financeiro") || eventLower.contains("relatório")
+    val isPosicao = (eventLower.contains("posicao") || eventLower.contains("posição") || eventLower.contains("position") || event.temPosicao.isNotBlank()) &&
+            !isOrdemExecutada && !isOrdemModificada && !isErroOrdem && !isOrdemNaoExecutada
+    val isSessao = eventLower.contains("sessao") || eventLower.contains("sessão")
+    val isEquador = eventLower.contains("equador")
+    val isInicializacao = eventLower.contains("inicializ") || eventLower.contains("boot")
+    val isNotificacao = isOrdemNaoExecutada || eventLower.startsWith("notificacao") || event.sistema.contains("NOTIFICACOES") ||
+            event.msg.contains("desativado") || event.msg.contains("travado") || event.msg.contains("trvado") ||
+            event.msg.contains("contol_de_gerenciamento")
+
+    val isStateChange = !isNotificacao && !isOrdemExecutada && !isOrdemModificada && !isErroOrdem && !isRelatorio && !isInicializacao && !isSessao && !isEquador && !isPosicao &&
+            (event.anterior.isNotEmpty() || event.novo.isNotEmpty() || event.descNovo.isNotEmpty() ||
+            eventLower.contains("mudanca") || eventLower.contains("estado") || eventLower.contains("status"))
+
+    return when {
+        isOrdemExecutada -> {
+            val tipoStr = if (event.tipo.isNotBlank()) event.tipo else if (event.type.isNotBlank()) event.type else "Operação"
+            val ticketStr = if (event.ticket.isNotBlank()) " bilhete ${event.ticket}" else ""
+            "Ordem de $tipoStr executada no ativo ${event.symbol}$ticketStr. Preço ${event.price}, volume ${event.volume} lotes. ${sanitizeText(event.msg)}"
+        }
+        isOrdemModificada -> {
+            val ticketStr = if (event.ticket.isNotBlank()) " bilhete ${event.ticket}" else ""
+            "Ordem $ticketStr modificada no ativo ${event.symbol}. Novo Stop Loss ${event.novoSl}, novo Take Profit ${event.novoTp}. ${sanitizeText(event.msg)}"
+        }
+        isErroOrdem || isOrdemNaoExecutada -> {
+            "Erro de ordem no ativo ${event.symbol}. ${sanitizeText(event.msg)}"
+        }
+        isNotificacao -> {
+            "Notificação do Robô Fimaster: ${sanitizeText(event.resumo.ifEmpty { event.msg })}. ${sanitizeText(event.descNovo)}"
+        }
+        isRelatorio -> {
+            buildString {
+                append("Relatório financeiro do robô Fimaster. ")
+                if (event.diarioStatus.isNotBlank()) append("Diário: ${event.diarioStatus} de ${event.diarioValor} ${event.moeda}. ")
+                if (event.semanalStatus.isNotBlank()) append("Semanal: ${event.semanalStatus} de ${event.semanalValor} ${event.moeda}. ")
+                if (event.motivacao.isNotBlank()) append("Motivação: ${sanitizeText(event.motivacao)}. ")
+                if (event.resumo.isNotBlank()) append("Resumo: ${sanitizeText(event.resumo)}.")
+            }
+        }
+        isPosicao -> {
+            buildString {
+                append("Posição alterada no ativo ${event.symbol}. ")
+                val posState = event.novo.ifEmpty { event.anterior.ifEmpty { event.temPosicao } }
+                if (posState.isNotBlank()) append("Estado da posição: ${cleanStateEnumText(posState)}. ")
+                if (event.msg.isNotBlank()) append("${sanitizeText(event.msg)}. ")
+                if (event.resumo.isNotBlank()) append("${sanitizeText(event.resumo)}.")
+            }
+        }
+        isSessao -> {
+            val action = if (eventLower.contains("inicio") || eventLower.contains("start")) "iniciada" else "encerrada"
+            "Sessão Forex ${event.sessao.ifEmpty { "Mercado" }} $action para o ativo ${event.symbol}."
+        }
+        isEquador -> {
+            "Linha do Equador alterada de ${cleanStateEnumText(event.anterior)} para ${cleanStateEnumText(event.novo)} no ativo ${event.symbol}."
+        }
+        isInicializacao -> {
+            "Robô EA Fimaster inicializado no ativo ${event.symbol} no servidor ${event.server} para a conta ${event.login}."
+        }
+        isStateChange -> {
+            val stateText = cleanStateEnumText(event.novo.ifEmpty { event.anterior })
+            val rawDesc = com.example.data.resolveEventStateDescription(event)
+            val cleanDesc = sanitizeText(rawDesc)
+            val sysName = detectStateSystemType(event)
+            buildString {
+                append("Mudança de estado no $sysName. ")
+                if (stateText.isNotBlank()) append("Novo estado: $stateText. ")
+                if (cleanDesc.isNotBlank() && !cleanDesc.equals(stateText, ignoreCase = true)) {
+                    append(cleanDesc)
+                } else if (event.msg.isNotBlank()) {
+                    append(sanitizeText(event.msg))
+                }
+            }.trim()
+        }
+        else -> {
+            "Evento ${event.event}: ${sanitizeText(event.msg.ifEmpty { event.resumo.ifEmpty { "Registrado para o ativo " + event.symbol } })}"
+        }
+    }
+}
+
+fun decodeBase64ToBitmap(base64Str: String): android.graphics.Bitmap? {
+    if (base64Str.isBlank()) return null
+    return try {
+        val cleanBase64 = if (base64Str.contains(",")) base64Str.substringAfter(",") else base64Str
+        val bytes = android.util.Base64.decode(cleanBase64, android.util.Base64.DEFAULT)
+        android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+    } catch (e: Exception) {
+        null
+    }
+}
+
+@Composable
+fun ClassicEventCard(event: com.example.data.EaRobotEvent) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+
+    val readKeys by PortalEventQueueManager.readEventKeys.collectAsStateWithLifecycle()
+    val currentlyReadingKey by PortalEventQueueManager.currentlyReadingKey.collectAsStateWithLifecycle()
+    val queuedKeys by PortalEventQueueManager.queuedEventKeys.collectAsStateWithLifecycle()
+
+    val readState = remember(event, readKeys, currentlyReadingKey, queuedKeys) {
+        PortalEventQueueManager.getReadState(event)
+    }
+
+    val eventLower = remember(event) { event.event.lowercase().trim() }
+    val rawTipoLower = remember(event) { (event.tipo.ifEmpty { event.type }).lowercase().trim() }
+    val msgLower = remember(event) { event.msg.lowercase().trim() }
+
+    val isCapturaTela = remember(eventLower, event) {
+        eventLower == "captura" || eventLower == "captura_tela" || eventLower == "screenshot" || eventLower == "print" ||
+        event.imageBase64.isNotBlank() || event.filename.contains("captura") ||
+        (eventLower.contains("captura") && !eventLower.contains("ordem") && !eventLower.contains("estado"))
+    }
+    val isRelatorio = remember(eventLower, event) {
+        !isCapturaTela && (
+            eventLower == "relatorio_financeiro" || eventLower == "relatorio financeiro" || eventLower == "relatório_financeiro" ||
+            (eventLower.contains("relatorio") || eventLower.contains("relatório")) ||
+            (eventLower.contains("financeiro") && (event.diarioValor != 0.0 || event.semanalValor != 0.0 || event.diarioStatus.isNotBlank()))
+        )
+    }
+    val isErroOrdem = remember(eventLower) {
+        !isCapturaTela && (
+            eventLower == "erro_ordem" || eventLower == "erro ordem" || eventLower == "order_error" ||
+            (eventLower.contains("erro") && (eventLower.contains("ordem") || eventLower.contains("order")))
+        )
+    }
+    val isOrdemNaoExecutada = remember(eventLower) {
+        !isCapturaTela && !isErroOrdem && (
+            eventLower == "ordem_não_executada" || eventLower == "ordem_nao_executada" ||
+            eventLower == "ordem não executada" || eventLower == "ordem nao executada" ||
+            eventLower.contains("não_executad") || eventLower.contains("nao_executad")
+        )
+    }
+    val isOrdemModificada = remember(eventLower) {
+        !isCapturaTela && !isErroOrdem && !isOrdemNaoExecutada && (
+            eventLower == "ordem_modificada" || eventLower == "ordem modificada" || eventLower == "order_modified" || eventLower == "sl_tp_modificado"
+        )
+    }
+    val isOrdemExecutada = remember(eventLower, rawTipoLower, msgLower) {
+        !isCapturaTela && !isErroOrdem && !isOrdemNaoExecutada && !isOrdemModificada && (
+            eventLower == "ordem_executada" || eventLower == "ordem executada" || eventLower == "order_executed" ||
+            eventLower == "ordem_aberta" || eventLower == "entry_position" || eventLower == "closed_position" ||
+            eventLower == "posicao_fechada" || eventLower == "ordem_fechada"
+        )
+    }
+    val isSessao = remember(eventLower) {
+        !isCapturaTela && (
+            eventLower == "sessao_inicio" || eventLower == "sessao_fim" || eventLower == "sessão_inicio" || eventLower == "sessão_fim" ||
+            eventLower == "sessao" || eventLower == "sessão" || eventLower.contains("sessao") || eventLower.contains("sessão")
+        )
+    }
+    val isEquador = remember(eventLower) {
+        !isCapturaTela && (
+            eventLower == "mudanca_equador" || eventLower == "mudança_equador" || eventLower.contains("equador")
+        )
+    }
+    val isInicializacao = remember(eventLower) {
+        !isCapturaTela && (
+            eventLower == "inicializacao" || eventLower == "inicialização" || eventLower.contains("inicializ") || eventLower.contains("boot")
+        )
+    }
+    val isPosicao = remember(eventLower, event) {
+        !isCapturaTela && !isOrdemExecutada && !isOrdemModificada && !isErroOrdem && !isOrdemNaoExecutada && (
+            eventLower == "posicao_alterada" || eventLower == "posição_alterada" ||
+            (eventLower.contains("posicao") && !eventLower.contains("mudanca") && !eventLower.contains("estado")) ||
+            (event.temPosicao.isNotBlank() && !eventLower.contains("mudanca_estado"))
+        )
+    }
+    val isStateChange = remember(eventLower, event) {
+        !isCapturaTela && !isOrdemExecutada && !isOrdemModificada && !isErroOrdem && !isOrdemNaoExecutada && !isRelatorio && !isInicializacao && !isSessao && !isEquador && !isPosicao && (
+            eventLower == "mudanca_estado" || eventLower == "mudança_estado" || eventLower == "mudanca estado" ||
+            eventLower.contains("mudanca") || eventLower.contains("estado") ||
+            event.sistema.isNotBlank() || event.novo.isNotBlank() || event.anterior.isNotBlank()
+        )
+    }
+
+    val (cardTitle, badgeIcon, badgeColor) = remember(
+        event, eventLower, isCapturaTela, isOrdemExecutada, isOrdemModificada, isErroOrdem,
+        isOrdemNaoExecutada, isRelatorio, isPosicao, isSessao, isEquador,
+        isInicializacao, isStateChange
+    ) {
+        when {
+            isCapturaTela -> Triple("CAPTURA DE TELA CONCLUÍDA", Icons.Default.CameraAlt, Color(0xFF38BDF8))
+            isRelatorio -> Triple("RELATÓRIO FINANCEIRO EA", Icons.Default.TrendingUp, Color(0xFF10B981))
+            isErroOrdem -> Triple("ERRO DE ORDEM MT5", Icons.Default.Error, Color(0xFFEF4444))
+            isOrdemNaoExecutada -> Triple("ORDEM NÃO EXECUTADA", Icons.Default.Warning, Color(0xFFEF4444))
+            isOrdemModificada -> Triple("ORDEM MODIFICADA (SL/TP)", Icons.Default.Tune, Color(0xFF38BDF8))
+            isOrdemExecutada -> {
+                val tipoLower = rawTipoLower
+                val isVenda = tipoLower.contains("venda") || msgLower.contains("venda") || eventLower.contains("sell")
+                val isCompra = tipoLower.contains("compra") || msgLower.contains("compra") || eventLower.contains("buy")
+                val isClosed = eventLower.contains("closed") || eventLower.contains("fechad")
+                val isEntry = eventLower.contains("entry") || eventLower.contains("entrad")
+                val title = when {
+                    isCompra && isClosed -> "ORDEM DE COMPRA FECHADA"
+                    isVenda && isClosed -> "ORDEM DE VENDA FECHADA"
+                    isClosed -> "POSIÇÃO / ORDEM ENCERRADA"
+                    isCompra -> "ORDEM DE COMPRA EXECUTADA"
+                    isVenda -> "ORDEM DE VENDA EXECUTADA"
+                    isEntry -> "ORDEM DE ENTRADA EXECUTADA"
+                    else -> "ORDEM EXECUTADA MT5"
+                }
+                val icon = if (isCompra) Icons.Default.TrendingUp else if (isVenda) Icons.Default.TrendingDown else Icons.Default.ReceiptLong
+                val color = if (isCompra) Color(0xFF10B981) else if (isVenda) Color(0xFFEF4444) else Color(0xFF8B5CF6)
+                Triple(title, icon, color)
+            }
+            isSessao -> {
+                val isStart = eventLower.contains("inicio") || eventLower.contains("start")
+                Triple("SESSÃO FOREX ${if (isStart) "INICIADA" else "ENCERRADA"}", Icons.Default.Schedule, Color(0xFF38BDF8))
+            }
+            isEquador -> Triple("ALTERAÇÃO LINHA EQUADOR", Icons.Default.CompareArrows, Color(0xFFF59E0B))
+            isInicializacao -> Triple("INICIALIZAÇÃO DO ROBÔ", Icons.Default.PlayArrow, Color(0xFF10B981))
+            isPosicao -> Triple("POSIÇÃO ALTERADA NO MERCADO", Icons.Default.SwapHoriz, Color(0xFFF59E0B))
+            isStateChange -> {
+                val sysCat = detectStateSystemType(event)
+                Triple("MUDANÇA DE ESTADO: $sysCat", Icons.Default.Tune, Color(0xFF22D3EE))
+            }
+            else -> {
+                val rawTitle = event.event.uppercase().replace("_", " ").trim()
+                val cleanTitle = if (rawTitle == "EVENTO" || rawTitle == "EVENT" || rawTitle.isBlank() || rawTitle == "DESCONHECIDO") {
+                    if (event.sistema.isNotBlank()) "SISTEMA • ${cleanStateEnumText(event.sistema)}"
+                    else if (event.novo.isNotBlank()) "ESTADO • ${cleanStateEnumText(event.novo)}"
+                    else if (event.msg.isNotBlank()) "REGISTRO DE EVENTO EA"
+                    else "NOTIFICAÇÃO DO ROBÔ"
+                } else {
+                    "EVENTO: $rawTitle"
+                }
+                Triple(cleanTitle, Icons.Default.Info, Color(0xFF38BDF8))
+            }
+        }
+    }
+
     val sdf = remember { java.text.SimpleDateFormat("dd/MM/yyyy HH:mm:ss", java.util.Locale.getDefault()) }
-    val dateFormatted = remember(event.timestamp) {
+    val dateFormatted = remember(event.timestamp, event.data, event.hora) {
         if (event.timestamp > 0) {
             val tsMs = if (event.timestamp in 1L..9_999_999_999L) event.timestamp * 1000L else event.timestamp
             try { sdf.format(java.util.Date(tsMs)) } catch (e: Exception) { "N/A" }
+        } else if (event.data.isNotBlank()) {
+            if (event.hora.isNotBlank()) "${event.data} ${event.hora}" else event.data
         } else "N/A"
     }
 
@@ -1219,7 +3157,7 @@ fun ClassicEventCard(event: com.example.data.EaRobotEvent) {
         border = BorderStroke(1.dp, badgeColor.copy(alpha = 0.35f))
     ) {
         Column(modifier = Modifier.padding(10.dp)) {
-            // Header Row: Badge + Title + Audio Button
+            // Header Row: Badge + Title + Signal Badge + Audio Button
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -1249,31 +3187,41 @@ fun ClassicEventCard(event: com.example.data.EaRobotEvent) {
                             fontWeight = FontWeight.Black,
                             color = badgeColor,
                             letterSpacing = 0.5.sp
-                        )
+                        ),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
 
+                Spacer(modifier = Modifier.width(6.dp))
+
+                // Signal Indicator Badge (Cinza = Não lido / Verde = Lido)
+                EventReadSignalBadge(readState = readState)
+
+                Spacer(modifier = Modifier.width(6.dp))
+
+                // Audio Button
                 Surface(
-                    onClick = { speakText(showToast = true) },
-                    color = if (isSpeaking) Color(0xFF10B981).copy(alpha = 0.2f) else badgeColor.copy(alpha = 0.15f),
+                    onClick = { PortalEventQueueManager.speakSingleEvent(context, event) },
+                    color = if (readState == EventReadState.READING) Color(0xFF0284C7).copy(alpha = 0.25f) else badgeColor.copy(alpha = 0.15f),
                     shape = RoundedCornerShape(10.dp),
-                    border = BorderStroke(1.dp, if (isSpeaking) Color(0xFF10B981) else badgeColor.copy(alpha = 0.5f))
+                    border = BorderStroke(1.dp, if (readState == EventReadState.READING) Color(0xFF38BDF8) else badgeColor.copy(alpha = 0.5f))
                 ) {
                     Row(
                         modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(
-                            imageVector = if (isSpeaking) Icons.Default.VolumeUp else Icons.Default.VolumeMute,
+                            imageVector = if (readState == EventReadState.READING) Icons.Default.VolumeUp else Icons.Default.VolumeMute,
                             contentDescription = "Ouvir em Áudio",
-                            tint = if (isSpeaking) Color(0xFF10B981) else badgeColor,
+                            tint = if (readState == EventReadState.READING) Color(0xFF38BDF8) else badgeColor,
                             modifier = Modifier.size(13.dp)
                         )
                         Spacer(modifier = Modifier.width(4.dp))
                         Text(
-                            text = if (isSpeaking) "Lendo..." else "Áudio 🔊",
+                            text = if (readState == EventReadState.READING) "Lendo..." else "Áudio 🔊",
                             style = MaterialTheme.typography.labelSmall.copy(
-                                color = if (isSpeaking) Color(0xFF10B981) else badgeColor,
+                                color = if (readState == EventReadState.READING) Color(0xFF38BDF8) else badgeColor,
                                 fontWeight = FontWeight.Bold
                             )
                         )
@@ -1285,6 +3233,80 @@ fun ClassicEventCard(event: com.example.data.EaRobotEvent) {
 
             // Specific Card Body Layouts based on event type
             when {
+                isCapturaTela -> {
+                    // Captura de Tela Exclusive Layout
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color(0xFF1E293B).copy(alpha = 0.8f), RoundedCornerShape(10.dp))
+                            .padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        if (event.imageBase64.isNotBlank()) {
+                            val bitmap = remember(event.imageBase64) { decodeBase64ToBitmap(event.imageBase64) }
+                            if (bitmap != null) {
+                                Image(
+                                    bitmap = bitmap.asImageBitmap(),
+                                    contentDescription = "Captura de Tela do Gráfico MT5",
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .heightIn(max = 240.dp)
+                                        .clip(RoundedCornerShape(8.dp)),
+                                    contentScale = ContentScale.Fit
+                                )
+                            }
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column {
+                                Text(
+                                    text = if (event.filename.isNotBlank()) "Arquivo: ${event.filename}" else "Captura Real MT5",
+                                    style = MaterialTheme.typography.bodyMedium.copy(color = Color.White, fontWeight = FontWeight.Bold)
+                                )
+                                val details = mutableListOf<String>()
+                                if (event.symbol.isNotBlank()) details.add("Ativo: ${event.symbol}")
+                                if (event.timeframe.isNotBlank()) details.add("TF: ${event.timeframe}")
+                                if (event.login > 0) details.add("Conta: ${event.login}")
+                                if (details.isNotEmpty()) {
+                                    Text(
+                                        text = details.joinToString(" • "),
+                                        style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF94A3B8))
+                                    )
+                                }
+                            }
+                            Surface(
+                                color = Color(0xFF38BDF8).copy(alpha = 0.2f),
+                                shape = RoundedCornerShape(6.dp),
+                                border = BorderStroke(1.dp, Color(0xFF38BDF8).copy(alpha = 0.5f))
+                            ) {
+                                Text(
+                                    text = "CONCLUÍDO",
+                                    style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF38BDF8), fontWeight = FontWeight.Bold),
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                )
+                            }
+                        }
+
+                        val capMsg = event.msg.ifEmpty { "Captura de tela REAL enviada com sucesso ao App do MT5 com objetos MQL5." }
+                        Surface(
+                            color = Color(0xFF0284C7).copy(alpha = 0.15f),
+                            shape = RoundedCornerShape(8.dp),
+                            border = BorderStroke(1.dp, Color(0xFF38BDF8).copy(alpha = 0.3f)),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = sanitizeText(capMsg),
+                                style = MaterialTheme.typography.bodySmall.copy(color = Color.White, lineHeight = 18.sp),
+                                modifier = Modifier.padding(8.dp)
+                            )
+                        }
+                    }
+                }
+
                 isRelatorio -> {
                     // Relatório Financeiro Compact Layout
                     Column(
@@ -1294,48 +3316,62 @@ fun ClassicEventCard(event: com.example.data.EaRobotEvent) {
                             .padding(10.dp),
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = "📊 GERENCIAMENTO DIÁRIO",
-                                    style = MaterialTheme.typography.labelSmall.copy(
-                                        color = Color(0xFF38BDF8),
-                                        fontWeight = FontWeight.Bold
+                        if (event.diarioStatus.isNotBlank() || event.diarioValor != 0.0 || event.diarioPct != 0.0) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "📊 GERENCIAMENTO DIÁRIO",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            color = Color(0xFF38BDF8),
+                                            fontWeight = FontWeight.Bold
+                                        )
                                     )
-                                )
-                                Text(
-                                    text = "${event.diarioStatus.ifEmpty { "STATUS OK" }}: ${String.format(java.util.Locale.US, "%.2f", event.diarioValor)} ${event.moeda} (${String.format(java.util.Locale.US, "%.2f", event.diarioPct)}%)",
-                                    style = MaterialTheme.typography.bodyMedium.copy(
-                                        color = Color.White,
-                                        fontWeight = FontWeight.Bold
+                                    Text(
+                                        text = "${event.diarioStatus.ifEmpty { "STATUS OK" }}: ${String.format(java.util.Locale.US, "%.2f", event.diarioValor)} ${event.moeda.ifEmpty { "USD" }} (${String.format(java.util.Locale.US, "%.2f", event.diarioPct)}%)",
+                                        style = MaterialTheme.typography.bodyMedium.copy(
+                                            color = Color.White,
+                                            fontWeight = FontWeight.Bold
+                                        )
                                     )
-                                )
+                                }
                             }
                         }
 
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = "📊 GERENCIAMENTO SEMANAL",
-                                    style = MaterialTheme.typography.labelSmall.copy(
-                                        color = Color(0xFF22D3EE),
-                                        fontWeight = FontWeight.Bold
+                        if (event.semanalStatus.isNotBlank() || event.semanalValor != 0.0 || event.semanalPct != 0.0) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "📊 GERENCIAMENTO SEMANAL",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            color = Color(0xFF22D3EE),
+                                            fontWeight = FontWeight.Bold
+                                        )
                                     )
-                                )
-                                Text(
-                                    text = "${event.semanalStatus.ifEmpty { "STATUS OK" }}: ${String.format(java.util.Locale.US, "%.2f", event.semanalValor)} ${event.moeda} (${String.format(java.util.Locale.US, "%.2f", event.semanalPct)}%)",
-                                    style = MaterialTheme.typography.bodyMedium.copy(
-                                        color = Color.White,
-                                        fontWeight = FontWeight.Bold
+                                    Text(
+                                        text = "${event.semanalStatus.ifEmpty { "STATUS OK" }}: ${String.format(java.util.Locale.US, "%.2f", event.semanalValor)} ${event.moeda.ifEmpty { "USD" }} (${String.format(java.util.Locale.US, "%.2f", event.semanalPct)}%)",
+                                        style = MaterialTheme.typography.bodyMedium.copy(
+                                            color = Color.White,
+                                            fontWeight = FontWeight.Bold
+                                        )
                                     )
-                                )
+                                }
                             }
+                        }
+
+                        if (event.saldoDisponivel > 0.0) {
+                            Text(
+                                text = "💰 Saldo Disponível: ${String.format(java.util.Locale.US, "%.2f", event.saldoDisponivel)} ${event.moeda.ifEmpty { "USD" }}",
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    color = Color(0xFF10B981),
+                                    fontWeight = FontWeight.Bold
+                                )
+                            )
                         }
 
                         if (event.motivacao.isNotBlank()) {
@@ -1354,16 +3390,300 @@ fun ClassicEventCard(event: com.example.data.EaRobotEvent) {
                                         )
                                     )
                                     Text(
-                                        text = event.motivacao,
+                                        text = sanitizeText(event.motivacao),
                                         style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFFFEF3C7))
                                     )
                                 }
                             }
                         }
 
-                        if (event.resumo.isNotBlank()) {
+                        val relatorioDesc = event.resumo.ifEmpty { event.msg }
+                        if (relatorioDesc.isNotBlank()) {
                             Text(
-                                text = "📢 Resumo: ${event.resumo}",
+                                text = "📢 Resumo: ${sanitizeText(relatorioDesc)}",
+                                style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFFCBD5E1))
+                            )
+                        }
+                    }
+                }
+
+                isOrdemExecutada -> {
+                    // Ordem Executada Layout (1.1)
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color(0xFF1E293B).copy(alpha = 0.8f), RoundedCornerShape(10.dp))
+                            .padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                val tipoRaw = event.tipo.ifEmpty { event.type.ifEmpty { event.novo } }
+                                val tipoStr = cleanStateEnumText(tipoRaw)
+                                if (tipoStr.isNotBlank() && !tipoStr.startsWith("BILHETE")) {
+                                    Text(
+                                        text = tipoStr,
+                                        style = MaterialTheme.typography.titleSmall.copy(color = Color.White, fontWeight = FontWeight.Bold)
+                                    )
+                                }
+                                if (event.ticket.isNotBlank() && event.ticket != "0") {
+                                    Surface(
+                                        color = badgeColor.copy(alpha = 0.2f),
+                                        shape = RoundedCornerShape(6.dp),
+                                        border = BorderStroke(1.dp, badgeColor.copy(alpha = 0.5f))
+                                    ) {
+                                        Text(
+                                            text = "Bilhete #${event.ticket}",
+                                            style = MaterialTheme.typography.labelSmall.copy(color = badgeColor, fontWeight = FontWeight.Bold),
+                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                        )
+                                    }
+                                }
+                            }
+                            if (event.symbol.isNotBlank()) {
+                                Surface(
+                                    color = Color(0xFF38BDF8).copy(alpha = 0.15f),
+                                    shape = RoundedCornerShape(6.dp)
+                                ) {
+                                    Text(
+                                        text = event.symbol,
+                                        style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF38BDF8), fontWeight = FontWeight.Bold),
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
+                            }
+                        }
+
+                        // Order Metrics Grid
+                        val metrics = mutableListOf<String>()
+                        if (event.price > 0.0) metrics.add("Preço: ${String.format(java.util.Locale.US, "%.5f", event.price)}")
+                        if (event.volume > 0.0) metrics.add("Volume: ${String.format(java.util.Locale.US, "%.2f", event.volume)} Lotes")
+                        if (event.sl > 0.0) metrics.add("SL: ${String.format(java.util.Locale.US, "%.5f", event.sl)}")
+                        if (event.tp > 0.0) metrics.add("TP: ${String.format(java.util.Locale.US, "%.5f", event.tp)}")
+
+                        if (metrics.isNotEmpty()) {
+                            Text(
+                                text = metrics.joinToString(" • "),
+                                style = MaterialTheme.typography.bodySmall.copy(color = Color.White, fontWeight = FontWeight.SemiBold)
+                            )
+                        }
+
+                        val targets = mutableListOf<String>()
+                        if (event.alvoMt > 0.0) targets.add("Alvo: ${String.format(java.util.Locale.US, "%.2f", event.alvoMt)} MT")
+                        if (event.protecaoMt > 0.0) targets.add("Proteção: ${String.format(java.util.Locale.US, "%.2f", event.protecaoMt)} MT")
+                        if (event.lucroPct != 0.0) targets.add("Lucro: ${String.format(java.util.Locale.US, "%.2f", event.lucroPct)}%")
+                        if (event.perdaPct != 0.0) targets.add("Perda: ${String.format(java.util.Locale.US, "%.2f", event.perdaPct)}%")
+
+                        if (targets.isNotEmpty()) {
+                            Text(
+                                text = targets.joinToString(" | "),
+                                style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF10B981), fontWeight = FontWeight.Bold)
+                            )
+                        }
+
+                        if (event.msg.isNotBlank()) {
+                            Text(
+                                text = sanitizeText(event.msg),
+                                style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFFCBD5E1))
+                            )
+                        }
+                    }
+                }
+
+                isOrdemModificada -> {
+                    // Ordem Modificada Layout (1.2)
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color(0xFF1E293B).copy(alpha = 0.8f), RoundedCornerShape(10.dp))
+                            .padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                if (event.ticket.isNotBlank() && event.ticket != "0") {
+                                    Surface(
+                                        color = Color(0xFF38BDF8).copy(alpha = 0.2f),
+                                        shape = RoundedCornerShape(6.dp),
+                                        border = BorderStroke(1.dp, Color(0xFF38BDF8).copy(alpha = 0.5f))
+                                    ) {
+                                        Text(
+                                            text = "Bilhete #${event.ticket}",
+                                            style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF38BDF8), fontWeight = FontWeight.Bold),
+                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                        )
+                                    }
+                                }
+                                val tipoStr = event.tipo.ifEmpty { event.type }
+                                if (tipoStr.isNotBlank()) {
+                                    Text(
+                                        text = tipoStr.uppercase(),
+                                        style = MaterialTheme.typography.labelSmall.copy(color = Color.White, fontWeight = FontWeight.Bold)
+                                    )
+                                }
+                            }
+                            if (event.symbol.isNotBlank()) {
+                                Surface(
+                                    color = Color(0xFF38BDF8).copy(alpha = 0.15f),
+                                    shape = RoundedCornerShape(6.dp)
+                                ) {
+                                    Text(
+                                        text = event.symbol,
+                                        style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF38BDF8), fontWeight = FontWeight.Bold),
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
+                            }
+                        }
+
+                        val modDetails = mutableListOf<String>()
+                        val effectiveSl = if (event.novoSl > 0.0) event.novoSl else event.sl
+                        val effectiveTp = if (event.novoTp > 0.0) event.novoTp else event.tp
+                        if (effectiveSl > 0.0) modDetails.add("Novo SL: ${String.format(java.util.Locale.US, "%.5f", effectiveSl)}")
+                        if (effectiveTp > 0.0) modDetails.add("Novo TP: ${String.format(java.util.Locale.US, "%.5f", effectiveTp)}")
+
+                        if (modDetails.isNotEmpty()) {
+                            Text(
+                                text = modDetails.joinToString(" • "),
+                                style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF38BDF8), fontWeight = FontWeight.Bold)
+                            )
+                        }
+
+                        if (event.msg.isNotBlank()) {
+                            Text(
+                                text = sanitizeText(event.msg),
+                                style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFFCBD5E1))
+                            )
+                        }
+                    }
+                }
+
+                isErroOrdem || isOrdemNaoExecutada -> {
+                    // Erro de Ordem / Ordem Não Executada Layout (1.3 & 1.10)
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color(0xFF451A1A).copy(alpha = 0.7f), RoundedCornerShape(10.dp))
+                            .border(1.dp, Color(0xFFEF4444).copy(alpha = 0.5f), RoundedCornerShape(10.dp))
+                            .padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Icon(
+                                    imageVector = Icons.Default.Error,
+                                    contentDescription = null,
+                                    tint = Color(0xFFEF4444),
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Text(
+                                    text = if (isOrdemNaoExecutada) "FALHA / ORDEM NÃO EXECUTADA" else "ERRO DE ORDEM MT5",
+                                    style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFFFCA5A5), fontWeight = FontWeight.Bold)
+                                )
+                            }
+                            if (event.symbol.isNotBlank()) {
+                                Surface(
+                                    color = Color(0xFFEF4444).copy(alpha = 0.2f),
+                                    shape = RoundedCornerShape(6.dp)
+                                ) {
+                                    Text(
+                                        text = event.symbol,
+                                        style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFFFCA5A5), fontWeight = FontWeight.Bold),
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
+                            }
+                        }
+
+                        val errDetails = mutableListOf<String>()
+                        if (event.erroCode > 0) errDetails.add("Código MQL5: ${event.erroCode}")
+                        val opType = event.tipo.ifEmpty { event.type }
+                        if (opType.isNotBlank()) errDetails.add("Operação: ${opType.uppercase()}")
+                        if (event.login > 0) errDetails.add("Conta: ${event.login}")
+
+                        if (errDetails.isNotEmpty()) {
+                            Text(
+                                text = errDetails.joinToString(" • "),
+                                style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFFFECACA), fontWeight = FontWeight.SemiBold)
+                            )
+                        }
+
+                        if (event.msg.isNotBlank()) {
+                            Text(
+                                text = sanitizeText(event.msg),
+                                style = MaterialTheme.typography.bodySmall.copy(color = Color.White)
+                            )
+                        }
+                    }
+                }
+
+                isPosicao -> {
+                    // Posicao Alterada Layout (1.8)
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color(0xFF1E293B).copy(alpha = 0.8f), RoundedCornerShape(10.dp))
+                            .padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "MUDANÇA DE POSIÇÃO NO MERCADO",
+                                    style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFFF59E0B), fontWeight = FontWeight.Bold)
+                                )
+                                val statusPosText = cleanStateEnumText(event.novo.ifEmpty { event.anterior.ifEmpty { event.temPosicao } })
+                                Text(
+                                    text = if (statusPosText.isNotBlank()) statusPosText else "POSIÇÃO ALTERADA",
+                                    style = MaterialTheme.typography.titleSmall.copy(color = Color.White, fontWeight = FontWeight.Bold)
+                                )
+                            }
+                            if (event.symbol.isNotBlank()) {
+                                Surface(
+                                    color = Color(0xFFF59E0B).copy(alpha = 0.15f),
+                                    shape = RoundedCornerShape(6.dp)
+                                ) {
+                                    Text(
+                                        text = event.symbol,
+                                        style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFFF59E0B), fontWeight = FontWeight.Bold),
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                    )
+                                }
+                            }
+                        }
+
+                        if (event.anterior.isNotBlank() && event.novo.isNotBlank() && event.anterior != event.novo) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Text(text = "De: ${cleanStateEnumText(event.anterior)}", style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8)))
+                                Icon(imageVector = Icons.Default.PlayArrow, contentDescription = null, tint = Color(0xFFF59E0B), modifier = Modifier.size(14.dp))
+                                Text(text = "Para: ${cleanStateEnumText(event.novo)}", style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFFF59E0B), fontWeight = FontWeight.Bold))
+                            }
+                        }
+
+                        val detailMsg = event.msg.ifEmpty { event.resumo.ifEmpty { event.descNovo.ifEmpty { event.descAnterior } } }
+                        if (detailMsg.isNotBlank()) {
+                            Text(
+                                text = sanitizeText(detailMsg.replace("_", " ")),
                                 style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFFCBD5E1))
                             )
                         }
@@ -1469,7 +3789,7 @@ fun ClassicEventCard(event: com.example.data.EaRobotEvent) {
                         modifier = Modifier
                             .fillMaxWidth()
                             .background(Color(0xFF1E293B).copy(alpha = 0.8f), RoundedCornerShape(10.dp))
-                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
                         verticalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
                         Row(
@@ -1478,7 +3798,7 @@ fun ClassicEventCard(event: com.example.data.EaRobotEvent) {
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
                             Text(
-                                text = "✅ EA Fimaster conectado & ativo",
+                                text = "EA Fimaster conectado & ativo",
                                 style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF10B981), fontWeight = FontWeight.Bold)
                             )
                             if (event.symbol.isNotBlank()) {
@@ -1497,6 +3817,7 @@ fun ClassicEventCard(event: com.example.data.EaRobotEvent) {
                         val infoParts = mutableListOf<String>()
                         if (event.login > 0) infoParts.add("Conta MT5: ${event.login}")
                         if (event.server.isNotBlank()) infoParts.add("Servidor: ${event.server}")
+                        if (event.timeframe.isNotBlank()) infoParts.add("TF: ${event.timeframe}")
                         if (infoParts.isNotEmpty()) {
                             Text(
                                 text = infoParts.joinToString(" • "),
@@ -1511,8 +3832,6 @@ fun ClassicEventCard(event: com.example.data.EaRobotEvent) {
                     val sistemaTipo = detectStateSystemType(event)
                     val cleanNovo = cleanStateEnumText(event.novo)
                     val cleanAnterior = cleanStateEnumText(event.anterior)
-                    val rawDesc = event.descNovo.ifEmpty { event.descAnterior.ifEmpty { event.msg.ifEmpty { event.resumo } } }
-                    val cleanDesc = if (rawDesc.contains("ESTADO_")) cleanStateEnumText(rawDesc) else rawDesc.replace("_", " ")
 
                     Column(
                         modifier = Modifier
@@ -1553,7 +3872,7 @@ fun ClassicEventCard(event: com.example.data.EaRobotEvent) {
                         }
 
                         if (cleanAnterior.isNotBlank() && cleanAnterior != cleanNovo) {
-                            Spacer(modifier = Modifier.height(4.dp))
+                            Spacer(modifier = Modifier.height(6.dp))
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -1570,11 +3889,68 @@ fun ClassicEventCard(event: com.example.data.EaRobotEvent) {
                             }
                         }
 
-                        if (cleanDesc.isNotBlank()) {
+                        // Explicit State Description Block
+                        val officialDesc = com.example.data.resolveEventStateDescription(event).trim()
+                        if (officialDesc.isNotBlank() && !officialDesc.startsWith("ESTADO_")) {
+                            val cleanDescNovo = sanitizeText(officialDesc.replace("_", " "))
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Surface(
+                                color = Color(0xFF0284C7).copy(alpha = 0.18f),
+                                shape = RoundedCornerShape(8.dp),
+                                border = BorderStroke(1.dp, Color(0xFF38BDF8).copy(alpha = 0.5f)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(modifier = Modifier.padding(8.dp)) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Description,
+                                            contentDescription = null,
+                                            tint = Color(0xFF38BDF8),
+                                            modifier = Modifier.size(14.dp)
+                                        )
+                                        Text(
+                                            text = "DESCRIÇÃO DO ESTADO:",
+                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                color = Color(0xFF38BDF8),
+                                                fontWeight = FontWeight.Bold,
+                                                fontSize = 11.sp,
+                                                letterSpacing = 0.3.sp
+                                            )
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text(
+                                        text = cleanDescNovo,
+                                        style = MaterialTheme.typography.bodySmall.copy(
+                                            color = Color(0xFFE2E8F0),
+                                            fontWeight = FontWeight.Normal,
+                                            fontSize = 12.sp,
+                                            lineHeight = 17.sp
+                                        )
+                                    )
+                                }
+                            }
+                        } else if (event.msg.isNotBlank()) {
                             Spacer(modifier = Modifier.height(6.dp))
                             Text(
-                                text = cleanDesc,
-                                style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFFCBD5E1), lineHeight = 16.sp)
+                                text = sanitizeText(event.msg),
+                                style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFFCBD5E1), lineHeight = 18.sp)
+                            )
+                        } else {
+                            val detailsList = mutableListOf<String>()
+                            if (event.symbol.isNotBlank()) detailsList.add("Ativo: ${event.symbol}")
+                            if (event.timeframe.isNotBlank()) detailsList.add("TF: ${cleanStateEnumText(event.timeframe)}")
+                            if (event.login > 0) detailsList.add("Conta: ${event.login}")
+                            if (event.server.isNotBlank()) detailsList.add("Servidor: ${event.server}")
+                            val fallbackStr = if (detailsList.isNotEmpty()) detailsList.joinToString(" • ") else "Log de transição registrado no terminal MT5 do robô."
+
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = fallbackStr,
+                                style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFFCBD5E1), lineHeight = 18.sp)
                             )
                         }
 
@@ -1593,34 +3969,48 @@ fun ClassicEventCard(event: com.example.data.EaRobotEvent) {
 
             // Footer metadata row
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 2.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    if (event.symbol.isNotBlank()) {
+                Row(
+                    modifier = Modifier.weight(1f, fill = false),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (event.symbol.isNotBlank() && !isInicializacao) {
                         Text(
                             text = "Ativo: ${event.symbol}",
-                            style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF22D3EE), fontWeight = FontWeight.Bold)
+                            style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF22D3EE), fontWeight = FontWeight.Bold),
+                            maxLines = 1
                         )
                     }
-                    if (event.timeframe.isNotBlank()) {
+                    if (event.timeframe.isNotBlank() && !isInicializacao) {
                         Text(
                             text = "TF: ${event.timeframe}",
-                            style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8))
+                            style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF94A3B8)),
+                            maxLines = 1
                         )
                     }
-                    if (event.server.isNotBlank()) {
+                    if (event.server.isNotBlank() && !isInicializacao) {
                         Text(
                             text = "Servidor: ${event.server}",
-                            style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8))
+                            style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF94A3B8)),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
                 }
 
+                Spacer(modifier = Modifier.width(8.dp))
+
                 Text(
                     text = dateFormatted,
-                    style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF64748B))
+                    style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF64748B)),
+                    maxLines = 1,
+                    softWrap = false
                 )
             }
         }
@@ -1829,7 +4219,7 @@ fun EaRobotStatusCard(status: com.example.ui.EaRobotStatus?, cambio: Double = 64
             Spacer(modifier = Modifier.height(16.dp))
 
             // Grid details
-            if (isOnline && status != null) {
+            if (status != null) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween
@@ -1841,7 +4231,7 @@ fun EaRobotStatusCard(status: com.example.ui.EaRobotStatus?, cambio: Double = 64
                         )
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
-                            text = status.fusoTexto,
+                            text = status.fusoTexto.ifBlank { "GMT+0" },
                             style = MaterialTheme.typography.bodyMedium.copy(
                                 color = Color.White,
                                 fontWeight = FontWeight.SemiBold
@@ -1851,15 +4241,15 @@ fun EaRobotStatusCard(status: com.example.ui.EaRobotStatus?, cambio: Double = 64
 
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "POSIÇÃO OPERACIONAL",
+                            text = "POSIÇÃO / ORDENS",
                             style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF64748B))
                         )
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
-                            text = if (status.temPosicao) "⚠️ Posição Aberta" else "💤 Em Espera (Sem ordens)",
+                            text = if (status.temPosicao) "⚠️ Posição / Ordem Aberta" else "💤 Em Espera (Sem ordens)",
                             style = MaterialTheme.typography.bodyMedium.copy(
-                                color = if (status.temPosicao) Color(0xFF38BDF8) else Color(0xFF94A3B8),
-                                fontWeight = FontWeight.SemiBold
+                                color = if (status.temPosicao) Color(0xFFF59E0B) else Color(0xFF94A3B8),
+                                fontWeight = FontWeight.Bold
                             )
                         )
                     }
@@ -1899,56 +4289,6 @@ fun EaRobotStatusCard(status: com.example.ui.EaRobotStatus?, cambio: Double = 64
                             style = MaterialTheme.typography.bodyMedium.copy(
                                 color = Color(0xFF22D3EE),
                                 fontWeight = FontWeight.Bold
-                            )
-                        )
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(12.dp))
-                HorizontalDivider(color = Color(0xFF334155).copy(alpha = 0.4f))
-                Spacer(modifier = Modifier.height(12.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column {
-                        Text(
-                            text = "SALDO DISPONÍVEL (MARGEM LIVRE)",
-                            style = MaterialTheme.typography.labelSmall.copy(
-                                color = Color(0xFF64748B),
-                                letterSpacing = 0.5.sp
-                            )
-                        )
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                            text = String.format("%,.2f", status.saldoDisponivel * cambio) + " MT",
-                            style = MaterialTheme.typography.titleMedium.copy(
-                                color = Color(0xFF10B981),
-                                fontWeight = FontWeight.Bold,
-                                letterSpacing = 0.5.sp
-                            )
-                        )
-                        Spacer(modifier = Modifier.height(2.dp))
-                        Text(
-                            text = String.format("Original: $%,.2f USD (Câmbio: %.1f)", status.saldoDisponivel, cambio),
-                            style = MaterialTheme.typography.labelSmall.copy(
-                                color = Color(0xFF64748B)
-                            )
-                        )
-                    }
-
-                    Surface(
-                        color = Color(0xFF10B981).copy(alpha = 0.12f),
-                        shape = RoundedCornerShape(8.dp),
-                    ) {
-                        Text(
-                            text = "Garantido",
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-                            style = MaterialTheme.typography.labelSmall.copy(
-                                color = Color(0xFF10B981),
-                                fontWeight = FontWeight.SemiBold
                             )
                         )
                     }
@@ -2369,7 +4709,7 @@ fun UserUidCompactDialog(
 }
 
 @Composable
-fun LicenseStatusCard(status: String, expiryDate: String) {
+fun LicenseStatusCard(status: String, expiryDate: String, creditoGuardado: Double = 0.0) {
     val displayStatusColor = if (status.equals("Ativa", ignoreCase = true)) {
         Color(0xFF22D3EE) // Bright Cyan 400
     } else if (status.equals("Pendente", ignoreCase = true)) {
@@ -2451,12 +4791,13 @@ fun LicenseStatusCard(status: String, expiryDate: String) {
             }
 
             Spacer(modifier = Modifier.height(16.dp))
-            Divider(color = Color(0xFF334155).copy(alpha = 0.4f))
+            HorizontalDivider(color = Color(0xFF334155).copy(alpha = 0.4f))
             Spacer(modifier = Modifier.height(16.dp))
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
                 Column {
                     Text(
@@ -2472,6 +4813,25 @@ fun LicenseStatusCard(status: String, expiryDate: String) {
                         text = "ID: 88429105",
                         style = MaterialTheme.typography.bodyMedium.copy(
                             color = Color(0xFFCFFAFE), // Cyan 100
+                            fontWeight = FontWeight.Bold
+                        )
+                    )
+                }
+
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        text = "CRÉDITO GUARDADO",
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            color = Color(0xFF64748B),
+                            fontWeight = FontWeight.Bold,
+                            letterSpacing = 0.5.sp
+                        )
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = String.format(Locale.US, "%,.2f MT", creditoGuardado),
+                        style = MaterialTheme.typography.bodyMedium.copy(
+                            color = Color(0xFF10B981),
                             fontWeight = FontWeight.Bold
                         )
                     )
@@ -3493,12 +5853,562 @@ fun RefundRequestDialog(
     }
 }
 
+data class FaqItem(
+    val id: Int,
+    val question: String,
+    val answer: String,
+    val category: String,
+    val icon: androidx.compose.ui.graphics.vector.ImageVector
+)
+
+@Composable
+fun SupportTicketDialog(
+    userProfile: com.example.data.GithubUser?,
+    onDismiss: () -> Unit,
+    onSubmit: (categoria: String, assunto: String, mensagem: String, contato: String) -> Unit
+) {
+    var activeSupportTab by remember { mutableIntStateOf(0) } // 0: FAQ, 1: Abrir Ticket
+    var searchQuery by remember { mutableStateOf("") }
+    var expandedFaqIndex by remember { mutableIntStateOf(-1) }
+
+    val faqList = remember {
+        listOf(
+            FaqItem(
+                id = 1,
+                question = "Como vincular minha conta do MT5 ao Portal?",
+                answer = "Acesse a aba 'Conta EA' no menu inferior do aplicativo, digite o número exato da sua conta de negociação no MT5 (ex: 8841209) e clique em 'Salvar Número MT5'. Quando o robô estiver em execução no MetaTrader 5 com esse mesmo ID, o Portal exibirá o status ONLINE em tempo real.",
+                category = "MT5",
+                icon = Icons.Default.AccountBalance
+            ),
+            FaqItem(
+                id = 2,
+                question = "Por que os Templates Oficiais do Admin vêm com Lote 0.00?",
+                answer = "Por medida de segurança e gestão de risco! A exposição recomendada é de 0.5% por operação em relação ao saldo total da sua conta. O Admin publica os parâmetros com lote 0.00 para que você defina o lote apropriado na aba 'Config EA' de acordo com a margem da sua banca antes de sincronizar.",
+                category = "Risco",
+                icon = Icons.Default.Shield
+            ),
+            FaqItem(
+                id = 3,
+                question = "Como carregar e aplicar um Template do Admin?",
+                answer = "Na aba 'Config EA', abra a seção 'Templates & Presets do Admin'. Escolha o preset desejado (ex: Gold Conservador, Surfada D1), verifique as tags de paridade (XAUUSD, EURUSD) e pontos do canal, clique em 'Carregar' ou 'Aplicar'. Os campos do formulário serão preenchidos. Ajuste o lote para 0.5% de exposição e clique em 'Salvar e Sincronizar'.",
+                category = "Templates",
+                icon = Icons.Default.CloudDownload
+            ),
+            FaqItem(
+                id = 4,
+                question = "O que fazer se o Robô no MT5 aparecer como OFFLINE?",
+                answer = "1. Certifique-se de que o botão 'AlgoTrading' ou 'AutoTrading' está ativo no topo do MT5.\n2. Verifique se o número da conta MT5 cadastrado na aba 'Conta EA' é idêntico à conta logada no MetaTrader.\n3. Confirme se as URLs do servidor estão autorizadas em Ferramentas > Opções > Expert Advisors no MT5.",
+                category = "MT5",
+                icon = Icons.Default.Warning
+            ),
+            FaqItem(
+                id = 5,
+                question = "Como verificar o status e validade da minha Licença?",
+                answer = "Acesse a aba 'Licença' no menu inferior. Lá você poderá visualizar se sua licença está ativa ('LICENÇA ATIVA'), conferir a data de expiração e o identificador do dispositivo (UID). Se precisar renovar, entre em contato com o suporte.",
+                category = "Licença",
+                icon = Icons.Default.Verified
+            ),
+            FaqItem(
+                id = 6,
+                question = "Como funcionam os Alertas em Áudio (TTS) no Portal?",
+                answer = "Na aba 'Eventos EA', o Portal Fimaster transmite notificações de ordens e canais do robô em tempo real. Cada evento possui um botão com ícone de áudio para voz sintetizada em português.",
+                category = "Eventos",
+                icon = Icons.Default.Notifications
+            )
+        )
+    }
+
+    val filteredFaq = remember(searchQuery, faqList) {
+        if (searchQuery.isBlank()) faqList
+        else faqList.filter {
+            it.question.contains(searchQuery, ignoreCase = true) ||
+            it.answer.contains(searchQuery, ignoreCase = true) ||
+            it.category.contains(searchQuery, ignoreCase = true)
+        }
+    }
+
+    val categorias = listOf(
+        "Problema no MT5",
+        "Licença & Expiração",
+        "Configuração do EA",
+        "Outros Assuntos"
+    )
+    var selectedCategory by remember { mutableStateOf(categorias[0]) }
+    var assuntoText by remember { mutableStateOf("") }
+    var mensagemText by remember { mutableStateOf("") }
+    var contatoText by remember { mutableStateOf(userProfile?.numero ?: "") }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth(0.94f)
+                .padding(vertical = 16.dp)
+                .border(
+                    1.dp,
+                    Color(0xFF0EA5E9).copy(alpha = 0.4f),
+                    RoundedCornerShape(20.dp)
+                ),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF0F172A)),
+            shape = RoundedCornerShape(20.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .padding(18.dp)
+                    .fillMaxWidth()
+            ) {
+                // Header
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(42.dp)
+                            .clip(CircleShape)
+                            .background(Color(0xFF0EA5E9).copy(alpha = 0.15f))
+                            .border(1.dp, Color(0xFF0EA5E9).copy(alpha = 0.4f), CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = if (activeSupportTab == 0) Icons.Default.Help else Icons.Default.SupportAgent,
+                            contentDescription = "Suporte",
+                            tint = Color(0xFF38BDF8),
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = if (activeSupportTab == 0) "Perguntas Frequentes (FAQ)" else "Suporte Técnico & Ajuda",
+                            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                            color = Color.White
+                        )
+                        Text(
+                            text = if (activeSupportTab == 0) "Respostas rápidas para as dúvidas mais comuns" else "Envie um ticket diretamente para a equipe técnica",
+                            style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8), fontSize = 11.sp)
+                        )
+                    }
+                    IconButton(
+                        onClick = onDismiss,
+                        modifier = Modifier.size(32.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = "Fechar",
+                            tint = Color(0xFF64748B)
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(14.dp))
+
+                // Top Tab Selector (FAQ vs Abrir Ticket)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color(0xFF1E293B), RoundedCornerShape(12.dp))
+                        .padding(4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Surface(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clickable { activeSupportTab = 0 },
+                        shape = RoundedCornerShape(10.dp),
+                        color = if (activeSupportTab == 0) Color(0xFF0EA5E9) else Color.Transparent
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(vertical = 8.dp),
+                            horizontalArrangement = Arrangement.Center,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.QuestionAnswer,
+                                contentDescription = null,
+                                tint = if (activeSupportTab == 0) Color.White else Color(0xFF94A3B8),
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "FAQ / Dúvidas",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 11.5.sp
+                                ),
+                                color = if (activeSupportTab == 0) Color.White else Color(0xFF94A3B8)
+                            )
+                        }
+                    }
+
+                    Surface(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clickable { activeSupportTab = 1 },
+                        shape = RoundedCornerShape(10.dp),
+                        color = if (activeSupportTab == 1) Color(0xFF0EA5E9) else Color.Transparent
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(vertical = 8.dp),
+                            horizontalArrangement = Arrangement.Center,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Send,
+                                contentDescription = null,
+                                tint = if (activeSupportTab == 1) Color.White else Color(0xFF94A3B8),
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "Abrir Ticket",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 11.5.sp
+                                ),
+                                color = if (activeSupportTab == 1) Color.White else Color(0xFF94A3B8)
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(14.dp))
+
+                if (activeSupportTab == 0) {
+                    // TAB FAQ (Perguntas Frequentes)
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 420.dp)
+                            .verticalScroll(rememberScrollState())
+                    ) {
+                        // Search bar
+                        OutlinedTextField(
+                            value = searchQuery,
+                            onValueChange = { searchQuery = it },
+                            placeholder = { Text("Pesquisar dúvida ex: lote, MT5, licença...", fontSize = 12.sp) },
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.Default.Search,
+                                    contentDescription = null,
+                                    tint = Color(0xFF0EA5E9),
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            },
+                            trailingIcon = {
+                                if (searchQuery.isNotBlank()) {
+                                    IconButton(onClick = { searchQuery = "" }) {
+                                        Icon(
+                                            imageVector = Icons.Default.Close,
+                                            contentDescription = "Limpar",
+                                            tint = Color(0xFF64748B),
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                    }
+                                }
+                            },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = Color(0xFF0EA5E9),
+                                unfocusedBorderColor = Color(0xFF334155),
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White
+                            ),
+                            shape = RoundedCornerShape(10.dp)
+                        )
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        if (filteredFaq.isEmpty()) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(24.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = "Nenhuma dúvida encontrada para '${searchQuery}'",
+                                    style = MaterialTheme.typography.bodyMedium.copy(color = Color(0xFF94A3B8))
+                                )
+                            }
+                        } else {
+                            filteredFaq.forEachIndexed { index, item ->
+                                val isExpanded = expandedFaqIndex == index
+                                Card(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 4.dp)
+                                        .clickable {
+                                            expandedFaqIndex = if (isExpanded) -1 else index
+                                        },
+                                    colors = CardDefaults.cardColors(
+                                        containerColor = if (isExpanded) Color(0xFF1E293B) else Color(0xFF0F172A)
+                                    ),
+                                    shape = RoundedCornerShape(12.dp),
+                                    border = BorderStroke(
+                                        1.dp,
+                                        if (isExpanded) Color(0xFF0EA5E9) else Color(0xFF334155)
+                                    )
+                                ) {
+                                    Column(modifier = Modifier.padding(12.dp)) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Box(
+                                                modifier = Modifier
+                                                    .size(30.dp)
+                                                    .clip(CircleShape)
+                                                    .background(Color(0xFF0EA5E9).copy(alpha = 0.15f)),
+                                                contentAlignment = Alignment.Center
+                                            ) {
+                                                Icon(
+                                                    imageVector = item.icon,
+                                                    contentDescription = null,
+                                                    tint = Color(0xFF38BDF8),
+                                                    modifier = Modifier.size(16.dp)
+                                                )
+                                            }
+                                            Spacer(modifier = Modifier.width(10.dp))
+                                            Text(
+                                                text = item.question,
+                                                style = MaterialTheme.typography.bodySmall.copy(
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = Color.White,
+                                                    fontSize = 12.sp
+                                                ),
+                                                modifier = Modifier.weight(1f)
+                                            )
+                                            Icon(
+                                                imageVector = if (isExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                                                contentDescription = null,
+                                                tint = Color(0xFF38BDF8),
+                                                modifier = Modifier.size(20.dp)
+                                            )
+                                        }
+
+                                        if (isExpanded) {
+                                            Spacer(modifier = Modifier.height(8.dp))
+                                            HorizontalDivider(color = Color(0xFF334155))
+                                            Spacer(modifier = Modifier.height(8.dp))
+                                            Text(
+                                                text = item.answer,
+                                                style = MaterialTheme.typography.bodySmall.copy(
+                                                    color = Color(0xFFCBD5E1),
+                                                    fontSize = 11.5.sp,
+                                                    lineHeight = 16.sp
+                                                )
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(14.dp))
+
+                        // Call to action button to open ticket
+                        Surface(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { activeSupportTab = 1 },
+                            color = Color(0xFF0EA5E9).copy(alpha = 0.12f),
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(1.dp, Color(0xFF0EA5E9).copy(alpha = 0.4f))
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.HeadsetMic,
+                                    contentDescription = null,
+                                    tint = Color(0xFF38BDF8),
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = "Sua dúvida não foi resolvida? Clique aqui para abrir um Ticket",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        color = Color(0xFF38BDF8),
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 11.sp
+                                    )
+                                )
+                            }
+                        }
+                    }
+                } else {
+                    // TAB TICKET FORM
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 420.dp)
+                            .verticalScroll(rememberScrollState())
+                    ) {
+                        // Categoria selector
+                        Text(
+                            text = "Tipo de Solicitação",
+                            style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF94A3B8), fontWeight = FontWeight.Bold)
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        LazyRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            items(categorias) { cat ->
+                                val isSelected = cat == selectedCategory
+                                Surface(
+                                    modifier = Modifier.clickable { selectedCategory = cat },
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = if (isSelected) Color(0xFF0EA5E9) else Color(0xFF1E293B),
+                                    border = BorderStroke(
+                                        1.dp,
+                                        if (isSelected) Color(0xFF38BDF8) else Color(0xFF334155)
+                                    )
+                                ) {
+                                    Text(
+                                        text = cat,
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                            fontSize = 11.sp
+                                        ),
+                                        color = if (isSelected) Color.White else Color(0xFFCBD5E1),
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                    )
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(14.dp))
+
+                        // Assunto
+                        OutlinedTextField(
+                            value = assuntoText,
+                            onValueChange = {
+                                assuntoText = it
+                                errorMessage = null
+                            },
+                            label = { Text("Assunto / Título da Dúvida") },
+                            placeholder = { Text("Ex: Erro de conexão com o MT5") },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = Color(0xFF0EA5E9),
+                                unfocusedBorderColor = Color(0xFF334155),
+                                focusedLabelColor = Color(0xFF38BDF8),
+                                unfocusedLabelColor = Color(0xFF64748B),
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White
+                            ),
+                            shape = RoundedCornerShape(10.dp)
+                        )
+
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        // Mensagem / Descrição
+                        OutlinedTextField(
+                            value = mensagemText,
+                            onValueChange = {
+                                mensagemText = it
+                                errorMessage = null
+                            },
+                            label = { Text("Descrição Detalhada") },
+                            placeholder = { Text("Descreva o problema ou dúvida técnica...") },
+                            modifier = Modifier.fillMaxWidth(),
+                            minLines = 3,
+                            maxLines = 5,
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = Color(0xFF0EA5E9),
+                                unfocusedBorderColor = Color(0xFF334155),
+                                focusedLabelColor = Color(0xFF38BDF8),
+                                unfocusedLabelColor = Color(0xFF64748B),
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White
+                            ),
+                            shape = RoundedCornerShape(10.dp)
+                        )
+
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        // Contato (WhatsApp/E-mail)
+                        OutlinedTextField(
+                            value = contatoText,
+                            onValueChange = { contatoText = it },
+                            label = { Text("Contato para Resposta (WhatsApp / E-mail)") },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = Color(0xFF0EA5E9),
+                                unfocusedBorderColor = Color(0xFF334155),
+                                focusedLabelColor = Color(0xFF38BDF8),
+                                unfocusedLabelColor = Color(0xFF64748B),
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White
+                            ),
+                            shape = RoundedCornerShape(10.dp)
+                        )
+
+                        if (errorMessage != null) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = errorMessage!!,
+                                color = Color(0xFFEF4444),
+                                style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp)
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(18.dp))
+
+                        // Buttons
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.End,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            TextButton(onClick = onDismiss) {
+                                Text("Cancelar", color = Color(0xFF94A3B8))
+                            }
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Button(
+                                onClick = {
+                                    if (assuntoText.isBlank() || mensagemText.isBlank()) {
+                                        errorMessage = "Por favor, preencha o assunto e a descrição."
+                                    } else {
+                                        onSubmit(selectedCategory, assuntoText.trim(), mensagemText.trim(), contatoText.trim())
+                                    }
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0EA5E9)),
+                                shape = RoundedCornerShape(10.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Send,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp),
+                                    tint = Color.White
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Enviar Ticket", fontWeight = FontWeight.Bold, color = Color.White)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 @Composable
 fun EaConfigScreen(viewModel: PortalViewModel) {
     val configState by viewModel.eaConfig.collectAsStateWithLifecycle()
     val userProfile by viewModel.userProfile.collectAsStateWithLifecycle()
     val dataSourceMode by viewModel.dataSourceMode.collectAsStateWithLifecycle()
     val eaRobotStatus by viewModel.eaRobotStatus.collectAsStateWithLifecycle()
+    val adminTemplates by viewModel.adminTemplates.collectAsStateWithLifecycle()
     
     var localConfig by remember { mutableStateOf<com.example.data.EaConfigEntity?>(null) }
     
@@ -3534,6 +6444,9 @@ fun EaConfigScreen(viewModel: PortalViewModel) {
     var customTemplates by remember { mutableStateOf<List<Pair<String, com.example.data.EaConfigEntity>>>(emptyList()) }
     var newTemplateName by remember { mutableStateOf("") }
     var templateMessage by remember { mutableStateOf("") }
+    var activeTemplateId by remember { mutableStateOf<String?>(null) }
+    var activeTemplateAction by remember { mutableStateOf<String?>(null) }
+    var showAdminInstructionsDialog by remember { mutableStateOf(false) }
 
     val focusManager = LocalFocusManager.current
 
@@ -3722,53 +6635,68 @@ fun EaConfigScreen(viewModel: PortalViewModel) {
                                 Spacer(modifier = Modifier.width(12.dp))
                                 
                                 Column(modifier = Modifier.weight(1f)) {
-                                    Row(
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        modifier = Modifier.fillMaxWidth()
-                                    ) {
-                                        Text(
-                                            text = if (isSynced) "Parâmetros sincronizados com sucesso pelo EA" else "Sincronizando parâmetros com o robô MetaTrader...",
-                                            style = MaterialTheme.typography.bodyMedium.copy(
-                                                color = Color.White,
-                                                fontWeight = FontWeight.Bold,
-                                                fontSize = 13.sp
-                                            ),
-                                            modifier = Modifier.weight(1f)
-                                        )
-                                        
-                                        Surface(
-                                            shape = RoundedCornerShape(6.dp),
-                                            color = if (isSynced) Color(0xFF10B981).copy(alpha = 0.2f) else Color(0xFF38BDF8).copy(alpha = 0.2f),
-                                            modifier = Modifier.padding(start = 6.dp)
-                                        ) {
-                                            Text(
-                                                text = if (isSynced) "ONLINE" else "SYNC",
-                                                color = if (isSynced) Color(0xFF34D399) else Color(0xFF38BDF8),
-                                                style = MaterialTheme.typography.labelSmall.copy(
-                                                    fontWeight = FontWeight.ExtraBold,
-                                                    fontSize = 9.sp
-                                                ),
-                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                                            )
-                                        }
-                                    }
-                                    
-                                    Spacer(modifier = Modifier.height(2.dp))
-                                    
                                     Text(
-                                        text = if (isSynced && (eaRobotStatus?.lastConfigSync ?: 0L) > 0L) {
-                                            val dateStr = java.text.SimpleDateFormat("dd/MM/yyyy HH:mm:ss", java.util.Locale.getDefault())
-                                                .format(java.util.Date((eaRobotStatus?.lastConfigSync ?: 0L) * 1000L))
-                                            "Confirmado pelo MT5 em $dateStr"
-                                        } else {
-                                            "O robô lê e aplica as alterações automaticamente a cada 5 segundos no MT5"
-                                        },
-                                        style = MaterialTheme.typography.bodySmall.copy(
-                                            color = Color(0xFF94A3B8),
-                                            fontSize = 11.sp
+                                        text = if (isSynced) "Parâmetros sincronizados com sucesso pelo EA" else "Sincronizando parâmetros com o robô MetaTrader...",
+                                        style = MaterialTheme.typography.bodyMedium.copy(
+                                            color = Color.White,
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 13.sp
                                         )
                                     )
+                                    
+                                    if (isSynced && (eaRobotStatus?.lastConfigSync ?: 0L) > 0L) {
+                                        val dateStr = java.text.SimpleDateFormat("dd/MM/yyyy HH:mm:ss", java.util.Locale.getDefault())
+                                            .format(java.util.Date((eaRobotStatus?.lastConfigSync ?: 0L) * 1000L))
+                                        
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            modifier = Modifier.padding(top = 2.dp)
+                                        ) {
+                                            Text(
+                                                text = "Confirmado pelo MT5 em ",
+                                                style = MaterialTheme.typography.bodySmall.copy(
+                                                    color = Color(0xFF94A3B8),
+                                                    fontSize = 11.sp
+                                                )
+                                            )
+                                            Surface(
+                                                shape = RoundedCornerShape(6.dp),
+                                                color = Color(0xFF10B981).copy(alpha = 0.25f),
+                                                border = BorderStroke(1.dp, Color(0xFF10B981).copy(alpha = 0.6f))
+                                            ) {
+                                                Row(
+                                                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+                                                    verticalAlignment = Alignment.CenterVertically
+                                                ) {
+                                                    Icon(
+                                                        imageVector = Icons.Default.Schedule,
+                                                        contentDescription = null,
+                                                        tint = Color(0xFF34D399),
+                                                        modifier = Modifier.size(12.dp)
+                                                    )
+                                                    Spacer(modifier = Modifier.width(4.dp))
+                                                    Text(
+                                                        text = dateStr,
+                                                        style = MaterialTheme.typography.labelSmall.copy(
+                                                            color = Color(0xFF34D399),
+                                                            fontWeight = FontWeight.Bold,
+                                                            fontSize = 11.sp
+                                                        )
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        Spacer(modifier = Modifier.height(2.dp))
+                                        Text(
+                                            text = "O robô lê e aplica as alterações automaticamente a cada 5 segundos no MT5",
+                                            style = MaterialTheme.typography.bodySmall.copy(
+                                                color = Color(0xFF94A3B8),
+                                                fontSize = 11.sp
+                                            )
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -3818,84 +6746,344 @@ fun EaConfigScreen(viewModel: PortalViewModel) {
                 onToggle = { expTemplates = !expTemplates }
             ) {
                 Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                    Text(
-                        text = "⚡ PRESETS PADRÃO DISPONÍVEIS",
-                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold, color = Color(0xFF38BDF8))
-                    )
+                    // 1. ADMIN PUBLISHED TEMPLATES SECTION
+                    if (showAdminInstructionsDialog) {
+                        InstrucoesAdminTemplatesDialog(onDismiss = { showAdminInstructionsDialog = false })
+                    }
 
-                    val defaultPresets = listOf(
-                        Triple("⚡ Fimathe M15 Padrão", "FIMATHE M15 | Lote 0.01", config.copy(
-                            ESTRATÉGIA = "FIMATHE",
-                            OperationalPeriod = "PERIOD_M15",
-                            lot = 0.01,
-                            Nives = 1.0,
-                            Costurar = true,
-                            virada_de_jogo = false,
-                            AUTO_PERIOD = "HORA_1"
-                        )),
-                        Triple("🌊 F_Surfada D1 Agressivo", "F_SURFADA D1 | Lote 0.05", config.copy(
-                            ESTRATÉGIA = "F_SURFADA",
-                            OperationalPeriod = "PERIOD_D1",
-                            lot = 0.05,
-                            Nives = 2.0,
-                            Costurar = true,
-                            virada_de_jogo = true,
-                            AUTO_SURFADA = true,
-                            AUTO_PERIOD = "DIARIO"
-                        )),
-                        Triple("🛡️ Conservador M30", "FIMATHE M30 | Risco Diário 0.5%", config.copy(
-                            ESTRATÉGIA = "FIMATHE",
-                            OperationalPeriod = "PERIOD_M30",
-                            lot = 0.01,
-                            GERENCIAMENTO_DE_RISCO_DIARIO = true,
-                            porcentos = 0.5,
-                            poercentosg = 0.5,
-                            posicaoTake = true,
-                            santo = 25.0,
-                            dedo = 15
-                        )),
-                        Triple("🚀 Scalper M1", "FIMATHE M1 | Sessões Ativas", config.copy(
-                            ESTRATÉGIA = "FIMATHE",
-                            OperationalPeriod = "PERIOD_M1",
-                            lot = 0.02,
-                            Costurar = true,
-                            AUTO_PERIOD = "HORA_1",
-                            SESSAO_LONDRES = true,
-                            SESSAO_NOVA_YORQUI = true
-                        ))
-                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "👑 TEMPLATES DO ADMIN",
+                            style = MaterialTheme.typography.labelMedium.copy(
+                                fontWeight = FontWeight.Black,
+                                color = Color(0xFFC084FC),
+                                letterSpacing = 0.5.sp
+                            ),
+                            modifier = Modifier.weight(1f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        OutlinedButton(
+                            onClick = { showAdminInstructionsDialog = true },
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, Color(0xFFC084FC).copy(alpha = 0.6f)),
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                            modifier = Modifier.height(32.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Info,
+                                contentDescription = "Instruções Admin",
+                                tint = Color(0xFFC084FC),
+                                modifier = Modifier.size(13.dp)
+                            )
+                            Spacer(modifier = Modifier.width(3.dp))
+                            Text(
+                                text = "Schema",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = Color(0xFFC084FC),
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 10.sp
+                                )
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(4.dp))
+                        OutlinedButton(
+                            onClick = {
+                                viewModel.loadAdminTemplates()
+                                templateMessage = "Servidor consultado: Templates atualizados com sucesso!"
+                            },
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, Color(0xFFC084FC)),
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                            modifier = Modifier.height(32.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Refresh,
+                                contentDescription = "Atualizar Templates",
+                                tint = Color(0xFFC084FC),
+                                modifier = Modifier.size(13.dp)
+                            )
+                            Spacer(modifier = Modifier.width(3.dp))
+                            Text(
+                                text = "Atualizar",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = Color(0xFFC084FC),
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 10.sp
+                                )
+                            )
+                        }
+                    }
 
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        defaultPresets.forEach { (title, subtitle, presetConfig) ->
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        if (adminTemplates.isEmpty()) {
                             Surface(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable {
-                                        localConfig = presetConfig
-                                        templateMessage = "Preset '$title' aplicado aos campos!"
-                                    },
+                                modifier = Modifier.fillMaxWidth(),
                                 color = Color(0xFF0F172A),
                                 shape = RoundedCornerShape(10.dp),
                                 border = BorderStroke(1.dp, Color(0xFF334155))
                             ) {
-                                Row(
-                                    modifier = Modifier.padding(12.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween
+                                Text(
+                                    text = "Nenhum template publicado pelo Admin no momento.",
+                                    style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8)),
+                                    modifier = Modifier.padding(12.dp)
+                                )
+                            }
+                        } else {
+                            adminTemplates.forEach { tpl ->
+                                val isValid = tpl.isTemplateValido()
+                                Surface(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    color = Color(0xFF0F172A),
+                                    shape = RoundedCornerShape(12.dp),
+                                    border = BorderStroke(
+                                        1.dp,
+                                        if (isValid) Color(0xFF0EA5E9).copy(alpha = 0.6f) else Color(0xFFEF4444).copy(alpha = 0.4f)
+                                    )
                                 ) {
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(text = title, style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold, color = Color.White))
-                                        Text(text = subtitle, style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8)))
-                                    }
-                                    Button(
-                                        onClick = {
-                                            localConfig = presetConfig
-                                            templateMessage = "Preset '$title' aplicado aos campos!"
-                                        },
-                                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
-                                        shape = RoundedCornerShape(8.dp)
-                                    ) {
-                                        Text("📥 Carregar", style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold))
+                                    Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.Top
+                                        ) {
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = tpl.titulo,
+                                                    style = MaterialTheme.typography.bodyMedium.copy(
+                                                        fontWeight = FontWeight.Bold,
+                                                        color = Color.White
+                                                    )
+                                                )
+                                                if (tpl.descricao.isNotBlank()) {
+                                                    Text(
+                                                        text = tpl.descricao,
+                                                        style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFFCBD5E1), fontSize = 11.sp)
+                                                    )
+                                                }
+                                            }
+
+                                            Spacer(modifier = Modifier.width(8.dp))
+
+                                            Surface(
+                                                shape = RoundedCornerShape(8.dp),
+                                                color = if (isValid) Color(0xFF10B981).copy(alpha = 0.2f) else Color(0xFFEF4444).copy(alpha = 0.2f),
+                                                border = BorderStroke(
+                                                    1.dp,
+                                                    if (isValid) Color(0xFF34D399) else Color(0xFFF87171)
+                                                )
+                                            ) {
+                                                Row(
+                                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                                    verticalAlignment = Alignment.CenterVertically
+                                                ) {
+                                                    Box(
+                                                        modifier = Modifier
+                                                            .size(6.dp)
+                                                            .clip(CircleShape)
+                                                            .background(if (isValid) Color(0xFF34D399) else Color(0xFFF87171))
+                                                    )
+                                                    Spacer(modifier = Modifier.width(4.dp))
+                                                    Text(
+                                                        text = if (isValid) "DISPONÍVEL" else "INDISPONÍVEL",
+                                                        style = MaterialTheme.typography.labelSmall.copy(
+                                                            color = if (isValid) Color(0xFF34D399) else Color(0xFFF87171),
+                                                            fontWeight = FontWeight.Bold,
+                                                            fontSize = 9.sp
+                                                        )
+                                                    )
+                                                }
+                                            }
+                                        }
+
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                Icon(imageVector = Icons.Default.Event, contentDescription = null, tint = Color(0xFF94A3B8), modifier = Modifier.size(12.dp))
+                                                Spacer(modifier = Modifier.width(4.dp))
+                                                Text(
+                                                    text = "Pub: ${tpl.dataPublicacao}",
+                                                    style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF94A3B8), fontSize = 10.sp)
+                                                )
+                                            }
+
+                                            if (!isValid && tpl.validoAte.isNotBlank()) {
+                                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                                    Icon(imageVector = Icons.Default.Schedule, contentDescription = null, tint = Color(0xFFF87171), modifier = Modifier.size(12.dp))
+                                                    Spacer(modifier = Modifier.width(4.dp))
+                                                    Text(
+                                                        text = "Expirado: ${tpl.validoAte}",
+                                                        style = MaterialTheme.typography.labelSmall.copy(
+                                                            color = Color(0xFFF87171),
+                                                            fontSize = 10.sp,
+                                                            fontWeight = FontWeight.Medium
+                                                        )
+                                                    )
+                                                }
+                                            }
+                                        }
+
+                                        if (tpl.paridade.isNotBlank() || tpl.pontosAtivo.isNotBlank()) {
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                if (tpl.paridade.isNotBlank()) {
+                                                    Surface(
+                                                        color = Color(0xFF38BDF8).copy(alpha = 0.15f),
+                                                        shape = RoundedCornerShape(4.dp),
+                                                        border = BorderStroke(0.5.dp, Color(0xFF38BDF8).copy(alpha = 0.5f))
+                                                    ) {
+                                                        Text(
+                                                            text = "💱 ${tpl.paridade}",
+                                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                                color = Color(0xFF7DD3FC),
+                                                                fontSize = 10.sp,
+                                                                fontWeight = FontWeight.Bold
+                                                            ),
+                                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                                        )
+                                                    }
+                                                }
+                                                if (tpl.pontosAtivo.isNotBlank()) {
+                                                    Surface(
+                                                        color = Color(0xFF10B981).copy(alpha = 0.15f),
+                                                        shape = RoundedCornerShape(4.dp),
+                                                        border = BorderStroke(0.5.dp, Color(0xFF10B981).copy(alpha = 0.5f))
+                                                    ) {
+                                                        Text(
+                                                            text = "🎯 ${tpl.pontosAtivo}",
+                                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                                color = Color(0xFF6EE7B7),
+                                                                fontSize = 10.sp,
+                                                                fontWeight = FontWeight.Bold
+                                                            ),
+                                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        Text(
+                                            text = "Estratégia: ${tpl.config.ESTRATÉGIA} | TF: ${tpl.config.OperationalPeriod}",
+                                            style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF38BDF8), fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
+                                        )
+
+                                        Surface(
+                                            color = Color(0xFF0284C7).copy(alpha = 0.15f),
+                                            border = BorderStroke(1.dp, Color(0xFF38BDF8).copy(alpha = 0.5f)),
+                                            shape = RoundedCornerShape(6.dp),
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Row(
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.Warning,
+                                                    contentDescription = null,
+                                                    tint = Color(0xFF38BDF8),
+                                                    modifier = Modifier.size(13.dp)
+                                                )
+                                                Spacer(modifier = Modifier.width(6.dp))
+                                                Text(
+                                                    text = "⚠️ Lote 0.00: Ajuste o lote nos campos conforme a margem da sua conta! A exposição recomendada é de 0.5%",
+                                                    style = MaterialTheme.typography.labelSmall.copy(
+                                                        color = Color(0xFFBAE6FD),
+                                                        fontSize = 9.5.sp,
+                                                        fontWeight = FontWeight.Medium,
+                                                        lineHeight = 12.sp
+                                                    )
+                                                )
+                                            }
+                                        }
+
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.End,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            val isThisActive = activeTemplateId == tpl.id
+                                            val isLoaded = isThisActive && activeTemplateAction == "LOADED"
+                                            val isApplied = isThisActive && activeTemplateAction == "APPLIED"
+
+                                            OutlinedButton(
+                                                onClick = {
+                                                    if (!isValid) return@OutlinedButton
+                                                    localConfig = tpl.config
+                                                    activeTemplateId = tpl.id
+                                                    activeTemplateAction = "LOADED"
+                                                    templateMessage = "Template '${tpl.titulo}' carregado nos campos para revisão!"
+                                                },
+                                                enabled = isValid,
+                                                shape = RoundedCornerShape(8.dp),
+                                                border = BorderStroke(1.dp, if (!isValid) Color(0xFF475569) else if (isLoaded) Color(0xFF10B981) else Color(0xFF38BDF8)),
+                                                colors = ButtonDefaults.outlinedButtonColors(
+                                                    disabledContentColor = Color(0xFF64748B)
+                                                ),
+                                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                                            ) {
+                                                Icon(
+                                                    imageVector = if (isLoaded) Icons.Default.CheckCircle else Icons.Default.Download,
+                                                    contentDescription = null,
+                                                    tint = if (!isValid) Color(0xFF64748B) else if (isLoaded) Color(0xFF10B981) else Color(0xFF38BDF8),
+                                                    modifier = Modifier.size(14.dp)
+                                                )
+                                                Spacer(modifier = Modifier.width(4.dp))
+                                                Text(
+                                                    text = if (isLoaded) "✓ Carregado" else "Carregar",
+                                                    style = MaterialTheme.typography.labelSmall.copy(
+                                                        color = if (!isValid) Color(0xFF64748B) else if (isLoaded) Color(0xFF10B981) else Color(0xFF38BDF8),
+                                                        fontWeight = if (isLoaded) FontWeight.Bold else FontWeight.Normal
+                                                    )
+                                                )
+                                            }
+
+                                            Spacer(modifier = Modifier.width(8.dp))
+
+                                            Button(
+                                                onClick = {
+                                                    if (!isValid) return@Button
+                                                    localConfig = tpl.config
+                                                    activeTemplateId = tpl.id
+                                                    activeTemplateAction = "APPLIED"
+                                                    templateMessage = "Template '${tpl.titulo}' aplicado nos campos! Clique em 'Salvar e Sincronizar' para enviar ao banco."
+                                                },
+                                                enabled = isValid,
+                                                colors = ButtonDefaults.buttonColors(
+                                                    containerColor = if (isApplied) Color(0xFF10B981) else Color(0xFF0284C7),
+                                                    disabledContainerColor = Color(0xFF334155),
+                                                    disabledContentColor = Color(0xFF64748B)
+                                                ),
+                                                shape = RoundedCornerShape(8.dp),
+                                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.CheckCircle,
+                                                    contentDescription = null,
+                                                    tint = if (isValid) Color.White else Color(0xFF64748B),
+                                                    modifier = Modifier.size(14.dp)
+                                                )
+                                                Spacer(modifier = Modifier.width(4.dp))
+                                                Text(
+                                                    text = if (isApplied) "✓ Aplicado" else "Aplicar",
+                                                    style = MaterialTheme.typography.labelSmall.copy(
+                                                        color = if (isValid) Color.White else Color(0xFF64748B),
+                                                        fontWeight = FontWeight.Bold
+                                                    )
+                                                )
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -3951,11 +7139,13 @@ fun EaConfigScreen(viewModel: PortalViewModel) {
 
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             customTemplates.forEachIndexed { index, (name, customCfg) ->
+                                val customId = "custom_$index"
+                                val isCustomLoaded = activeTemplateId == customId && activeTemplateAction == "LOADED"
                                 Surface(
                                     modifier = Modifier.fillMaxWidth(),
                                     color = Color(0xFF0F172A),
                                     shape = RoundedCornerShape(10.dp),
-                                    border = BorderStroke(1.dp, Color(0xFF334155))
+                                    border = BorderStroke(1.dp, if (isCustomLoaded) Color(0xFF10B981) else Color(0xFF334155))
                                 ) {
                                     Row(
                                         modifier = Modifier.padding(12.dp),
@@ -3974,12 +7164,19 @@ fun EaConfigScreen(viewModel: PortalViewModel) {
                                             Button(
                                                 onClick = {
                                                     localConfig = customCfg
+                                                    activeTemplateId = customId
+                                                    activeTemplateAction = "LOADED"
                                                     templateMessage = "Template '$name' aplicado!"
                                                 },
-                                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
+                                                colors = ButtonDefaults.buttonColors(
+                                                    containerColor = if (isCustomLoaded) Color(0xFF10B981) else Color(0xFF0284C7)
+                                                ),
                                                 shape = RoundedCornerShape(8.dp)
                                             ) {
-                                                Text("📥 Usar", style = MaterialTheme.typography.labelSmall)
+                                                Text(
+                                                    text = if (isCustomLoaded) "✓ Aplicado" else "📥 Usar",
+                                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
+                                                )
                                             }
 
                                             IconButton(
@@ -4885,6 +8082,78 @@ fun EaConfigScreen(viewModel: PortalViewModel) {
                         onValueChange = { localConfig = config.copy(CAMBIO = it) },
                         label = "Taxa de Câmbio USD (CAMBIO)"
                     )
+
+                    // Quick Currency Presets & Auto Fetch Online Quote
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color(0xFF0F172A), RoundedCornerShape(10.dp))
+                            .border(1.dp, Color(0xFF0EA5E9).copy(alpha = 0.3f), RoundedCornerShape(10.dp))
+                            .padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = "🌐 Buscar Cotação em Tempo Real (API Financeira)",
+                            style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF38BDF8), fontWeight = FontWeight.Bold)
+                        )
+
+                        Text(
+                            text = "Obtenha a taxa oficial de conversão USD via mercado financeiro internacional:",
+                            style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8), fontSize = 11.sp)
+                        )
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            listOf("MZN" to "🇲🇿 Metical", "BRL" to "🇧🇷 Real", "EUR" to "🇪🇺 Euro", "AOA" to "🇦🇴 Kwanza").forEach { (code, label) ->
+                                Surface(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .clickable {
+                                            localConfig = config.copy(mony = code)
+                                            viewModel.fetchExchangeRate(code) { newRate ->
+                                                if (newRate != null) {
+                                                    localConfig = localConfig?.copy(CAMBIO = newRate, mony = code)
+                                                }
+                                            }
+                                        },
+                                    shape = RoundedCornerShape(6.dp),
+                                    color = if (config.mony.uppercase() == code) Color(0xFF0EA5E9) else Color(0xFF1E293B),
+                                    border = BorderStroke(0.5.dp, Color(0xFF0EA5E9).copy(alpha = 0.5f))
+                                ) {
+                                    Text(
+                                        text = label,
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            color = Color.White,
+                                            fontSize = 9.5.sp,
+                                            fontWeight = FontWeight.Bold
+                                        ),
+                                        modifier = Modifier.padding(vertical = 6.dp, horizontal = 2.dp),
+                                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                                    )
+                                }
+                            }
+                        }
+
+                        Button(
+                            onClick = {
+                                val targetCode = config.mony.ifBlank { "MZN" }
+                                viewModel.fetchExchangeRate(targetCode) { newRate ->
+                                    if (newRate != null) {
+                                        localConfig = localConfig?.copy(CAMBIO = newRate, mony = targetCode)
+                                    }
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth().height(42.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Icon(imageVector = Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Atualizar Câmbio On-line Agora", style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold))
+                        }
+                    }
                 }
             }
         }
@@ -5166,19 +8435,21 @@ fun LoginScreen(
     var showHelpSection by remember { mutableStateOf(false) }
 
     LaunchedEffect(feedbackMessage) {
-        if (feedbackMessage != null && (
-            feedbackMessage!!.contains("Erro", ignoreCase = true) ||
-            feedbackMessage!!.contains("incorrect", ignoreCase = true) ||
-            feedbackMessage!!.contains("incorreta", ignoreCase = true) ||
-            feedbackMessage!!.contains("não encontrado", ignoreCase = true) ||
-            feedbackMessage!!.contains("preencha", ignoreCase = true)
-        )) {
-            lastLoginError = feedbackMessage
+        val msg = feedbackMessage
+        if (!msg.isNullOrBlank()) {
+            if (msg.startsWith("Login efetuado") || msg.startsWith("Bem-vindo")) {
+                lastLoginError = null
+            } else {
+                lastLoginError = msg
+            }
         }
     }
 
     LaunchedEffect(phoneInput, passwordInput) {
-        lastLoginError = null
+        if (lastLoginError != null) {
+            lastLoginError = null
+            viewModel.clearMessage()
+        }
     }
 
     val scrollState = rememberScrollState()
@@ -5332,14 +8603,14 @@ fun LoginScreen(
 
                     if (lastLoginError != null) {
                         Card(
-                            colors = CardDefaults.cardColors(containerColor = Color(0xFF7F1D1D).copy(alpha = 0.8f)),
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFF7F1D1D).copy(alpha = 0.9f)),
                             shape = RoundedCornerShape(12.dp),
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .border(1.dp, Color(0xFFEF4444).copy(alpha = 0.4f), RoundedCornerShape(12.dp))
+                                .border(1.dp, Color(0xFFEF4444).copy(alpha = 0.6f), RoundedCornerShape(12.dp))
                         ) {
                             Row(
-                                modifier = Modifier.padding(12.dp),
+                                modifier = Modifier.padding(14.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Icon(
@@ -5349,7 +8620,7 @@ fun LoginScreen(
                                     modifier = Modifier.size(24.dp)
                                 )
                                 Spacer(modifier = Modifier.width(12.dp))
-                                Column {
+                                Column(modifier = Modifier.weight(1f)) {
                                     Text(
                                         text = "Falha no Login",
                                         style = MaterialTheme.typography.bodyMedium.copy(
@@ -5362,6 +8633,19 @@ fun LoginScreen(
                                         style = MaterialTheme.typography.bodySmall.copy(
                                             color = Color(0xFFFCA5A5)
                                         )
+                                    )
+                                }
+                                IconButton(
+                                    onClick = {
+                                        lastLoginError = null
+                                        viewModel.clearMessage()
+                                    }
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Close,
+                                        contentDescription = "Fechar aviso",
+                                        tint = Color(0xFFFCA5A5),
+                                        modifier = Modifier.size(18.dp)
                                     )
                                 }
                             }
@@ -6140,12 +9424,7 @@ fun AdminConfigDialog(
     onDismiss: () -> Unit,
     onSave: (com.example.data.GitHubAdminConfig, String, String) -> Unit
 ) {
-    var tokenInput by remember { mutableStateOf(config.token) }
-    var repositoryInput by remember { mutableStateOf(config.repository) }
-    var branchInput by remember { mutableStateOf(config.branch) }
-    var pathInput by remember { mutableStateOf(config.path) }
     var selectedMode by remember { mutableStateOf(currentMode) }
-    var firebaseUrlInput by remember { mutableStateOf(currentFirebaseUrl) }
 
     Dialog(onDismissRequest = onDismiss) {
         Card(
@@ -6161,303 +9440,189 @@ fun AdminConfigDialog(
                     .fillMaxWidth(),
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
-                Text(
-                    text = "Fonte de Dados Admin",
-                    style = MaterialTheme.typography.titleLarge.copy(
-                        fontWeight = FontWeight.ExtraBold,
-                        color = Color.White
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(CircleShape)
+                            .background(Color(0xFF22D3EE).copy(alpha = 0.2f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Settings,
+                            contentDescription = "Configuração",
+                            tint = Color(0xFF22D3EE),
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                    Text(
+                        text = "Fonte de Conexão Admin",
+                        style = MaterialTheme.typography.titleMedium.copy(
+                            fontWeight = FontWeight.ExtraBold,
+                            color = Color.White
+                        )
                     )
-                )
+                }
 
                 Text(
-                    text = "Escolha o serviço que será usado para consultar e salvar as informações dos utilizadores.",
+                    text = "Selecione o método de acesso do servidor para consulta e sincronização:",
                     style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8))
                 )
 
-                // Segmented selector row
+                // Segmented selector row with GI and FI
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .background(Color(0xFF0F172A), RoundedCornerShape(12.dp))
                         .padding(4.dp),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
+                    // FI Option (Firebase - Primary)
                     Box(
                         modifier = Modifier
-                            .weight(1.5f)
+                            .weight(1f)
                             .clip(RoundedCornerShape(8.dp))
-                            .background(if (selectedMode == "GITHUB") Color(0xFF1E293B) else Color.Transparent)
-                            .border(
-                                width = if (selectedMode == "GITHUB") 1.dp else 0.dp,
-                                color = if (selectedMode == "GITHUB") Color(0xFF22D3EE) else Color.Transparent,
-                                shape = RoundedCornerShape(8.dp)
-                            )
-                            .clickable { selectedMode = "GITHUB" }
-                            .padding(vertical = 10.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = "GitHub REST",
-                            style = MaterialTheme.typography.bodyMedium.copy(
-                                fontWeight = FontWeight.Bold,
-                                color = if (selectedMode == "GITHUB") Color(0xFF22D3EE) else Color(0xFF94A3B8)
-                            )
-                        )
-                    }
-                    Box(
-                        modifier = Modifier
-                            .weight(1.5f)
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(if (selectedMode == "FIREBASE") Color(0xFF1E293B) else Color.Transparent)
+                            .background(if (selectedMode == "FIREBASE") Color(0xFF10B981).copy(alpha = 0.2f) else Color.Transparent)
                             .border(
                                 width = if (selectedMode == "FIREBASE") 1.dp else 0.dp,
-                                color = if (selectedMode == "FIREBASE") Color(0xFF22D3EE) else Color.Transparent,
+                                color = if (selectedMode == "FIREBASE") Color(0xFF10B981) else Color.Transparent,
                                 shape = RoundedCornerShape(8.dp)
                             )
                             .clickable { selectedMode = "FIREBASE" }
-                            .padding(vertical = 10.dp),
+                            .padding(vertical = 12.dp),
                         contentAlignment = Alignment.Center
                     ) {
-                        Text(
-                            text = "Firebase RTDB",
-                            style = MaterialTheme.typography.bodyMedium.copy(
-                                fontWeight = FontWeight.Bold,
-                                color = if (selectedMode == "FIREBASE") Color(0xFF22D3EE) else Color(0xFF94A3B8)
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                text = "FI",
+                                style = MaterialTheme.typography.titleMedium.copy(
+                                    fontWeight = FontWeight.Black,
+                                    color = if (selectedMode == "FIREBASE") Color(0xFF10B981) else Color(0xFF94A3B8)
+                                )
                             )
-                        )
+                            Text(
+                                text = "(Firebase)",
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    color = if (selectedMode == "FIREBASE") Color.White else Color(0xFF64748B),
+                                    fontWeight = FontWeight.Medium
+                                )
+                            )
+                        }
+                    }
+
+                    // GI Option (GitHub - Secondary)
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(if (selectedMode == "GITHUB") Color(0xFF38BDF8).copy(alpha = 0.2f) else Color.Transparent)
+                            .border(
+                                width = if (selectedMode == "GITHUB") 1.dp else 0.dp,
+                                color = if (selectedMode == "GITHUB") Color(0xFF38BDF8) else Color.Transparent,
+                                shape = RoundedCornerShape(8.dp)
+                            )
+                            .clickable { selectedMode = "GITHUB" }
+                            .padding(vertical = 12.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                text = "GI",
+                                style = MaterialTheme.typography.titleMedium.copy(
+                                    fontWeight = FontWeight.Black,
+                                    color = if (selectedMode == "GITHUB") Color(0xFF38BDF8) else Color(0xFF94A3B8)
+                                )
+                            )
+                            Text(
+                                text = "(GitHub)",
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    color = if (selectedMode == "GITHUB") Color.White else Color(0xFF64748B),
+                                    fontWeight = FontWeight.Medium
+                                )
+                            )
+                        }
                     }
                 }
 
-                // Dynamic Input Fields based on Selected Mode
-                if (selectedMode == "GITHUB") {
-                    OutlinedTextField(
-                        value = tokenInput,
-                        onValueChange = { tokenInput = it },
-                        label = { Text("GitHub Personal Access Token") },
-                        leadingIcon = {
-                            Icon(
-                                imageVector = Icons.Default.Key,
-                                contentDescription = "Token",
-                                tint = Color(0xFF94A3B8)
-                            )
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true,
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = Color(0xFF22D3EE),
-                            unfocusedBorderColor = Color(0xFF334155),
-                            focusedLabelColor = Color(0xFF22D3EE),
-                            unfocusedLabelColor = Color(0xFF94A3B8),
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White
-                        ),
-                        shape = RoundedCornerShape(12.dp)
-                    )
-
-                    OutlinedTextField(
-                        value = repositoryInput,
-                        onValueChange = { repositoryInput = it },
-                        label = { Text("Repositório GitHub (ex: Macucul/fimaster)") },
-                        leadingIcon = {
-                            Icon(
-                                imageVector = Icons.Default.Folder,
-                                contentDescription = "Repositorio",
-                                tint = Color(0xFF94A3B8)
-                            )
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true,
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = Color(0xFF22D3EE),
-                            unfocusedBorderColor = Color(0xFF334155),
-                            focusedLabelColor = Color(0xFF22D3EE),
-                            unfocusedLabelColor = Color(0xFF94A3B8),
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White
-                        ),
-                        shape = RoundedCornerShape(12.dp)
-                    )
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                // Info banner without showing raw URL strings
+                if (selectedMode == "FIREBASE") {
+                    Surface(
+                        color = Color(0xFF10B981).copy(alpha = 0.12f),
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, Color(0xFF10B981).copy(alpha = 0.4f)),
+                        modifier = Modifier.fillMaxWidth()
                     ) {
-                        OutlinedTextField(
-                            value = branchInput,
-                            onValueChange = { branchInput = it },
-                            label = { Text("Branch") },
-                            modifier = Modifier.weight(1f),
-                            singleLine = true,
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedBorderColor = Color(0xFF22D3EE),
-                                unfocusedBorderColor = Color(0xFF334155),
-                                focusedLabelColor = Color(0xFF22D3EE),
-                                unfocusedLabelColor = Color(0xFF94A3B8),
-                                focusedTextColor = Color.White,
-                                unfocusedTextColor = Color.White
-                            ),
-                            shape = RoundedCornerShape(12.dp)
-                        )
-
-                        OutlinedTextField(
-                            value = pathInput,
-                            onValueChange = { pathInput = it },
-                            label = { Text("Caminho pasta") },
-                            modifier = Modifier.weight(1.5f),
-                            singleLine = true,
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedBorderColor = Color(0xFF22D3EE),
-                                unfocusedBorderColor = Color(0xFF334155),
-                                focusedLabelColor = Color(0xFF22D3EE),
-                                unfocusedLabelColor = Color(0xFF94A3B8),
-                                focusedTextColor = Color.White,
-                                unfocusedTextColor = Color.White
-                            ),
-                            shape = RoundedCornerShape(12.dp)
-                        )
+                        Row(
+                            modifier = Modifier.padding(14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.CheckCircle,
+                                contentDescription = "FI Selecionado",
+                                tint = Color(0xFF10B981),
+                                modifier = Modifier.size(24.dp)
+                            )
+                            Column {
+                                Text(
+                                    text = "FI — Método Principal (Firebase)",
+                                    style = MaterialTheme.typography.bodyMedium.copy(
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color.White
+                                    )
+                                )
+                                Text(
+                                    text = "Acesso direto e sincronização em tempo real ativada para clientes e licenças.",
+                                    style = MaterialTheme.typography.bodySmall.copy(
+                                        color = Color(0xFFA7F3D0)
+                                    )
+                                )
+                            }
+                        }
                     }
                 } else {
-                    OutlinedTextField(
-                        value = firebaseUrlInput,
-                        onValueChange = { firebaseUrlInput = it },
-                        label = { Text("Firebase Realtime Database URL") },
-                        leadingIcon = {
+                    Surface(
+                        color = Color(0xFF38BDF8).copy(alpha = 0.12f),
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, Color(0xFF38BDF8).copy(alpha = 0.4f)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
                             Icon(
-                                imageVector = Icons.Default.Link,
-                                contentDescription = "Firebase URL",
-                                tint = Color(0xFF94A3B8)
+                                imageVector = Icons.Default.CheckCircle,
+                                contentDescription = "GI Selecionado",
+                                tint = Color(0xFF38BDF8),
+                                modifier = Modifier.size(24.dp)
                             )
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true,
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = Color(0xFF22D3EE),
-                            unfocusedBorderColor = Color(0xFF334155),
-                            focusedLabelColor = Color(0xFF22D3EE),
-                            unfocusedLabelColor = Color(0xFF94A3B8),
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White
-                        ),
-                        shape = RoundedCornerShape(12.dp)
-                    )
-                }
-
-                // Info banner based on chosen mode
-                if (selectedMode == "GITHUB") {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(Color(0xFF0F172A).copy(alpha = 0.5f), RoundedCornerShape(10.dp))
-                            .padding(12.dp),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.CheckCircle,
-                            contentDescription = "Configurado",
-                            tint = Color(0xFF22D3EE),
-                            modifier = Modifier.size(20.dp)
-                        )
-                        Text(
-                            text = "O sistema sincronizará os dados através das APIs REST do GitHub.",
-                            style = MaterialTheme.typography.bodySmall.copy(
-                                color = Color(0xFFE2E8F0),
-                                fontWeight = FontWeight.Medium
-                            ),
-                            modifier = Modifier.weight(1f)
-                        )
-                    }
-                } else {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(Color(0xFF0F172A).copy(alpha = 0.5f), RoundedCornerShape(10.dp))
-                            .padding(12.dp),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.CheckCircle,
-                            contentDescription = "Configurado",
-                            tint = Color(0xFF10B981),
-                            modifier = Modifier.size(20.dp)
-                        )
-                        Text(
-                            text = "O aplicativo utilizará o Firebase RTDB com regras de segurança por UID de cliente e Admin.",
-                            style = MaterialTheme.typography.bodySmall.copy(
-                                color = Color(0xFF10B981),
-                                fontWeight = FontWeight.Medium
-                            ),
-                            modifier = Modifier.weight(1f)
-                        )
-                    }
-
-                    val clipboardManager = LocalClipboardManager.current
-                    var rulesCopiedInDialog by remember { mutableStateOf(false) }
-
-                    val dialogRulesJson = """{
-  "rules": {
-    "dados": {
-      "usuarios": {
-        ".read": "true",
-        "${'$'}userId": {
-          ".read": "true",
-          ".write": "true"
-        }
-      },
-      "indices": {
-        ".read": "true",
-        ".write": "true"
-      },
-      "parametros": {
-        ".read": "true",
-        "${'$'}mt5Id": {
-          ".write": "true"
-        }
-      },
-      "status": {
-        ".read": "true",
-        "${'$'}mt5Id": {
-          ".write": "true"
-        }
-      },
-      "eventos": {
-        ".read": "true",
-        "${'$'}mt5Id": {
-          ".write": "true"
-        }
-      },
-      "versao": {
-        ".read": "true",
-        ".write": "true"
-      }
-    }
-  }
-}"""
-
-                    OutlinedButton(
-                        onClick = {
-                            clipboardManager.setText(AnnotatedString(dialogRulesJson))
-                            rulesCopiedInDialog = true
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(10.dp),
-                        border = BorderStroke(1.dp, Color(0xFF10B981).copy(alpha = 0.5f))
-                    ) {
-                        Icon(
-                            imageVector = if (rulesCopiedInDialog) Icons.Default.Check else Icons.Default.ContentCopy,
-                            contentDescription = "Copiar Regras",
-                            tint = Color(0xFF10B981),
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = if (rulesCopiedInDialog) "Regras Firebase Copiadas!" else "Copiar Regras de Segurança Firebase (JSON)",
-                            style = MaterialTheme.typography.labelMedium.copy(
-                                fontWeight = FontWeight.Bold,
-                                color = Color(0xFF10B981)
-                            )
-                        )
+                            Column {
+                                Text(
+                                    text = "GI — Método Secundário (GitHub)",
+                                    style = MaterialTheme.typography.bodyMedium.copy(
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color.White
+                                    )
+                                )
+                                Text(
+                                    text = "Acesso via repositório e serviços REST ativado.",
+                                    style = MaterialTheme.typography.bodySmall.copy(
+                                        color = Color(0xFFBAE6FD)
+                                    )
+                                )
+                            }
+                        }
                     }
                 }
 
@@ -6470,7 +9635,7 @@ fun AdminConfigDialog(
                         onClick = onDismiss,
                         modifier = Modifier.weight(1f),
                         colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFEF4444)),
-                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFEF4444).copy(alpha = 0.5f)),
+                        border = BorderStroke(1.dp, Color(0xFFEF4444).copy(alpha = 0.5f)),
                         shape = RoundedCornerShape(10.dp)
                     ) {
                         Text("Cancelar")
@@ -6478,24 +9643,17 @@ fun AdminConfigDialog(
 
                     Button(
                         onClick = {
-                            onSave(
-                                com.example.data.GitHubAdminConfig(
-                                    token = tokenInput.trim(),
-                                    repository = repositoryInput.trim(),
-                                    branch = branchInput.trim(),
-                                    path = pathInput.trim()
-                                ),
-                                selectedMode,
-                                firebaseUrlInput.trim()
-                            )
+                            onSave(config, selectedMode, currentFirebaseUrl)
                         },
                         modifier = Modifier.weight(1f),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF22D3EE)),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (selectedMode == "FIREBASE") Color(0xFF10B981) else Color(0xFF38BDF8)
+                        ),
                         shape = RoundedCornerShape(10.dp)
                     ) {
                         Text(
-                            "Salvar",
-                            style = MaterialTheme.typography.labelLarge.copy(
+                            text = "Salvar",
+                            style = MaterialTheme.typography.bodyMedium.copy(
                                 fontWeight = FontWeight.Bold,
                                 color = Color(0xFF0F172A)
                             )
@@ -6843,22 +10001,37 @@ fun EaOnboardingTourDialog(
             ),
             EaTourStep(
                 stepIndex = 3,
-                title = "3. Parâmetros Operacionais",
-                subtitle = "Lote, Estratégia & Canais de Equador",
+                title = "3. Templates & Presets do Admin",
+                subtitle = "Carregamento Rápido & Regra de Risco (0.5%)",
+                targetTab = PortalTab.EA_CONFIG,
+                icon = Icons.Default.CloudDownload,
+                description = "Na aba Config EA, expanda 'Templates & Presets do Admin' para aplicar setups oficiais testados pela equipe com 1 clique.",
+                highlights = listOf(
+                    "Paridades & Pontos" to "Verifique o ativo (ex: 💱 XAUUSD, EURUSD) e os pontos do canal (ex: 🎯 250 pts).",
+                    "Aviso de Lote 0.00" to "Os templates vêm zerados (0.00) por segurança para evitar sobrealavancagem.",
+                    "Exposição Recomendada (0.5%)" to "Ajuste o lote conforme a margem da sua conta (máximo 0.5% de risco).",
+                    "Carregar & Aplicar" to "Sincronize com 1 clique em 'Aplicar' e depois 'Salvar e Sincronizar'."
+                ),
+                tip = "⚡ Dica: Nunca execute com lote padrão sem calcular a exposição de 0.5% da sua banca!"
+            ),
+            EaTourStep(
+                stepIndex = 4,
+                title = "4. Parâmetros Operacionais",
+                subtitle = "Lote, Estratégia & Linhas de Equador",
                 targetTab = PortalTab.EA_CONFIG,
                 icon = Icons.Default.Tune,
-                description = "Defina como o robô deve negociar na aba Config EA. O formulário aceita números decimais (ex: 0.01 ou 1.0850) de forma natural.",
+                description = "Defina como o robô deve negociar na aba Config EA. O formulário aceita números decimais (ex: 0.01 ou 1.0850) de forma fluida.",
                 highlights = listOf(
-                    "Lote de Entrada (lot)" to "Define o volume por ordem. Exemplo: 0.01 para contas micro/cent.",
+                    "Lote de Entrada (lot)" to "Define o volume por ordem (ex: 0.01 para contas micro/cent).",
                     "Linhas de Equador" to "Preços de referência máxima (ex: 1.0850) e mínima (ex: 1.0720).",
                     "Estratégia & Tendência" to "Selecione opções de entrada no menu suspenso ou escolha CUSTOM.",
                     "Virada de Jogo / Costurar" to "Ative funções de recuperação automatizada de posições."
                 ),
-                tip = "⚙️ Dica: Agora você pode digitar decimais apagando e inserindo pontos/vírgulas sem conflitos!"
+                tip = "⚙️ Dica: Você pode digitar números decimais apagando e inserindo pontos/vírgulas sem travamentos!"
             ),
             EaTourStep(
-                stepIndex = 4,
-                title = "4. Gestão de Risco & Câmbio",
+                stepIndex = 5,
+                title = "5. Gestão de Risco & Câmbio",
                 subtitle = "Trava Diária/Semanal & Conversão de Saldo",
                 targetTab = PortalTab.EA_CONFIG,
                 icon = Icons.Default.Shield,
@@ -6871,8 +10044,8 @@ fun EaOnboardingTourDialog(
                 tip = "🛡️ Dica: A gestão de risco previne chamadas de margem (Margin Call) em dias de notícia forte."
             ),
             EaTourStep(
-                stepIndex = 5,
-                title = "5. Eventos & Alertas em Áudio",
+                stepIndex = 6,
+                title = "6. Eventos & Alertas em Áudio",
                 subtitle = "Acompanhamento em Tempo Real com Voz (TTS)",
                 targetTab = PortalTab.EA_EVENTS,
                 icon = Icons.Default.Notifications,
@@ -7366,19 +10539,14 @@ fun TraderProcessingOverlay(
     var isMinimized by remember { mutableStateOf(false) }
 
     val context = androidx.compose.ui.platform.LocalContext.current
-    var ttsObj by remember { mutableStateOf<android.speech.tts.TextToSpeech?>(null) }
     var isSpeaking by remember { mutableStateOf(false) }
 
     DisposableEffect(context) {
-        val tts = android.speech.tts.TextToSpeech(context) { status ->
-            if (status == android.speech.tts.TextToSpeech.SUCCESS) {
-                // Configured
-            }
-        }
-        ttsObj = tts
+        AppTtsManager.initIfNeeded(context)
         onDispose {
-            tts.stop()
-            tts.shutdown()
+            if (isSpeaking) {
+                AppTtsManager.stopAll()
+            }
         }
     }
 
@@ -7720,9 +10888,16 @@ fun TraderProcessingOverlay(
                 ) {
                     TextButton(
                         onClick = {
-                            if (ttsObj != null) {
-                                isSpeaking = true
-                                ttsObj?.speak(displayDescription, android.speech.tts.TextToSpeech.QUEUE_FLUSH, null, "process_speech")
+                            if (isSpeaking) {
+                                AppTtsManager.stopAll()
+                                isSpeaking = false
+                            } else {
+                                AppTtsManager.speak(
+                                    context = context,
+                                    text = displayDescription,
+                                    onStart = { isSpeaking = true },
+                                    onDone = { isSpeaking = false }
+                                )
                             }
                         },
                         colors = ButtonDefaults.textButtonColors(contentColor = Color(0xFF38BDF8))
@@ -7963,4 +11138,2785 @@ fun TraderRadarCanvas() {
         )
     }
 }
+
+@Composable
+fun InstrucoesAdminTemplatesDialog(onDismiss: () -> Unit) {
+    val clipboardManager = LocalClipboardManager.current
+    var copiedContent by remember { mutableStateOf(false) }
+
+    val fullMarkdownText = """# INSTRUÇÕES PARA PUBLICAÇÃO DE TEMPLATES DO ADMINISTRADOR MASTER
+
+1. ENDEREÇO DO NÓ NO FIREBASE:
+   -> /dados/indices/instrucoes_admin_templates/instrucoes_admin_templates.json
+   (Alternativos: /dados/instrucoes_admin_templates.json ou /instrucoes_admin_templates.json)
+
+2. ENUMERADORES (ENUMS) E VALORES VÁLIDOS:
+   - LINHAS_DE_EQUADOR (boolean): true (exibir) | false (ocultar)
+   - ESQUEMA_CORES_ENUM: "CYAN_NEON" | "DARK_MATRIX" | "GOLDEN_PRO" | "PURPLE_NIGHT" | "CLASSIC_BLUE" | "CUSTOM"
+   - TREND: "TENDENCIA_DE_ALTA" (ou "UP_TREND") | "TENDENCIA_DE_BAIXA" (ou "DOWN_TREND")
+   - ESTRATÉGIA: "FIMATHE" | "F_SURFADA"
+   - OperationalPeriod: "PERIOD_M1" | "PERIOD_M5" | "PERIOD_M15" | "PERIOD_M30" | "PERIOD_H1" | "PERIOD_H4" | "PERIOD_D1"
+   - AUTO_PERIOD: "MANUAL" | "SESSOES" | "SEMANAL" | "DIARIO" | "HORAS_8" | "HORA_1"
+   - BOOLEANS (true/false): EA_ATIVO, EA_AUTO, AUTO_SURFADA, virada_de_jogo, Costurar, TEMA, SESSAO_ASIA_TOQUIO, SESSAO_LONDRES, SESSAO_NOVA_YORQUI, GERENCIAMENTO_DE_RISCO_DIARIO, GERENCIAMENTO_DE_RISCO_SEMANAL, Modify_Sl_For_OxO, condicao_De_rompimento_c, condicao_De_rompimento_v, ativar_ou_desativar_compra, ativar_ou_desativar_venda, GMAIL, notific
+
+3. ORGANIZAÇÃO VISUAL E DIVISÃO DOS PARÂMETROS NO APP:
+   Os parâmetros do objeto "config" são divididos em 9 seções no visual do aplicativo:
+   1. Autenticação & Expiração: mt5AccountId, SENHA
+   2. Esquema de Cores: ESQUEMA_CORES_ENUM, cor_de_canal, cor_de_linhas, corr_de_equador, LINHAS_DE_EQUADOR
+   3. Canais de Tendência: TREND, M_equador_alta, M_equador_baixa
+   4. Estratégia Principal: ESTRATÉGIA, OperationalPeriod, virada_de_jogo, Nives, Costurar, TEMA
+   5. Automação & Sessões: EA_ATIVO, EA_AUTO, AUTO_PERIOD, AUTO_SURFADA, SESSAO_ASIA_TOQUIO, SESSAO_LONDRES, SESSAO_NOVA_YORQUI
+   6. Posicionamento de Ordem: EXPANSAO_MINIMA, EXPANSAO_MAXIMA, compra, venda, santo, dedo, posicaoTake, buy_take, sell_take
+   7. Gestão de Capital & Risco: SALDO, lot (lote 0.00), GERENCIAMENTO_DE_RISCO_DIARIO, porcentos, poercentosg, GERENCIAMENTO_DE_RISCO_SEMANAL, PORCENTOO, PORCENTOSS
+   8. Parâmetros Operacionais: ativar_ou_desativar_compra, ativar_ou_desativar_venda, Modify_Sl_For_OxO, condicao_De_rompimento_c, condicao_De_rompimento_v, GMAIL, notific
+   9. Resultado & Câmbio: CAMBIO
+
+4. IDENTIFICADORES ÚNICOS (id):
+   - Formato: tpl_<codigo>_<estrategia>_<perfil> (ex: tpl_001_fimathe_m15).
+   - O id deve ser IDÊNTICO na chave do JSON e na propriedade "id" interna.
+
+5. TÍTULO E DESCRIÇÃO:
+   - Título: "⚡ Template M15 Gold Conservador (Oficial Admin)"
+   - Descrição: Especificar objetivo, paridades, sessões recomendadas e aviso de lote 0.00 por segurança.
+
+6. REGRA DE 3 ATIVOS COM SUBSTITUIÇÃO AUTOMÁTICA:
+   - No máximo 3 templates ativos exibidos simultaneamente.
+   - Substituição automática ao expirar a data "validoAte".
+
+7. JSON SCHEMA COMPLETO:
+{
+  "instrucoes_admin_templates": {
+    "descricao": "Schema Único de Parâmetros para Publicação de Templates pelo Administrador Master.",
+    "limite_publicados_ativos": 3,
+    "regra_substituicao": "Publicação de 3 templates ativos. Quando 1 expira, é automaticamente substituído pelo próximo publicado.",
+    "templates": {
+      "tpl_001_fimathe_m15": {
+        "id": "tpl_001_fimathe_m15",
+        "titulo": "⚡ Template M15 Gold Conservador (Oficial Admin)",
+        "descricao": "Setup oficial com gestão de risco ajustada para XAUUSD e EURUSD nas sessões de Londres e Nova Iorque. Lote zerado 0.00 por segurança.",
+        "autor": "Admin Master Fimaster",
+        "dataPublicacao": "02/08/2026 09:00",
+        "validoAte": "31/12/2026",
+        "disponivel": true,
+        "versaoMinimaEa": "v3.2",
+        "pontosAtivo": "250 pts",
+        "paridade": "XAUUSD",
+        "config": {
+          "mt5AccountId": "TEMPLATE",
+          "SENHA": "123456",
+          "ESQUEMA_CORES_ENUM": "CYAN_NEON",
+          "cor_de_canal": "#22D3EE",
+          "cor_de_linhas": "#FF00E5",
+          "corr_de_equador": "#FFFF00",
+          "LINHAS_DE_EQUADOR": false,
+          "TREND": "TENDENCIA_DE_ALTA",
+          "M_equador_alta": 1.2500,
+          "M_equador_baixa": 1.2400,
+          "TEMA": false,
+          "ESTRATÉGIA": "FIMATHE",
+          "virada_de_jogo": false,
+          "Nives": 1.0,
+          "Costurar": true,
+          "OperationalPeriod": "PERIOD_M15",
+          "lot": 0.00,
+          "EA_ATIVO": true,
+          "EA_AUTO": false,
+          "AUTO_PERIOD": "HORA_1",
+          "AUTO_SURFADA": false,
+          "SESSAO_ASIA_TOQUIO": false,
+          "SESSAO_LONDRES": true,
+          "SESSAO_NOVA_YORQUI": true,
+          "EXPANSAO_MINIMA": 10,
+          "EXPANSAO_MAXIMA": 30,
+          "compra": 1.2550,
+          "venda": 1.2500,
+          "santo": 20.0,
+          "dedo": 10,
+          "posicaoTake": false,
+          "buy_take": 0.0,
+          "sell_take": 0.0,
+          "SALDO": 1000.0,
+          "GERENCIAMENTO_DE_RISCO_DIARIO": true,
+          "porcentos": 1.0,
+          "poercentosg": 1.5,
+          "GERENCIAMENTO_DE_RISCO_SEMANAL": false,
+          "PORCENTOO": 2.0,
+          "PORCENTOSS": 2.0,
+          "GMAIL": true,
+          "notific": true,
+          "ativar_ou_desativar_venda": true,
+          "ativar_ou_desativar_compra": true,
+          "Modify_Sl_For_OxO": true,
+          "condicao_De_rompimento_c": true,
+          "condicao_De_rompimento_v": true,
+          "CAMBIO": 64.0
+        }
+      }
+    }
+  }
+}"""
+
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .border(1.dp, Color(0xFFC084FC), RoundedCornerShape(20.dp)),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
+            shape = RoundedCornerShape(20.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .padding(20.dp)
+                    .fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text(
+                            text = "📋 INSTRUÇÕES ADMIN TEMPLATES",
+                            style = MaterialTheme.typography.titleMedium.copy(
+                                fontWeight = FontWeight.Black,
+                                color = Color(0xFFC084FC)
+                            )
+                        )
+                        Text(
+                            text = "Arquivo: INSTRUCOES_ADMIN_TEMPLATES.md",
+                            style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF94A3B8))
+                        )
+                    }
+                    IconButton(onClick = onDismiss, modifier = Modifier.size(28.dp)) {
+                        Icon(imageVector = Icons.Default.Close, contentDescription = "Fechar", tint = Color(0xFF94A3B8))
+                    }
+                }
+
+                Surface(
+                    color = Color(0xFF0F172A),
+                    shape = RoundedCornerShape(10.dp),
+                    border = BorderStroke(1.dp, Color(0xFF334155))
+                ) {
+                    Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            text = "• Nó Firebase: /instrucoes_admin_templates.json",
+                            style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF22D3EE), fontWeight = FontWeight.Bold)
+                        )
+                        Text(
+                            text = "• Estrutura Única de 'config' para todos os parâmetros com ID individual.",
+                            style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFFE2E8F0))
+                        )
+                        Text(
+                            text = "• Publicação de 3 Ativos com substituição automática ao expirar.",
+                            style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFFA7F3D0))
+                        )
+                    }
+                }
+
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 280.dp),
+                    color = Color(0xFF090D16),
+                    shape = RoundedCornerShape(10.dp),
+                    border = BorderStroke(1.dp, Color(0xFF334155))
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .verticalScroll(rememberScrollState())
+                            .padding(12.dp)
+                    ) {
+                        Text(
+                            text = fullMarkdownText,
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                fontFamily = FontFamily.Monospace,
+                                color = Color(0xFFE2E8F0),
+                                fontSize = 11.sp,
+                                lineHeight = 16.sp
+                            )
+                        )
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = {
+                            clipboardManager.setText(AnnotatedString(fullMarkdownText))
+                            copiedContent = true
+                        },
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, Color(0xFFC084FC))
+                    ) {
+                        Icon(
+                            imageVector = if (copiedContent) Icons.Default.Check else Icons.Default.ContentCopy,
+                            contentDescription = "Copiar",
+                            tint = Color(0xFFC084FC),
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = if (copiedContent) "Conteúdo Copiado!" else "Copiar Instruções",
+                            color = Color(0xFFC084FC),
+                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
+                        )
+                    }
+
+                    Button(
+                        onClick = onDismiss,
+                        modifier = Modifier.weight(0.8f),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF334155)),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Text(text = "Fechar", color = Color.White, style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold))
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ====================================================================
+// COMPONENTES DE CAPTURA DE TELA DO GRÁFICO MT5 COM OBJETOS MQL5
+// ====================================================================
+
+private data class Quad(val xRatio: Float, val openRatio: Float, val highRatio: Float, val lowRatio: Float, val closeRatio: Float)
+
+@Composable
+fun ChartScreenshotCanvas(
+    modifier: Modifier = Modifier,
+    symbol: String = "XAUUSD",
+    timeframe: String = "M15",
+    hasFimatheChannels: Boolean = true,
+    hasEaPanel: Boolean = true,
+    hasTradeArrows: Boolean = true,
+    chartScreenshot: com.example.ui.ChartScreenshotData? = null
+) {
+    val reconstructedBitmap = remember(chartScreenshot?.imageFilePath, chartScreenshot?.timestamp, chartScreenshot?.imageBytes) {
+        chartScreenshot?.getReconstructedBitmap()
+    }
+
+    Box(
+        modifier = modifier
+            .background(Color(0xFF0B0F19))
+            .border(1.dp, Color(0xFF1E293B), RoundedCornerShape(12.dp))
+            .clip(RoundedCornerShape(12.dp))
+    ) {
+        if (reconstructedBitmap != null) {
+            Image(
+                bitmap = reconstructedBitmap.asImageBitmap(),
+                contentDescription = "Imagem do Gráfico MT5",
+                contentScale = ContentScale.Fit,
+                modifier = Modifier.fillMaxSize()
+            )
+        } else {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+            val w = size.width
+            val h = size.height
+            
+            // 1. Grid Background
+            val gridCountX = 8
+            val gridCountY = 6
+            val strokeGrid = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(4f, 4f), 0f)
+            for (i in 1 until gridCountX) {
+                val x = w * (i / gridCountX.toFloat())
+                drawLine(
+                    color = Color(0xFF1E293B),
+                    start = androidx.compose.ui.geometry.Offset(x, 0f),
+                    end = androidx.compose.ui.geometry.Offset(x, h),
+                    pathEffect = strokeGrid,
+                    strokeWidth = 1f
+                )
+            }
+            for (j in 1 until gridCountY) {
+                val y = h * (j / gridCountY.toFloat())
+                drawLine(
+                    color = Color(0xFF1E293B),
+                    start = androidx.compose.ui.geometry.Offset(0f, y),
+                    end = androidx.compose.ui.geometry.Offset(w, y),
+                    pathEffect = strokeGrid,
+                    strokeWidth = 1f
+                )
+            }
+
+            // 2. Fimathe Channels & Level Lines (Objects created by EA MQL5)
+            if (hasFimatheChannels) {
+                // Resistance / Upper Channel Line (Cyan)
+                val yRes = h * 0.22f
+                drawLine(
+                    color = Color(0xFF22D3EE),
+                    start = androidx.compose.ui.geometry.Offset(0f, yRes),
+                    end = androidx.compose.ui.geometry.Offset(w, yRes - 15f),
+                    strokeWidth = 2.5f
+                )
+                // Canal Principal Top Line (Emerald)
+                val yCanal1 = h * 0.42f
+                drawLine(
+                    color = Color(0xFF10B981),
+                    start = androidx.compose.ui.geometry.Offset(0f, yCanal1),
+                    end = androidx.compose.ui.geometry.Offset(w, yCanal1 - 15f),
+                    strokeWidth = 3f
+                )
+                // Canal Principal Bottom Line (Emerald)
+                val yCanal0 = h * 0.62f
+                drawLine(
+                    color = Color(0xFF10B981),
+                    start = androidx.compose.ui.geometry.Offset(0f, yCanal0),
+                    end = androidx.compose.ui.geometry.Offset(w, yCanal0 - 15f),
+                    strokeWidth = 3f
+                )
+                // Golden Ratio 50% Subciclo (Amber Dashed)
+                val y50 = h * 0.52f
+                drawLine(
+                    color = Color(0xFFF59E0B),
+                    start = androidx.compose.ui.geometry.Offset(0f, y50),
+                    end = androidx.compose.ui.geometry.Offset(w, y50 - 15f),
+                    pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(8f, 6f), 0f),
+                    strokeWidth = 2f
+                )
+                // Stop Loss Line (Red Dashed)
+                val ySL = h * 0.76f
+                drawLine(
+                    color = Color(0xFFEF4444),
+                    start = androidx.compose.ui.geometry.Offset(w * 0.35f, ySL),
+                    end = androidx.compose.ui.geometry.Offset(w, ySL - 5f),
+                    pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(10f, 5f), 0f),
+                    strokeWidth = 2.5f
+                )
+                // Take Profit Line (Green Dashed)
+                val yTP = h * 0.15f
+                drawLine(
+                    color = Color(0xFF10B981),
+                    start = androidx.compose.ui.geometry.Offset(w * 0.35f, yTP),
+                    end = androidx.compose.ui.geometry.Offset(w, yTP - 5f),
+                    pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(10f, 5f), 0f),
+                    strokeWidth = 2.5f
+                )
+            }
+
+            // 3. Candlesticks
+            val candleData = listOf(
+                Quad(0.08f, 0.70f, 0.50f, 0.73f, 0.65f),
+                Quad(0.16f, 0.66f, 0.45f, 0.68f, 0.52f),
+                Quad(0.24f, 0.53f, 0.42f, 0.58f, 0.44f),
+                Quad(0.32f, 0.45f, 0.35f, 0.48f, 0.38f),
+                Quad(0.40f, 0.39f, 0.48f, 0.50f, 0.46f),
+                Quad(0.48f, 0.45f, 0.32f, 0.47f, 0.34f),
+                Quad(0.56f, 0.35f, 0.22f, 0.37f, 0.25f),
+                Quad(0.64f, 0.26f, 0.34f, 0.36f, 0.32f),
+                Quad(0.72f, 0.33f, 0.18f, 0.35f, 0.20f),
+                Quad(0.80f, 0.21f, 0.28f, 0.30f, 0.26f),
+                Quad(0.88f, 0.27f, 0.15f, 0.29f, 0.18f)
+            )
+
+            for (c in candleData) {
+                val cx = w * c.xRatio
+                val yOpen = h * c.openRatio
+                val yClose = h * c.closeRatio
+                val yHigh = h * c.highRatio
+                val yLow = h * c.lowRatio
+                val isBull = c.closeRatio < c.openRatio
+                val color = if (isBull) Color(0xFF10B981) else Color(0xFFEF4444)
+
+                // Wick
+                drawLine(
+                    color = color,
+                    start = androidx.compose.ui.geometry.Offset(cx, yHigh),
+                    end = androidx.compose.ui.geometry.Offset(cx, yLow),
+                    strokeWidth = 1.5f
+                )
+                // Body
+                val topY = kotlin.math.min(yOpen, yClose)
+                val botY = kotlin.math.max(yOpen, yClose)
+                val bodyHeight = kotlin.math.max(botY - topY, 4f)
+                drawRect(
+                    color = color,
+                    topLeft = androidx.compose.ui.geometry.Offset(cx - 7f, topY),
+                    size = androidx.compose.ui.geometry.Size(14f, bodyHeight)
+                )
+            }
+
+            // 4. Trade Execution Arrow (Buy Arrow MQL5 Object)
+            if (hasTradeArrows) {
+                val arrowX = w * 0.40f
+                val arrowY = h * 0.50f
+                val arrowPath = androidx.compose.ui.graphics.Path().apply {
+                    moveTo(arrowX, arrowY - 14f)
+                    lineTo(arrowX - 8f, arrowY + 4f)
+                    lineTo(arrowX + 8f, arrowY + 4f)
+                    close()
+                }
+                drawPath(path = arrowPath, color = Color(0xFF10B981))
+            }
+        }
+
+        // Overlay Labels & EA Information Panel
+        Box(modifier = Modifier.fillMaxSize().padding(10.dp)) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .background(Color(0xFF0F172A).copy(alpha = 0.85f), RoundedCornerShape(6.dp))
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(8.dp)
+                        .background(Color(0xFF10B981), CircleShape)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = "$symbol, $timeframe",
+                    style = MaterialTheme.typography.labelSmall.copy(
+                        color = Color.White,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 11.sp
+                    )
+                )
+            }
+
+            if (hasEaPanel) {
+                Column(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .background(Color(0xFF020617).copy(alpha = 0.90f), RoundedCornerShape(8.dp))
+                        .border(1.dp, Color(0xFF22D3EE).copy(alpha = 0.4f), RoundedCornerShape(8.dp))
+                        .padding(8.dp)
+                ) {
+                    Text(
+                        text = "⚡ EA FIMASTER MT5 v3.2",
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            color = Color(0xFF22D3EE),
+                            fontWeight = FontWeight.Black,
+                            fontSize = 9.sp
+                        )
+                    )
+                    Text(
+                        text = "Estratégia: FIMATHE M15",
+                        style = MaterialTheme.typography.labelSmall.copy(color = Color.White, fontSize = 9.sp)
+                    )
+                    Text(
+                        text = "Lote: 0.01 | Risco: 0.5%",
+                        style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF10B981), fontSize = 9.sp)
+                    )
+                    Text(
+                        text = "SL: 2,642.50 | TP: 2,658.00",
+                        style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFFF59E0B), fontSize = 9.sp)
+                    )
+                }
+            }
+
+            Row(
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .background(Color(0xFF0F172A).copy(alpha = 0.85f), RoundedCornerShape(6.dp))
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "── Canal Fimathe",
+                    style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF10B981), fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                )
+                Text(
+                    text = "⋯⋯ 50% Golden",
+                    style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFFF59E0B), fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                )
+                Text(
+                    text = "▲ Seta Ordem",
+                    style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF22D3EE), fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                )
+            }
+        }
+    }
+}
+}
+
+@Composable
+fun ChartScreenshotCard(
+    chartScreenshot: com.example.ui.ChartScreenshotData,
+    onRequestScreenshot: () -> Unit,
+    onViewFullChart: () -> Unit,
+    onViewMql5Code: () -> Unit
+) {
+    var showFullModal by remember { mutableStateOf(false) }
+
+    Card(
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B).copy(alpha = 0.95f)),
+        shape = RoundedCornerShape(24.dp),
+        border = BorderStroke(1.dp, Color(0xFF0284C7).copy(alpha = 0.4f)),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .size(38.dp)
+                            .background(Color(0xFF0284C7).copy(alpha = 0.2f), CircleShape)
+                            .border(1.dp, Color(0xFF38BDF8), CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.CameraAlt,
+                            contentDescription = "Captura de Tela",
+                            tint = Color(0xFF38BDF8),
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Column {
+                        Text(
+                            text = "CAPTURA DE TELA DO GRÁFICO MT5",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                color = Color(0xFF38BDF8),
+                                fontWeight = FontWeight.Black,
+                                letterSpacing = 1.sp
+                            )
+                        )
+                        val timeFormatted = remember(chartScreenshot.timestamp) {
+                            if (chartScreenshot.timestamp > 0) {
+                                val date = java.util.Date(chartScreenshot.timestamp * 1000L)
+                                java.text.SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(date)
+                            } else ""
+                        }
+                        Text(
+                            text = if (chartScreenshot.isRequested) 
+                                "Paridade: ${chartScreenshot.symbol} • ${chartScreenshot.timeframe}" + if (timeFormatted.isNotEmpty()) " • às $timeFormatted" else ""
+                                else "Aguardando solicitação",
+                            style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF38BDF8), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        )
+                    }
+                }
+            }
+
+            if (chartScreenshot.isRequested) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(200.dp)
+                        .clickable { showFullModal = true }
+                ) {
+                    ChartScreenshotCanvas(
+                        modifier = Modifier.fillMaxSize(),
+                        symbol = chartScreenshot.symbol,
+                        timeframe = chartScreenshot.timeframe,
+                        hasFimatheChannels = chartScreenshot.hasFimatheChannels,
+                        hasEaPanel = chartScreenshot.hasEaPanel,
+                        hasTradeArrows = chartScreenshot.hasTradeArrows,
+                        chartScreenshot = chartScreenshot
+                    )
+
+                    Surface(
+                        onClick = { showFullModal = true },
+                        color = Color(0xFF0F172A).copy(alpha = 0.8f),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .padding(10.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.ZoomIn,
+                                contentDescription = "AMPLIAR",
+                                tint = Color(0xFF38BDF8),
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "AMPLIAR",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = Color.White,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            )
+                        }
+                    }
+                }
+            } else {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(180.dp)
+                        .background(Color(0xFF0F172A), RoundedCornerShape(14.dp))
+                        .border(1.dp, Color(0xFF334155), RoundedCornerShape(14.dp))
+                        .clickable { onRequestScreenshot() },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.padding(16.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(48.dp)
+                                .background(Color(0xFF0284C7).copy(alpha = 0.15f), CircleShape)
+                                .border(1.dp, Color(0xFF0284C7).copy(alpha = 0.4f), CircleShape),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.CameraAlt,
+                                contentDescription = null,
+                                tint = Color(0xFF38BDF8),
+                                modifier = Modifier.size(24.dp)
+                            )
+                        }
+                        Text(
+                            text = "NENHUMA CAPTURA CARREGADA",
+                            style = MaterialTheme.typography.labelMedium.copy(
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 12.sp
+                            )
+                        )
+                        Text(
+                            text = "Clique abaixo para solicitar a captura do gráfico do MetaTrader 5 em tempo real.",
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                color = Color(0xFF94A3B8),
+                                fontSize = 11.sp,
+                                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                            )
+                        )
+                    }
+                }
+            }
+
+            if (chartScreenshot.isRequested) {
+                val timeFormatted = remember(chartScreenshot.timestamp) {
+                    val date = java.util.Date(chartScreenshot.timestamp * 1000L)
+                    java.text.SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(date)
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color(0xFF0F172A), RoundedCornerShape(10.dp))
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.Schedule,
+                            contentDescription = "Horário",
+                            tint = Color(0xFF38BDF8),
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "PARIDADE: ${chartScreenshot.symbol} (${chartScreenshot.timeframe})",
+                            style = MaterialTheme.typography.labelSmall.copy(color = Color.White, fontWeight = FontWeight.Bold)
+                        )
+                    }
+                    Text(
+                        text = "Capturado às $timeFormatted",
+                        style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF38BDF8), fontWeight = FontWeight.Bold)
+                    )
+                }
+            }
+
+            Button(
+                onClick = onRequestScreenshot,
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth(),
+                contentPadding = PaddingValues(vertical = 12.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Refresh,
+                    contentDescription = "Solicitar Captura",
+                    tint = Color.White,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "SOLICITAR CAPTURA",
+                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
+                )
+            }
+        }
+    }
+
+    if (showFullModal) {
+        ChartScreenshotModalDialog(
+            chartScreenshot = chartScreenshot,
+            onRequestScreenshot = onRequestScreenshot,
+            onDismiss = { showFullModal = false }
+        )
+    }
+}
+
+@Composable
+fun ChartScreenshotModalDialog(
+    chartScreenshot: com.example.ui.ChartScreenshotData,
+    onRequestScreenshot: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    var scale by remember { mutableFloatStateOf(1.0f) }
+    var offsetX by remember { mutableFloatStateOf(0f) }
+    var offsetY by remember { mutableFloatStateOf(0f) }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = Color(0xFF090D16)
+        ) {
+            Box(modifier = Modifier.fillMaxSize()) {
+                val timeFormatted = remember(chartScreenshot.timestamp) {
+                    val date = java.util.Date(chartScreenshot.timestamp * 1000L)
+                    java.text.SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(date)
+                }
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .pointerInput(Unit) {
+                            detectTransformGestures { _, pan, zoom, _ ->
+                                scale = (scale * zoom).coerceIn(1f, 5f)
+                                if (scale > 1f) {
+                                    offsetX += pan.x
+                                    offsetY += pan.y
+                                } else {
+                                    offsetX = 0f
+                                    offsetY = 0f
+                                }
+                            }
+                        }
+                        .pointerInput(Unit) {
+                            detectTapGestures(
+                                onDoubleTap = {
+                                    if (scale > 1f) {
+                                        scale = 1f
+                                        offsetX = 0f
+                                        offsetY = 0f
+                                    } else {
+                                        scale = 2.5f
+                                    }
+                                }
+                            )
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    ChartScreenshotCanvas(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .graphicsLayer(
+                                scaleX = scale,
+                                scaleY = scale,
+                                translationX = offsetX,
+                                translationY = offsetY
+                            ),
+                        symbol = chartScreenshot.symbol,
+                        timeframe = chartScreenshot.timeframe,
+                        hasFimatheChannels = true,
+                        hasEaPanel = true,
+                        hasTradeArrows = true,
+                        chartScreenshot = chartScreenshot
+                    )
+                }
+
+                // Top bar with Parity & Time
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .statusBarsPadding()
+                        .padding(16.dp)
+                        .background(Color(0xFF0F172A).copy(alpha = 0.85f), RoundedCornerShape(16.dp))
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text(
+                            text = "PARIDADE: ${chartScreenshot.symbol} (${chartScreenshot.timeframe})",
+                            style = MaterialTheme.typography.titleMedium.copy(
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold
+                            )
+                        )
+                        Text(
+                            text = "Capturado às $timeFormatted",
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                color = Color(0xFF38BDF8),
+                                fontWeight = FontWeight.Medium
+                            )
+                        )
+                    }
+
+                    IconButton(
+                        onClick = onDismiss,
+                        modifier = Modifier
+                            .background(Color(0xFF1E293B), CircleShape)
+                            .size(36.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = "Fechar",
+                            tint = Color.White
+                        )
+                    }
+                }
+
+                // Bottom Zoom Indicator & Reset
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .navigationBarsPadding()
+                        .padding(16.dp)
+                        .background(Color(0xFF0F172A).copy(alpha = 0.85f), RoundedCornerShape(16.dp))
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Zoom: ${(scale * 100).toInt()}% • Arraste com o dedo",
+                        style = MaterialTheme.typography.labelSmall.copy(color = Color.White, fontWeight = FontWeight.Medium)
+                    )
+                    if (scale > 1.0f) {
+                        TextButton(onClick = {
+                            scale = 1.0f
+                            offsetX = 0f
+                            offsetY = 0f
+                        }) {
+                            Text("RESETAR", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF38BDF8), fontWeight = FontWeight.Bold))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun Mql5CodeModalDialog(onDismiss: () -> Unit) {
+    val clipboardManager = LocalClipboardManager.current
+    var copied by remember { mutableStateOf(false) }
+
+    val mql5Code = """
+// ====================================================================
+// EA FIMASTER COMPLETO & INTEGRADO AO APP (ea_fimaster_completo.mql5)
+// ====================================================================
+// O código fonte MQL5 completo e atualizado está disponível no arquivo:
+// '/ea_fimaster_completo.mql5' e '/fimaster_notificar.mql5'
+//
+// Destaques de Comunicação com este Aplicativo Android:
+// 1. NotificarEAOnline() - Ping de conectividade a cada 60s
+// 2. SincronizarParametrosDoApp() - Lê parâmetros alterados no App a cada 5s
+// 3. CapturarGraficoComObjetos() - Tira screenshot com linhas Fimathe e objetos MQL5
+// 4. VerificarEEnviarHistoricoFinanceiro() - Auto-detecta depósitos, saques e ordens fechadas
+// 5. Disparo de Eventos:
+//    - 'ordem_executada' (Compra / Venda)
+//    - 'ordem_modificada' (Ajuste de Stop Loss / Take Profit)
+//    - 'mudanca_estado' (Transições de Máquina de Estados Fimathe)
+//    - 'relatorio_financeiro' (Lucros/Prejuízos diários e semanais)
+// ====================================================================
+    """.trimIndent()
+
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            color = Color(0xFF0F172A),
+            shape = RoundedCornerShape(20.dp),
+            border = BorderStroke(1.dp, Color(0xFF38BDF8).copy(alpha = 0.5f))
+        ) {
+            Column(
+                modifier = Modifier.padding(18.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(imageVector = Icons.Default.Code, contentDescription = null, tint = Color(0xFF38BDF8))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("CÓDIGO MQL5 DO ROBÔ", style = MaterialTheme.typography.titleSmall.copy(color = Color.White, fontWeight = FontWeight.Bold))
+                    }
+                    IconButton(onClick = onDismiss) {
+                        Icon(imageVector = Icons.Default.Close, contentDescription = null, tint = Color.White)
+                    }
+                }
+
+                Text(
+                    text = "Instruções: O robô usa a função nativa MQL5 'ChartScreenShot()' que captura automaticamente todas as velas e objetos desenhados (Canais Fimathe, Linhas de Nível, Painel EA e Setas) e envia para o app.",
+                    style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8), fontSize = 11.sp)
+                )
+
+                Surface(
+                    color = Color(0xFF020617),
+                    shape = RoundedCornerShape(10.dp),
+                    border = BorderStroke(1.dp, Color(0xFF1E293B)),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(220.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    Text(
+                        text = mql5Code,
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            fontFamily = FontFamily.Monospace,
+                            color = Color(0xFF38BDF8),
+                            fontSize = 10.sp
+                        ),
+                        modifier = Modifier.padding(12.dp)
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Button(
+                        onClick = {
+                            clipboardManager.setText(AnnotatedString(mql5Code))
+                            copied = true
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = if (copied) Color(0xFF10B981) else Color(0xFF38BDF8)),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(imageVector = if (copied) Icons.Default.Check else Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(if (copied) "COPIADO!" else "COPIAR CÓDIGO", style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold))
+                    }
+
+                    TextButton(onClick = onDismiss) {
+                        Text("FECHAR", style = MaterialTheme.typography.labelSmall.copy(color = Color.White))
+                    }
+                }
+            }
+        }
+    }
+}
+
+data class ChartTrendline(
+    val id: String = java.util.UUID.randomUUID().toString(),
+    val startCandleIndex: Float,
+    val startPrice: Double,
+    val endCandleIndex: Float,
+    val endPrice: Double,
+    val color: Color = Color(0xFFEAB308)
+)
+
+data class ChartHorizontalLine(
+    val id: String = java.util.UUID.randomUUID().toString(),
+    val price: Double,
+    val color: Color = Color(0xFF38BDF8)
+)
+
+@Composable
+fun FinancialEquityCandlestickCard(
+    candles: List<com.example.ui.FinancialCandle>,
+    currentTimeframe: com.example.ui.EquityTimeframe,
+    onSelectTimeframe: (com.example.ui.EquityTimeframe) -> Unit,
+    cambio: Double = 64.0,
+    currencySymbol: String = "MT"
+) {
+    var selectedCandle by remember { mutableStateOf<com.example.ui.FinancialCandle?>(null) }
+    var zoomLevelX by remember { mutableFloatStateOf(1.0f) }
+    var zoomLevelY by remember { mutableFloatStateOf(1.0f) }
+    var isFullScreen by remember { mutableStateOf(false) }
+    var trendlines by remember { mutableStateOf<List<ChartTrendline>>(emptyList()) }
+    var horizontalLines by remember { mutableStateOf<List<ChartHorizontalLine>>(emptyList()) }
+    var activeToolMode by remember { mutableStateOf<String?>(null) }
+    var pendingTrendlineStart by remember { mutableStateOf<Pair<Float, Double>?>(null) }
+    var isLandscapeMode by remember { mutableStateOf(false) }
+    var selectedObjectId by remember { mutableStateOf<String?>(null) }
+
+    val handleUpdateHorizontalLine: (ChartHorizontalLine) -> Unit = { updated ->
+        horizontalLines = horizontalLines.map { if (it.id == updated.id) updated else it }
+    }
+    val handleUpdateTrendline: (ChartTrendline) -> Unit = { updated ->
+        trendlines = trendlines.map { if (it.id == updated.id) updated else it }
+    }
+    val handleDeleteObject: (String) -> Unit = { id ->
+        horizontalLines = horizontalLines.filter { it.id != id }
+        trendlines = trendlines.filter { it.id != id }
+        if (selectedObjectId == id) selectedObjectId = null
+    }
+
+    val activeCandle = selectedCandle ?: candles.lastOrNull()
+
+    val totalDeposits = remember(candles, cambio) { candles.sumOf { it.deposits } * cambio }
+    val totalWithdrawals = remember(candles, cambio) { candles.sumOf { it.withdrawals } * cambio }
+    val totalNetProfit = remember(candles, cambio) { candles.sumOf { it.netProfit } * cambio }
+    val finalEquity = remember(candles, cambio) { (candles.lastOrNull()?.closeBalance ?: 0.0) * cambio }
+
+    Card(
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF0F172A).copy(alpha = 0.95f)),
+        shape = RoundedCornerShape(18.dp),
+        border = BorderStroke(1.dp, Color(0xFF10B981).copy(alpha = 0.4f)),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            // Header
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    modifier = Modifier.weight(1f),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(32.dp)
+                            .background(Color(0xFF10B981).copy(alpha = 0.2f), CircleShape)
+                            .border(1.dp, Color(0xFF10B981), CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.ShowChart,
+                            contentDescription = "Gráfico Candlestick",
+                            tint = Color(0xFF10B981),
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "GRÁFICO CANDLESTICK DE PATRIMÔNIO",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                color = Color(0xFF10B981),
+                                fontWeight = FontWeight.Black,
+                                fontSize = 11.sp,
+                                letterSpacing = 0.5.sp
+                            )
+                        )
+                        Text(
+                            text = "Sincronização via Robô EA MT5",
+                            style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8), fontSize = 10.sp)
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.width(6.dp))
+
+                Surface(
+                    onClick = { isFullScreen = true },
+                    color = Color(0xFF10B981).copy(alpha = 0.15f),
+                    shape = RoundedCornerShape(6.dp),
+                    border = BorderStroke(1.dp, Color(0xFF10B981).copy(alpha = 0.4f))
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.AspectRatio,
+                            contentDescription = "Tela Cheia",
+                            tint = Color(0xFF10B981),
+                            modifier = Modifier.size(12.dp)
+                        )
+                        Text(
+                            text = "TELA CHEIA",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                color = Color(0xFF10B981),
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 9.sp
+                            )
+                        )
+                    }
+                }
+            }
+
+            // Timeframe Selector Buttons
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF1E293B), RoundedCornerShape(12.dp))
+                    .padding(4.dp),
+                horizontalArrangement = Arrangement.SpaceEvenly
+            ) {
+                com.example.ui.EquityTimeframe.values().forEach { tf ->
+                    val isSelected = tf == currentTimeframe
+                    val shortLabel = when (tf) {
+                        com.example.ui.EquityTimeframe.PER_POSITION -> "Posição"
+                        com.example.ui.EquityTimeframe.DAILY -> "Diário"
+                        com.example.ui.EquityTimeframe.WEEKLY -> "Semanal"
+                        com.example.ui.EquityTimeframe.MONTHLY -> "Mensal"
+                    }
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(if (isSelected) Color(0xFF10B981) else Color.Transparent)
+                            .clickable {
+                                onSelectTimeframe(tf)
+                                selectedCandle = null
+                            }
+                            .padding(vertical = 6.dp, horizontal = 2.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = "${tf.shortCode} • $shortLabel",
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                color = if (isSelected) Color.White else Color(0xFF94A3B8),
+                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                fontSize = 10.5.sp
+                            )
+                        )
+                    }
+                }
+            }
+
+            // Quick Metrics Grid (2x2 Organized Cards)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF020617), RoundedCornerShape(14.dp))
+                    .padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    // Saldo Final
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .background(Color(0xFF0F172A), RoundedCornerShape(10.dp))
+                            .padding(10.dp)
+                    ) {
+                        Column {
+                            Text("SALDO FINAL", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF64748B), fontSize = 9.5.sp, fontWeight = FontWeight.SemiBold))
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                "$currencySymbol ${String.format("%.2f", finalEquity)}",
+                                style = MaterialTheme.typography.titleSmall.copy(color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            )
+                        }
+                    }
+
+                    // Lucro Líquido
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .background(Color(0xFF0F172A), RoundedCornerShape(10.dp))
+                            .padding(10.dp)
+                    ) {
+                        Column {
+                            Text("LUCRO LÍQUIDO", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF64748B), fontSize = 9.5.sp, fontWeight = FontWeight.SemiBold))
+                            Spacer(modifier = Modifier.height(2.dp))
+                            val color = if (totalNetProfit >= 0) Color(0xFF10B981) else Color(0xFFEF4444)
+                            val prefix = if (totalNetProfit >= 0) "+" else ""
+                            Text(
+                                "$prefix$currencySymbol ${String.format("%.2f", totalNetProfit)}",
+                                style = MaterialTheme.typography.titleSmall.copy(color = color, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            )
+                        }
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    // Depósitos
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .background(Color(0xFF0F172A), RoundedCornerShape(10.dp))
+                            .padding(10.dp)
+                    ) {
+                        Column {
+                            Text("DEPÓSITOS (+)", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF64748B), fontSize = 9.5.sp, fontWeight = FontWeight.SemiBold))
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                "+$currencySymbol ${String.format("%.2f", totalDeposits)}",
+                                style = MaterialTheme.typography.titleSmall.copy(color = Color(0xFF22D3EE), fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            )
+                        }
+                    }
+
+                    // Saques
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .background(Color(0xFF0F172A), RoundedCornerShape(10.dp))
+                            .padding(10.dp)
+                    ) {
+                        Column {
+                            Text("SAQUES (-)", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF64748B), fontSize = 9.5.sp, fontWeight = FontWeight.SemiBold))
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                "-$currencySymbol ${String.format("%.2f", totalWithdrawals)}",
+                                style = MaterialTheme.typography.titleSmall.copy(color = Color(0xFFF59E0B), fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Active Candle Inspector Tooltip
+            if (activeCandle != null) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color(0xFF020617), RoundedCornerShape(10.dp))
+                        .border(1.dp, if (activeCandle.isBullish) Color(0xFF10B981).copy(alpha = 0.5f) else Color(0xFFEF4444).copy(alpha = 0.5f), RoundedCornerShape(10.dp))
+                        .padding(horizontal = 10.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "VELA: ${activeCandle.periodLabel}",
+                            style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF38BDF8), fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                        )
+                        val pColor = if (activeCandle.netProfit >= 0) Color(0xFF10B981) else Color(0xFFEF4444)
+                        val pPrefix = if (activeCandle.netProfit >= 0) "+" else ""
+                        Text(
+                            text = "Resultado: $pPrefix$currencySymbol ${String.format("%.2f", activeCandle.netProfit * cambio)}",
+                            style = MaterialTheme.typography.labelSmall.copy(color = pColor, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                        )
+                    }
+
+                    HorizontalDivider(color = Color(0xFF1E293B), thickness = 1.dp)
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        // Left Column: Abertura & Fechamento
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text("Abertura:", style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8), fontSize = 9.5.sp))
+                                Text("$currencySymbol ${String.format("%.2f", activeCandle.openBalance * cambio)}", style = MaterialTheme.typography.bodySmall.copy(color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 9.5.sp))
+                            }
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text("Fechamento:", style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8), fontSize = 9.5.sp))
+                                Text("$currencySymbol ${String.format("%.2f", activeCandle.closeBalance * cambio)}", style = MaterialTheme.typography.bodySmall.copy(color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 9.5.sp))
+                            }
+                        }
+
+                        // Right Column: Máximo & Mínimo
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text("Máximo:", style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8), fontSize = 9.5.sp))
+                                Text("$currencySymbol ${String.format("%.2f", activeCandle.highBalance * cambio)}", style = MaterialTheme.typography.bodySmall.copy(color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 9.5.sp))
+                            }
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text("Mínimo:", style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8), fontSize = 9.5.sp))
+                                Text("$currencySymbol ${String.format("%.2f", activeCandle.lowBalance * cambio)}", style = MaterialTheme.typography.bodySmall.copy(color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 9.5.sp))
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Toolbar Row: Botões de Zoom (Horizontal & Vertical) & Ferramentas de Análise Técnica
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF020617), RoundedCornerShape(12.dp))
+                    .border(1.dp, Color(0xFF1E293B), RoundedCornerShape(12.dp))
+                    .padding(horizontal = 8.dp, vertical = 6.dp)
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // Controles de Zoom & Expandir Tela Cheia
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Surface(
+                        onClick = {
+                            zoomLevelX = (zoomLevelX - 0.25f).coerceAtLeast(0.5f)
+                            zoomLevelY = (zoomLevelY - 0.25f).coerceAtLeast(0.5f)
+                        },
+                        shape = RoundedCornerShape(6.dp),
+                        color = Color(0xFF1E293B),
+                        border = BorderStroke(0.5.dp, Color(0xFF334155))
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Remove,
+                            contentDescription = "Diminuir Zoom",
+                            tint = Color.White,
+                            modifier = Modifier.padding(4.dp).size(16.dp)
+                        )
+                    }
+
+                    Surface(
+                        onClick = { isFullScreen = true },
+                        shape = RoundedCornerShape(6.dp),
+                        color = Color(0xFF0F172A),
+                        border = BorderStroke(0.5.dp, Color(0xFF38BDF8).copy(alpha = 0.5f))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(3.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.AspectRatio,
+                                contentDescription = "Zoom Expandido",
+                                tint = Color(0xFF38BDF8),
+                                modifier = Modifier.size(13.dp)
+                            )
+                            Text(
+                                text = "Zoom ${((zoomLevelX + zoomLevelY) / 2f * 100).toInt()}%",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = Color(0xFF38BDF8),
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 10.sp
+                                )
+                            )
+                        }
+                    }
+
+                    Surface(
+                        onClick = {
+                            zoomLevelX = (zoomLevelX + 0.25f).coerceAtMost(4.0f)
+                            zoomLevelY = (zoomLevelY + 0.25f).coerceAtMost(4.0f)
+                        },
+                        shape = RoundedCornerShape(6.dp),
+                        color = Color(0xFF1E293B),
+                        border = BorderStroke(0.5.dp, Color(0xFF334155))
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Add,
+                            contentDescription = "Aumentar Zoom",
+                            tint = Color.White,
+                            modifier = Modifier.padding(4.dp).size(16.dp)
+                        )
+                    }
+
+                    if (zoomLevelX != 1.0f || zoomLevelY != 1.0f) {
+                        Surface(
+                            onClick = {
+                                zoomLevelX = 1.0f
+                                zoomLevelY = 1.0f
+                            },
+                            shape = RoundedCornerShape(6.dp),
+                            color = Color(0xFF0EA5E9).copy(alpha = 0.2f),
+                            border = BorderStroke(0.5.dp, Color(0xFF0EA5E9))
+                        ) {
+                            Text(
+                                text = "Reset",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = Color(0xFF38BDF8),
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 9.5.sp
+                                ),
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+                }
+
+                // Botão de Virar Tela (Girar Orientação do Gráfico)
+                Surface(
+                    onClick = { isLandscapeMode = !isLandscapeMode },
+                    shape = RoundedCornerShape(6.dp),
+                    color = if (isLandscapeMode) Color(0xFF8B5CF6) else Color(0xFF1E293B),
+                    border = BorderStroke(0.5.dp, if (isLandscapeMode) Color(0xFFA78BFA) else Color(0xFF334155))
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.ScreenRotation,
+                            contentDescription = "Virar Tela",
+                            tint = if (isLandscapeMode) Color.White else Color(0xFFA78BFA),
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Text(
+                            text = if (isLandscapeMode) "90° Paisagem" else "Virar Tela",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 9.5.sp
+                            )
+                        )
+                    }
+                }
+
+                // Botão de Ferramentas (Linha de Tendência & Linha Horizontal)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    val isTrendActive = activeToolMode == "TRENDLINE" || trendlines.isNotEmpty()
+                    Surface(
+                        onClick = {
+                            if (activeToolMode == "TRENDLINE") {
+                                activeToolMode = null
+                                pendingTrendlineStart = null
+                            } else {
+                                activeToolMode = "TRENDLINE"
+                                if (trendlines.isEmpty() && candles.size >= 2) {
+                                    val minCandleIdx = candles.indices.minByOrNull { candles[it].lowBalance } ?: 0
+                                    val maxCandleIdx = candles.indices.maxByOrNull { candles[it].highBalance } ?: (candles.size - 1)
+                                    val startIdx = kotlin.math.min(minCandleIdx, maxCandleIdx)
+                                    val endIdx = kotlin.math.max(minCandleIdx, maxCandleIdx)
+                                    trendlines = listOf(
+                                        ChartTrendline(
+                                            startCandleIndex = startIdx.toFloat(),
+                                            startPrice = candles[startIdx].lowBalance * cambio,
+                                            endCandleIndex = endIdx.toFloat(),
+                                            endPrice = candles[endIdx].highBalance * cambio
+                                        )
+                                    )
+                                }
+                            }
+                        },
+                        shape = RoundedCornerShape(6.dp),
+                        color = if (isTrendActive) Color(0xFFEAB308) else Color(0xFF1E293B),
+                        border = BorderStroke(0.5.dp, if (isTrendActive) Color(0xFFFACC15) else Color(0xFF334155))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.ShowChart,
+                                contentDescription = null,
+                                tint = if (isTrendActive) Color.Black else Color(0xFFEAB308),
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Text(
+                                text = "Tendência",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = if (isTrendActive) Color.Black else Color.White,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 9.5.sp
+                                )
+                            )
+                        }
+                    }
+
+                    val isHorizActive = activeToolMode == "HORIZONTAL" || horizontalLines.isNotEmpty()
+                    Surface(
+                        onClick = {
+                            if (activeToolMode == "HORIZONTAL") {
+                                activeToolMode = null
+                            } else {
+                                activeToolMode = "HORIZONTAL"
+                                val currentPrice = (activeCandle?.closeBalance ?: candles.lastOrNull()?.closeBalance ?: 0.0) * cambio
+                                if (currentPrice > 0.0 && horizontalLines.none { kotlin.math.abs(it.price - currentPrice) < 0.01 }) {
+                                    horizontalLines = horizontalLines + ChartHorizontalLine(price = currentPrice)
+                                }
+                            }
+                        },
+                        shape = RoundedCornerShape(6.dp),
+                        color = if (isHorizActive) Color(0xFF0EA5E9) else Color(0xFF1E293B),
+                        border = BorderStroke(0.5.dp, if (isHorizActive) Color(0xFF38BDF8) else Color(0xFF334155))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.HorizontalRule,
+                                contentDescription = null,
+                                tint = if (isHorizActive) Color.White else Color(0xFF38BDF8),
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Text(
+                                text = "Horizontal",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = Color.White,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 9.5.sp
+                                )
+                            )
+                        }
+                    }
+
+                    // Botão Mover / Selecionar Objeto
+                    Surface(
+                        onClick = {
+                            activeToolMode = if (activeToolMode == "MOVE") null else "MOVE"
+                        },
+                        shape = RoundedCornerShape(6.dp),
+                        color = if (activeToolMode == "MOVE") Color(0xFFF59E0B) else Color(0xFF1E293B),
+                        border = BorderStroke(0.5.dp, if (activeToolMode == "MOVE") Color(0xFFFBBF24) else Color(0xFF334155))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.OpenWith,
+                                contentDescription = "Mover Objeto",
+                                tint = if (activeToolMode == "MOVE") Color.Black else Color(0xFFF59E0B),
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Text(
+                                text = "Mover",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = if (activeToolMode == "MOVE") Color.Black else Color.White,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 9.5.sp
+                                )
+                            )
+                        }
+                    }
+
+                    // Botão Excluir Objeto Selecionado
+                    if (selectedObjectId != null) {
+                        Surface(
+                            onClick = {
+                                selectedObjectId?.let { handleDeleteObject(it) }
+                            },
+                            shape = RoundedCornerShape(6.dp),
+                            color = Color(0xFFEF4444).copy(alpha = 0.25f),
+                            border = BorderStroke(0.5.dp, Color(0xFFEF4444))
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Delete,
+                                    contentDescription = "Excluir Objeto",
+                                    tint = Color(0xFFEF4444),
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Text(
+                                    text = "Excluir",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        color = Color(0xFFEF4444),
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 9.5.sp
+                                    )
+                                )
+                            }
+                        }
+                    }
+
+                    if (trendlines.isNotEmpty() || horizontalLines.isNotEmpty()) {
+                        Surface(
+                            onClick = {
+                                trendlines = emptyList()
+                                horizontalLines = emptyList()
+                                activeToolMode = null
+                                pendingTrendlineStart = null
+                                selectedObjectId = null
+                            },
+                            shape = RoundedCornerShape(6.dp),
+                            color = Color(0xFFEF4444).copy(alpha = 0.2f),
+                            border = BorderStroke(0.5.dp, Color(0xFFEF4444))
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Limpar Desenhos",
+                                tint = Color(0xFFEF4444),
+                                modifier = Modifier.padding(4.dp).size(14.dp)
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Candlestick Chart Canvas
+            FinancialCandlestickCanvas(
+                candles = candles,
+                selectedCandle = activeCandle,
+                onCandleSelect = { selectedCandle = it },
+                cambio = cambio,
+                currencySymbol = currencySymbol,
+                zoomLevelX = zoomLevelX,
+                zoomLevelY = zoomLevelY,
+                onZoomChange = { newX, newY ->
+                    zoomLevelX = newX
+                    zoomLevelY = newY
+                },
+                trendlines = trendlines,
+                horizontalLines = horizontalLines,
+                activeToolMode = activeToolMode,
+                isLandscapeMode = isLandscapeMode,
+                selectedObjectId = selectedObjectId,
+                onSelectObject = { selectedObjectId = it },
+                onUpdateHorizontalLine = handleUpdateHorizontalLine,
+                onUpdateTrendline = handleUpdateTrendline,
+                onDeleteObject = handleDeleteObject,
+                onAddHorizontalLine = { price ->
+                    horizontalLines = horizontalLines + ChartHorizontalLine(price = price)
+                },
+                onAddTrendlinePoint = { index, price ->
+                    val pending = pendingTrendlineStart
+                    if (pending == null) {
+                        pendingTrendlineStart = Pair(index, price)
+                    } else {
+                        trendlines = trendlines + ChartTrendline(
+                            startCandleIndex = pending.first,
+                            startPrice = pending.second,
+                            endCandleIndex = index,
+                            endPrice = price
+                        )
+                        pendingTrendlineStart = null
+                    }
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(if (isLandscapeMode) 320.dp else 240.dp)
+            )
+
+            // Legend Organized in 2 Clean Rows
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceEvenly,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(modifier = Modifier.size(10.dp).background(Color(0xFF10B981), RoundedCornerShape(2.dp)))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Lucro / Alta", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF94A3B8), fontSize = 10.5.sp))
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(modifier = Modifier.size(10.dp).background(Color(0xFFEF4444), RoundedCornerShape(2.dp)))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Prejuízo / Baixa", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF94A3B8), fontSize = 10.5.sp))
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(modifier = Modifier.width(12.dp).height(2.dp).background(Color(0xFF38BDF8)))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Preço Atual", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF38BDF8), fontSize = 10.5.sp, fontWeight = FontWeight.SemiBold))
+                    }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceEvenly,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(modifier = Modifier.size(8.dp).background(Color(0xFF22D3EE), CircleShape))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("● Depósito (MT5 Auto)", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF22D3EE), fontSize = 10.5.sp))
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(modifier = Modifier.size(8.dp).background(Color(0xFFF59E0B), CircleShape))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("● Saque (MT5 Auto)", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFFF59E0B), fontSize = 10.5.sp))
+                    }
+                }
+            }
+        }
+    }
+
+    // Modal / Fullscreen Expanded Zoom View
+    if (isFullScreen) {
+        Dialog(
+            onDismissRequest = { isFullScreen = false },
+            properties = DialogProperties(usePlatformDefaultWidth = false)
+        ) {
+            Surface(
+                modifier = Modifier.fillMaxSize(),
+                color = Color(0xFF020617)
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    // Fullscreen Header Bar
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(36.dp)
+                                    .background(Color(0xFF10B981).copy(alpha = 0.2f), CircleShape)
+                                    .border(1.dp, Color(0xFF10B981), CircleShape),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.ShowChart,
+                                    contentDescription = null,
+                                    tint = Color(0xFF10B981),
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+                            Column {
+                                Text(
+                                    text = "GRÁFICO DE PATRIMÔNIO (TELA CHEIA)",
+                                    style = MaterialTheme.typography.titleMedium.copy(
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 14.sp
+                                    )
+                                )
+                                Text(
+                                    text = "Zoom H: ${(zoomLevelX * 100).toInt()}% • Zoom V: ${(zoomLevelY * 100).toInt()}% • Pinçar para Zoom",
+                                    style = MaterialTheme.typography.bodySmall.copy(
+                                        color = Color(0xFF38BDF8),
+                                        fontSize = 11.sp
+                                    )
+                                )
+                            }
+                        }
+
+                        IconButton(
+                            onClick = { isFullScreen = false },
+                            modifier = Modifier
+                                .background(Color(0xFF1E293B), CircleShape)
+                                .size(36.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Fechar Tela Cheia",
+                                tint = Color.White
+                            )
+                        }
+                    }
+
+                    // Timeframes in Fullscreen
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color(0xFF1E293B), RoundedCornerShape(10.dp))
+                            .padding(4.dp),
+                        horizontalArrangement = Arrangement.SpaceEvenly
+                    ) {
+                        com.example.ui.EquityTimeframe.values().forEach { tf ->
+                            val isSelected = tf == currentTimeframe
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(if (isSelected) Color(0xFF10B981) else Color.Transparent)
+                                    .clickable {
+                                        onSelectTimeframe(tf)
+                                        selectedCandle = null
+                                    }
+                                    .padding(vertical = 6.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = tf.shortCode,
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        color = if (isSelected) Color.White else Color(0xFF94A3B8),
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 11.sp
+                                    )
+                                )
+                            }
+                        }
+                    }
+
+                    // Fullscreen Toolbar: Zoom X, Zoom Y, Virar Tela & Ferramentas de Análise Técnica
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color(0xFF0F172A), RoundedCornerShape(12.dp))
+                            .border(1.dp, Color(0xFF1E293B), RoundedCornerShape(12.dp))
+                            .padding(8.dp)
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        // Horizontal Zoom Controls
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Text("X:", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF94A3B8), fontSize = 10.sp))
+                            Surface(
+                                onClick = { zoomLevelX = (zoomLevelX - 0.25f).coerceAtLeast(0.5f) },
+                                shape = RoundedCornerShape(6.dp),
+                                color = Color(0xFF1E293B)
+                            ) {
+                                Icon(Icons.Default.Remove, contentDescription = "Zoom H-", tint = Color.White, modifier = Modifier.padding(4.dp).size(14.dp))
+                            }
+                            Text(
+                                text = "${(zoomLevelX * 100).toInt()}%",
+                                style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF38BDF8), fontWeight = FontWeight.Bold, fontSize = 10.sp)
+                            )
+                            Surface(
+                                onClick = { zoomLevelX = (zoomLevelX + 0.25f).coerceAtMost(5.0f) },
+                                shape = RoundedCornerShape(6.dp),
+                                color = Color(0xFF1E293B)
+                            ) {
+                                Icon(Icons.Default.Add, contentDescription = "Zoom H+", tint = Color.White, modifier = Modifier.padding(4.dp).size(14.dp))
+                            }
+                        }
+
+                        // Vertical Zoom Controls
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Text("Y:", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF94A3B8), fontSize = 10.sp))
+                            Surface(
+                                onClick = { zoomLevelY = (zoomLevelY - 0.25f).coerceAtLeast(0.5f) },
+                                shape = RoundedCornerShape(6.dp),
+                                color = Color(0xFF1E293B)
+                            ) {
+                                Icon(Icons.Default.Remove, contentDescription = "Zoom V-", tint = Color.White, modifier = Modifier.padding(4.dp).size(14.dp))
+                            }
+                            Text(
+                                text = "${(zoomLevelY * 100).toInt()}%",
+                                style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF10B981), fontWeight = FontWeight.Bold, fontSize = 10.sp)
+                            )
+                            Surface(
+                                onClick = { zoomLevelY = (zoomLevelY + 0.25f).coerceAtMost(5.0f) },
+                                shape = RoundedCornerShape(6.dp),
+                                color = Color(0xFF1E293B)
+                            ) {
+                                Icon(Icons.Default.Add, contentDescription = "Zoom V+", tint = Color.White, modifier = Modifier.padding(4.dp).size(14.dp))
+                            }
+                        }
+
+                        if (zoomLevelX != 1.0f || zoomLevelY != 1.0f) {
+                            Surface(
+                                onClick = {
+                                    zoomLevelX = 1.0f
+                                    zoomLevelY = 1.0f
+                                },
+                                shape = RoundedCornerShape(6.dp),
+                                color = Color(0xFF0EA5E9).copy(alpha = 0.2f),
+                                border = BorderStroke(0.5.dp, Color(0xFF0EA5E9))
+                            ) {
+                                Text("Reset Zoom", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF38BDF8), fontSize = 10.sp, fontWeight = FontWeight.Bold), modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp))
+                            }
+                        }
+
+                        // Botão Virar Tela
+                        Surface(
+                            onClick = { isLandscapeMode = !isLandscapeMode },
+                            shape = RoundedCornerShape(6.dp),
+                            color = if (isLandscapeMode) Color(0xFF8B5CF6) else Color(0xFF1E293B),
+                            border = BorderStroke(0.5.dp, if (isLandscapeMode) Color(0xFFA78BFA) else Color(0xFF334155))
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.ScreenRotation,
+                                    contentDescription = "Virar Tela",
+                                    tint = if (isLandscapeMode) Color.White else Color(0xFFA78BFA),
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Text(
+                                    text = if (isLandscapeMode) "90° Paisagem" else "Virar Tela",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 10.sp
+                                    )
+                                )
+                            }
+                        }
+
+                        // Ferramentas de Análise Técnica em Tela Cheia
+                        val isTrendActive = activeToolMode == "TRENDLINE" || trendlines.isNotEmpty()
+                        Surface(
+                            onClick = {
+                                if (activeToolMode == "TRENDLINE") {
+                                    activeToolMode = null
+                                    pendingTrendlineStart = null
+                                } else {
+                                    activeToolMode = "TRENDLINE"
+                                    if (trendlines.isEmpty() && candles.size >= 2) {
+                                        val minCandleIdx = candles.indices.minByOrNull { candles[it].lowBalance } ?: 0
+                                        val maxCandleIdx = candles.indices.maxByOrNull { candles[it].highBalance } ?: (candles.size - 1)
+                                        val startIdx = kotlin.math.min(minCandleIdx, maxCandleIdx)
+                                        val endIdx = kotlin.math.max(minCandleIdx, maxCandleIdx)
+                                        trendlines = listOf(
+                                            ChartTrendline(
+                                                startCandleIndex = startIdx.toFloat(),
+                                                startPrice = candles[startIdx].lowBalance * cambio,
+                                                endCandleIndex = endIdx.toFloat(),
+                                                endPrice = candles[endIdx].highBalance * cambio
+                                            )
+                                        )
+                                    }
+                                }
+                            },
+                            shape = RoundedCornerShape(6.dp),
+                            color = if (isTrendActive) Color(0xFFEAB308) else Color(0xFF1E293B),
+                            border = BorderStroke(0.5.dp, if (isTrendActive) Color(0xFFFACC15) else Color(0xFF334155))
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.ShowChart,
+                                    contentDescription = null,
+                                    tint = if (isTrendActive) Color.Black else Color(0xFFEAB308),
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Text(
+                                    text = "Tendência",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        color = if (isTrendActive) Color.Black else Color.White,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 10.sp
+                                    )
+                                )
+                            }
+                        }
+
+                        val isHorizActive = activeToolMode == "HORIZONTAL" || horizontalLines.isNotEmpty()
+                        Surface(
+                            onClick = {
+                                if (activeToolMode == "HORIZONTAL") {
+                                    activeToolMode = null
+                                } else {
+                                    activeToolMode = "HORIZONTAL"
+                                    val currentPrice = (activeCandle?.closeBalance ?: candles.lastOrNull()?.closeBalance ?: 0.0) * cambio
+                                    if (currentPrice > 0.0 && horizontalLines.none { kotlin.math.abs(it.price - currentPrice) < 0.01 }) {
+                                        horizontalLines = horizontalLines + ChartHorizontalLine(price = currentPrice)
+                                    }
+                                }
+                            },
+                            shape = RoundedCornerShape(6.dp),
+                            color = if (isHorizActive) Color(0xFF0EA5E9) else Color(0xFF1E293B),
+                            border = BorderStroke(0.5.dp, if (isHorizActive) Color(0xFF38BDF8) else Color(0xFF334155))
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.HorizontalRule,
+                                    contentDescription = null,
+                                    tint = if (isHorizActive) Color.White else Color(0xFF38BDF8),
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Text(
+                                    text = "Horizontal",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 10.sp
+                                    )
+                                )
+                            }
+                        }
+
+                        // Botão Mover / Selecionar Objeto
+                        Surface(
+                            onClick = {
+                                activeToolMode = if (activeToolMode == "MOVE") null else "MOVE"
+                            },
+                            shape = RoundedCornerShape(6.dp),
+                            color = if (activeToolMode == "MOVE") Color(0xFFF59E0B) else Color(0xFF1E293B),
+                            border = BorderStroke(0.5.dp, if (activeToolMode == "MOVE") Color(0xFFFBBF24) else Color(0xFF334155))
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.OpenWith,
+                                    contentDescription = "Mover Objeto",
+                                    tint = if (activeToolMode == "MOVE") Color.Black else Color(0xFFF59E0B),
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Text(
+                                    text = "Mover",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        color = if (activeToolMode == "MOVE") Color.Black else Color.White,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 10.sp
+                                    )
+                                )
+                            }
+                        }
+
+                        // Botão Excluir Objeto Selecionado
+                        if (selectedObjectId != null) {
+                            Surface(
+                                onClick = {
+                                    selectedObjectId?.let { handleDeleteObject(it) }
+                                },
+                                shape = RoundedCornerShape(6.dp),
+                                color = Color(0xFFEF4444).copy(alpha = 0.25f),
+                                border = BorderStroke(0.5.dp, Color(0xFFEF4444))
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Delete,
+                                        contentDescription = "Excluir Objeto",
+                                        tint = Color(0xFFEF4444),
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                    Text(
+                                        text = "Excluir",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            color = Color(0xFFEF4444),
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 10.sp
+                                        )
+                                    )
+                                }
+                            }
+                        }
+
+                        if (trendlines.isNotEmpty() || horizontalLines.isNotEmpty()) {
+                            Surface(
+                                onClick = {
+                                    trendlines = emptyList()
+                                    horizontalLines = emptyList()
+                                    activeToolMode = null
+                                    pendingTrendlineStart = null
+                                    selectedObjectId = null
+                                },
+                                shape = RoundedCornerShape(6.dp),
+                                color = Color(0xFFEF4444).copy(alpha = 0.2f),
+                                border = BorderStroke(0.5.dp, Color(0xFFEF4444))
+                            ) {
+                                Text("Limpar", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFFEF4444), fontSize = 10.sp, fontWeight = FontWeight.Bold), modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp))
+                            }
+                        }
+                    }
+
+                    // Fullscreen Candlestick Canvas (Takes remaining vertical space)
+                    FinancialCandlestickCanvas(
+                        candles = candles,
+                        selectedCandle = activeCandle,
+                        onCandleSelect = { selectedCandle = it },
+                        cambio = cambio,
+                        currencySymbol = currencySymbol,
+                        zoomLevelX = zoomLevelX,
+                        zoomLevelY = zoomLevelY,
+                        onZoomChange = { newX, newY ->
+                            zoomLevelX = newX
+                            zoomLevelY = newY
+                        },
+                        trendlines = trendlines,
+                        horizontalLines = horizontalLines,
+                        activeToolMode = activeToolMode,
+                        isLandscapeMode = isLandscapeMode,
+                        selectedObjectId = selectedObjectId,
+                        onSelectObject = { selectedObjectId = it },
+                        onUpdateHorizontalLine = handleUpdateHorizontalLine,
+                        onUpdateTrendline = handleUpdateTrendline,
+                        onDeleteObject = handleDeleteObject,
+                        onAddHorizontalLine = { price ->
+                            horizontalLines = horizontalLines + ChartHorizontalLine(price = price)
+                        },
+                        onAddTrendlinePoint = { index, price ->
+                            val pending = pendingTrendlineStart
+                            if (pending == null) {
+                                pendingTrendlineStart = Pair(index, price)
+                            } else {
+                                trendlines = trendlines + ChartTrendline(
+                                    startCandleIndex = pending.first,
+                                    startPrice = pending.second,
+                                    endCandleIndex = index,
+                                    endPrice = price
+                                )
+                                pendingTrendlineStart = null
+                            }
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f)
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun distanceToSegment(pX: Float, pY: Float, x1: Float, y1: Float, x2: Float, y2: Float): Float {
+    val l2 = (x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1)
+    if (l2 == 0f) return kotlin.math.hypot(pX - x1, pY - y1)
+    var t = ((pX - x1) * (x2 - x1) + (pY - y1) * (y2 - y1)) / l2
+    t = t.coerceIn(0f, 1f)
+    val projX = x1 + t * (x2 - x1)
+    val projY = y1 + t * (y2 - y1)
+    return kotlin.math.hypot(pX - projX, pY - projY)
+}
+
+@Composable
+fun FinancialCandlestickCanvas(
+    candles: List<com.example.ui.FinancialCandle>,
+    selectedCandle: com.example.ui.FinancialCandle?,
+    onCandleSelect: (com.example.ui.FinancialCandle) -> Unit,
+    cambio: Double = 1.0,
+    currencySymbol: String = "MT",
+    zoomLevelX: Float = 1.0f,
+    zoomLevelY: Float = 1.0f,
+    onZoomChange: ((Float, Float) -> Unit)? = null,
+    trendlines: List<ChartTrendline> = emptyList(),
+    horizontalLines: List<ChartHorizontalLine> = emptyList(),
+    activeToolMode: String? = null,
+    isLandscapeMode: Boolean = false,
+    selectedObjectId: String? = null,
+    onSelectObject: ((String?) -> Unit)? = null,
+    onUpdateHorizontalLine: ((ChartHorizontalLine) -> Unit)? = null,
+    onUpdateTrendline: ((ChartTrendline) -> Unit)? = null,
+    onDeleteObject: ((String) -> Unit)? = null,
+    onAddHorizontalLine: ((Double) -> Unit)? = null,
+    onAddTrendlinePoint: ((Float, Double) -> Unit)? = null,
+    modifier: Modifier = Modifier
+) {
+    Box(
+        modifier = modifier
+            .background(Color(0xFF020617))
+            .border(1.dp, Color(0xFF1E293B), RoundedCornerShape(14.dp))
+            .clip(RoundedCornerShape(14.dp))
+    ) {
+        if (candles.isEmpty()) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text(
+                    text = "Nenhuma posição ou transação registrada no período.",
+                    style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF64748B))
+                )
+            }
+            return@Box
+        }
+
+        val minEquity = remember(candles, cambio) { (candles.minOf { it.lowBalance * cambio } * 0.98).coerceAtLeast(0.0) }
+        val maxEquity = remember(candles, cambio) { (candles.maxOf { it.highBalance * cambio } * 1.02).coerceAtLeast(minEquity + (100.0 * cambio)) }
+        val equityRange = maxEquity - minEquity
+
+        val scrollStateX = rememberScrollState()
+        val scrollStateY = rememberScrollState()
+
+        BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+            val baseWidthPx = constraints.maxWidth.toFloat()
+            val baseHeightPx = constraints.maxHeight.toFloat()
+            val totalChartWidthPx = (baseWidthPx * zoomLevelX).coerceAtLeast(baseWidthPx)
+            val totalChartHeightPx = (baseHeightPx * zoomLevelY).coerceAtLeast(baseHeightPx)
+
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer {
+                        rotationZ = if (isLandscapeMode) 90f else 0f
+                    }
+                    .horizontalScroll(scrollStateX, enabled = zoomLevelX > 1.0f || isLandscapeMode)
+                    .verticalScroll(scrollStateY, enabled = zoomLevelY > 1.0f || isLandscapeMode)
+            ) {
+                Canvas(
+                    modifier = Modifier
+                        .width(with(androidx.compose.ui.platform.LocalDensity.current) { totalChartWidthPx.toDp() })
+                        .height(with(androidx.compose.ui.platform.LocalDensity.current) { totalChartHeightPx.toDp() })
+                        .padding(top = 16.dp, bottom = 28.dp, start = 16.dp, end = 16.dp)
+                        .pointerInput(candles, zoomLevelX, zoomLevelY, isLandscapeMode, onZoomChange) {
+                            detectTransformGestures { _, pan, zoom, _ ->
+                                if (zoom != 1.0f && onZoomChange != null) {
+                                    val newX = (zoomLevelX * zoom).coerceIn(0.5f, 5.0f)
+                                    val newY = (zoomLevelY * zoom).coerceIn(0.5f, 5.0f)
+                                    onZoomChange(newX, newY)
+                                }
+                                if (pan != androidx.compose.ui.geometry.Offset.Zero) {
+                                    val deltaX = if (isLandscapeMode) pan.y else -pan.x
+                                    val deltaY = if (isLandscapeMode) -pan.x else -pan.y
+                                    scrollStateX.dispatchRawDelta(deltaX)
+                                    scrollStateY.dispatchRawDelta(deltaY)
+                                }
+                            }
+                        }
+                        .pointerInput(candles, horizontalLines, trendlines, minEquity, equityRange, isLandscapeMode) {
+                            var activeDragId: String? = null
+                            var activeDragMode: String? = null
+                            var touchStartPos: androidx.compose.ui.geometry.Offset? = null
+                            var initialStartIdx: Float = 0f
+                            var initialEndIdx: Float = 0f
+                            var initialStartPrice: Double = 0.0
+                            var initialEndPrice: Double = 0.0
+                            var initialHLinePrice: Double = 0.0
+
+                            detectDragGestures(
+                                onDragStart = { touchOffset ->
+                                    val w = size.width.toFloat()
+                                    val h = size.height.toFloat()
+                                    val count = candles.size.coerceAtLeast(1)
+                                    val rightMargin = 112f
+                                    val chartWidth = (w - rightMargin).coerceAtLeast(50f)
+                                    val slotWidth = chartWidth / count
+
+                                    for (tLine in trendlines) {
+                                        val x1 = (tLine.startCandleIndex + 0.5f) * slotWidth
+                                        val y1 = h * (1f - ((tLine.startPrice - minEquity) / equityRange).toFloat())
+                                        val x2 = (tLine.endCandleIndex + 0.5f) * slotWidth
+                                        val y2 = h * (1f - ((tLine.endPrice - minEquity) / equityRange).toFloat())
+
+                                        val d1 = kotlin.math.hypot(touchOffset.x - x1, touchOffset.y - y1)
+                                        val d2 = kotlin.math.hypot(touchOffset.x - x2, touchOffset.y - y2)
+
+                                        if (d1 < 60f) {
+                                            activeDragId = tLine.id
+                                            activeDragMode = "START"
+                                            touchStartPos = touchOffset
+                                            initialStartIdx = tLine.startCandleIndex
+                                            initialStartPrice = tLine.startPrice
+                                            onSelectObject?.invoke(tLine.id)
+                                            return@detectDragGestures
+                                        } else if (d2 < 60f) {
+                                            activeDragId = tLine.id
+                                            activeDragMode = "END"
+                                            touchStartPos = touchOffset
+                                            initialEndIdx = tLine.endCandleIndex
+                                            initialEndPrice = tLine.endPrice
+                                            onSelectObject?.invoke(tLine.id)
+                                            return@detectDragGestures
+                                        } else {
+                                            val dSeg = distanceToSegment(touchOffset.x, touchOffset.y, x1, y1, x2, y2)
+                                            if (dSeg < 44f) {
+                                                activeDragId = tLine.id
+                                                activeDragMode = "TRENDLINE_BODY"
+                                                touchStartPos = touchOffset
+                                                initialStartIdx = tLine.startCandleIndex
+                                                initialEndIdx = tLine.endCandleIndex
+                                                initialStartPrice = tLine.startPrice
+                                                initialEndPrice = tLine.endPrice
+                                                onSelectObject?.invoke(tLine.id)
+                                                return@detectDragGestures
+                                            }
+                                        }
+                                    }
+
+                                    for (hLine in horizontalLines) {
+                                        val yLine = h * (1f - ((hLine.price - minEquity) / equityRange).toFloat())
+                                        if (kotlin.math.abs(touchOffset.y - yLine) < 48f) {
+                                            activeDragId = hLine.id
+                                            activeDragMode = "HORIZONTAL"
+                                            touchStartPos = touchOffset
+                                            initialHLinePrice = hLine.price
+                                            onSelectObject?.invoke(hLine.id)
+                                            return@detectDragGestures
+                                        }
+                                    }
+                                },
+                                onDrag = { change, _ ->
+                                    val dragId = activeDragId ?: return@detectDragGestures
+                                    change.consume()
+
+                                    val w = size.width.toFloat()
+                                    val h = size.height.toFloat()
+                                    val count = candles.size.coerceAtLeast(1)
+                                    val rightMargin = 112f
+                                    val chartWidth = (w - rightMargin).coerceAtLeast(50f)
+                                    val slotWidth = chartWidth / count
+
+                                    val currentPos = change.position
+                                    val startPos = touchStartPos ?: currentPos
+
+                                    val totalDx = currentPos.x - startPos.x
+                                    val totalDy = currentPos.y - startPos.y
+
+                                    val idxShift = totalDx / slotWidth
+                                    val priceShift = -(totalDy / h) * equityRange
+
+                                    if (activeDragMode == "HORIZONTAL") {
+                                        val line = horizontalLines.find { it.id == dragId }
+                                        if (line != null && onUpdateHorizontalLine != null) {
+                                            val newPrice = (initialHLinePrice + priceShift).coerceIn(minEquity, maxEquity)
+                                            onUpdateHorizontalLine(line.copy(price = newPrice))
+                                        }
+                                    } else {
+                                        val tLine = trendlines.find { it.id == dragId }
+                                        if (tLine != null && onUpdateTrendline != null) {
+                                            when (activeDragMode) {
+                                                "START" -> {
+                                                    val newStartIdx = (initialStartIdx + idxShift).coerceIn(0f, (count - 1).toFloat())
+                                                    val newStartPrice = (initialStartPrice + priceShift).coerceIn(minEquity, maxEquity)
+                                                    onUpdateTrendline(tLine.copy(startCandleIndex = newStartIdx, startPrice = newStartPrice))
+                                                }
+                                                "END" -> {
+                                                    val newEndIdx = (initialEndIdx + idxShift).coerceIn(0f, (count - 1).toFloat())
+                                                    val newEndPrice = (initialEndPrice + priceShift).coerceIn(minEquity, maxEquity)
+                                                    onUpdateTrendline(tLine.copy(endCandleIndex = newEndIdx, endPrice = newEndPrice))
+                                                }
+                                                "TRENDLINE_BODY" -> {
+                                                    val newStartIdx = (initialStartIdx + idxShift).coerceIn(0f, (count - 1).toFloat())
+                                                    val newEndIdx = (initialEndIdx + idxShift).coerceIn(0f, (count - 1).toFloat())
+                                                    val newStartPrice = (initialStartPrice + priceShift).coerceIn(minEquity, maxEquity)
+                                                    val newEndPrice = (initialEndPrice + priceShift).coerceIn(minEquity, maxEquity)
+
+                                                    onUpdateTrendline(tLine.copy(
+                                                        startCandleIndex = newStartIdx,
+                                                        startPrice = newStartPrice,
+                                                        endCandleIndex = newEndIdx,
+                                                        endPrice = newEndPrice
+                                                    ))
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                                onDragEnd = {
+                                    activeDragId = null
+                                    activeDragMode = null
+                                    touchStartPos = null
+                                },
+                                onDragCancel = {
+                                    activeDragId = null
+                                    activeDragMode = null
+                                    touchStartPos = null
+                                }
+                            )
+                        }
+                        .pointerInput(candles, zoomLevelX, zoomLevelY, activeToolMode, horizontalLines, trendlines) {
+                            detectTapGestures { offset ->
+                                val w = size.width
+                                val h = size.height
+                                val count = candles.size
+                                val rightMargin = 112f
+                                val chartWidth = (w - rightMargin).coerceAtLeast(50f)
+                                val slotWidth = chartWidth / count
+                                val clickedIndex = (offset.x / slotWidth).coerceIn(0f, (count - 1).toFloat())
+                                val clickedPrice = maxEquity - (offset.y / h) * equityRange
+
+                                val tappedHLine = horizontalLines.find { line ->
+                                    val yLine = h * (1f - ((line.price - minEquity) / equityRange).toFloat())
+                                    kotlin.math.abs(offset.y - yLine) < 36f
+                                }
+
+                                val tappedTLine = trendlines.find { tLine ->
+                                    val x1 = (tLine.startCandleIndex + 0.5f) * slotWidth
+                                    val y1 = h * (1f - ((tLine.startPrice - minEquity) / equityRange).toFloat())
+                                    val x2 = (tLine.endCandleIndex + 0.5f) * slotWidth
+                                    val y2 = h * (1f - ((tLine.endPrice - minEquity) / equityRange).toFloat())
+                                    val dSeg = distanceToSegment(offset.x, offset.y, x1, y1, x2, y2)
+                                    dSeg < 36f || kotlin.math.hypot(offset.x - x1, offset.y - y1) < 48f || kotlin.math.hypot(offset.x - x2, offset.y - y2) < 48f
+                                }
+
+                                if (tappedHLine != null) {
+                                    onSelectObject?.invoke(tappedHLine.id)
+                                } else if (tappedTLine != null) {
+                                    onSelectObject?.invoke(tappedTLine.id)
+                                } else if (activeToolMode == "HORIZONTAL" && onAddHorizontalLine != null) {
+                                    onAddHorizontalLine(clickedPrice)
+                                } else if (activeToolMode == "TRENDLINE" && onAddTrendlinePoint != null) {
+                                    onAddTrendlinePoint(clickedIndex, clickedPrice)
+                                } else {
+                                    onSelectObject?.invoke(null)
+                                    val candleIdx = clickedIndex.toInt().coerceIn(0, candles.size - 1)
+                                    if (candleIdx in candles.indices) {
+                                        onCandleSelect(candles[candleIdx])
+                                    }
+                                }
+                            }
+                        }
+                ) {
+                    val w = size.width
+                    val h = size.height
+                    val count = candles.size
+                    
+                    val rightMargin = 112f
+                    val chartWidth = (w - rightMargin).coerceAtLeast(50f)
+                    val slotWidth = chartWidth / count
+                    val candleBodyWidth = (slotWidth * 0.55f).coerceIn(6f, 36f)
+
+                    // Grid Lines
+                    val gridSteps = 4
+                    val dashEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(4f, 4f), 0f)
+                    for (i in 0..gridSteps) {
+                        val ratio = i / gridSteps.toFloat()
+                        val y = h * (1f - ratio)
+
+                        drawLine(
+                            color = Color(0xFF1E293B),
+                            start = androidx.compose.ui.geometry.Offset(0f, y),
+                            end = androidx.compose.ui.geometry.Offset(w, y),
+                            pathEffect = dashEffect,
+                            strokeWidth = 1f
+                        )
+                    }
+
+                    // Draw Candlesticks
+                    candles.forEachIndexed { index, candle ->
+                        val cx = (index + 0.5f) * slotWidth
+                        val isSelected = selectedCandle?.id == candle.id
+
+                        val openVal = candle.openBalance * cambio
+                        val closeVal = candle.closeBalance * cambio
+                        val highVal = candle.highBalance * cambio
+                        val lowVal = candle.lowBalance * cambio
+
+                        val yOpen = h * (1f - ((openVal - minEquity) / equityRange).toFloat())
+                        val yClose = h * (1f - ((closeVal - minEquity) / equityRange).toFloat())
+                        val yHigh = h * (1f - ((highVal - minEquity) / equityRange).toFloat())
+                        val yLow = h * (1f - ((lowVal - minEquity) / equityRange).toFloat())
+
+                        val color = if (candle.isBullish) Color(0xFF10B981) else Color(0xFFEF4444)
+
+                        if (isSelected) {
+                            drawRect(
+                                color = Color(0xFF38BDF8).copy(alpha = 0.15f),
+                                topLeft = androidx.compose.ui.geometry.Offset(cx - (slotWidth / 2f), 0f),
+                                size = androidx.compose.ui.geometry.Size(slotWidth, h)
+                            )
+                        }
+
+                        // Wick Line
+                        drawLine(
+                            color = color,
+                            start = androidx.compose.ui.geometry.Offset(cx, yHigh),
+                            end = androidx.compose.ui.geometry.Offset(cx, yLow),
+                            strokeWidth = if (isSelected) 3.5f else 2f
+                        )
+
+                        // Body Rect
+                        val topY = kotlin.math.min(yOpen, yClose)
+                        val botY = kotlin.math.max(yOpen, yClose)
+                        val bodyH = kotlin.math.max(botY - topY, 4f)
+
+                        drawRect(
+                            color = color,
+                            topLeft = androidx.compose.ui.geometry.Offset(cx - (candleBodyWidth / 2f), topY),
+                            size = androidx.compose.ui.geometry.Size(candleBodyWidth, bodyH)
+                        )
+
+                        // Deposit Badge (+)
+                        if (candle.deposits > 0.0) {
+                            drawCircle(
+                                color = Color(0xFF22D3EE),
+                                radius = 6f,
+                                center = androidx.compose.ui.geometry.Offset(cx, yHigh - 10f)
+                            )
+                        }
+
+                        // Withdrawal Badge (-)
+                        if (candle.withdrawals > 0.0) {
+                            drawCircle(
+                                color = Color(0xFFF59E0B),
+                                radius = 6f,
+                                center = androidx.compose.ui.geometry.Offset(cx, yLow + 10f)
+                            )
+                        }
+                    }
+
+                    // 1. Horizontal Lines (Analysis Tool)
+                    horizontalLines.forEach { line ->
+                        val yLine = h * (1f - ((line.price - minEquity) / equityRange).toFloat())
+                        if (yLine in 0f..h) {
+                            val isObjSelected = line.id == selectedObjectId
+                            val lineDashEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(10f, 6f), 0f)
+
+                            if (isObjSelected) {
+                                drawLine(
+                                    color = Color(0xFFF59E0B),
+                                    start = androidx.compose.ui.geometry.Offset(0f, yLine),
+                                    end = androidx.compose.ui.geometry.Offset(w, yLine),
+                                    strokeWidth = 6f
+                                )
+                                drawCircle(color = Color(0xFFF59E0B), radius = 8f, center = androidx.compose.ui.geometry.Offset(16f, yLine))
+                                drawCircle(color = Color.White, radius = 5f, center = androidx.compose.ui.geometry.Offset(16f, yLine))
+                            }
+
+                            drawLine(
+                                color = if (isObjSelected) Color(0xFFFBBF24) else line.color,
+                                start = androidx.compose.ui.geometry.Offset(0f, yLine),
+                                end = androidx.compose.ui.geometry.Offset(w, yLine),
+                                pathEffect = if (isObjSelected) null else lineDashEffect,
+                                strokeWidth = if (isObjSelected) 3.5f else 2.5f
+                            )
+                        }
+                    }
+
+                    // 2. Trendlines (Analysis Tool)
+                    trendlines.forEach { tLine ->
+                        val x1 = (tLine.startCandleIndex + 0.5f) * slotWidth
+                        val y1 = h * (1f - ((tLine.startPrice - minEquity) / equityRange).toFloat())
+                        val x2 = (tLine.endCandleIndex + 0.5f) * slotWidth
+                        val y2 = h * (1f - ((tLine.endPrice - minEquity) / equityRange).toFloat())
+
+                        val isObjSelected = tLine.id == selectedObjectId
+
+                        if (isObjSelected) {
+                            drawLine(
+                                color = Color(0xFFF59E0B),
+                                start = androidx.compose.ui.geometry.Offset(x1, y1),
+                                end = androidx.compose.ui.geometry.Offset(x2, y2),
+                                strokeWidth = 8f
+                            )
+                            drawCircle(color = Color(0xFFF59E0B), radius = 10f, center = androidx.compose.ui.geometry.Offset(x1, y1))
+                            drawCircle(color = Color.White, radius = 6f, center = androidx.compose.ui.geometry.Offset(x1, y1))
+                            drawCircle(color = Color(0xFFF59E0B), radius = 10f, center = androidx.compose.ui.geometry.Offset(x2, y2))
+                            drawCircle(color = Color.White, radius = 6f, center = androidx.compose.ui.geometry.Offset(x2, y2))
+                        }
+
+                        drawLine(
+                            color = if (isObjSelected) Color(0xFFFBBF24) else tLine.color,
+                            start = androidx.compose.ui.geometry.Offset(x1, y1),
+                            end = androidx.compose.ui.geometry.Offset(x2, y2),
+                            strokeWidth = if (isObjSelected) 4.5f else 3.5f
+                        )
+                        drawCircle(color = if (isObjSelected) Color(0xFFFBBF24) else tLine.color, radius = 6f, center = androidx.compose.ui.geometry.Offset(x1, y1))
+                        drawCircle(color = if (isObjSelected) Color(0xFFFBBF24) else tLine.color, radius = 6f, center = androidx.compose.ui.geometry.Offset(x2, y2))
+                    }
+
+                    // Current Price / Equity Horizontal Line
+                    val lastCandle = candles.lastOrNull()
+                    if (lastCandle != null) {
+                        val currentPrice = lastCandle.closeBalance * cambio
+                        val yCurrent = h * (1f - ((currentPrice - minEquity) / equityRange).toFloat()).coerceIn(0f, 1f)
+                        val currentDashEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(8f, 5f), 0f)
+
+                        // Current Price Line
+                        drawLine(
+                            color = Color(0xFF38BDF8),
+                            start = androidx.compose.ui.geometry.Offset(0f, yCurrent),
+                            end = androidx.compose.ui.geometry.Offset(w, yCurrent),
+                            pathEffect = currentDashEffect,
+                            strokeWidth = 2f
+                        )
+
+                        // Current Price Badge on Right Edge
+                        val priceText = "$currencySymbol ${String.format("%.2f", currentPrice)}"
+                        val badgeWidth = 100f
+                        val badgeHeight = 24f
+                        val badgeLeft = (w - badgeWidth).coerceAtLeast(0f)
+                        val badgeTop = (yCurrent - (badgeHeight / 2f)).coerceIn(0f, h - badgeHeight)
+
+                        drawRoundRect(
+                            color = Color(0xFF0F172A),
+                            topLeft = androidx.compose.ui.geometry.Offset(badgeLeft, badgeTop),
+                            size = androidx.compose.ui.geometry.Size(badgeWidth, badgeHeight),
+                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(6f, 6f)
+                        )
+                        drawRoundRect(
+                            color = Color(0xFF38BDF8),
+                            topLeft = androidx.compose.ui.geometry.Offset(badgeLeft, badgeTop),
+                            size = androidx.compose.ui.geometry.Size(badgeWidth, badgeHeight),
+                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(6f, 6f),
+                            style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.2f)
+                        )
+
+                        drawContext.canvas.nativeCanvas.apply {
+                            val paint = android.graphics.Paint().apply {
+                                color = android.graphics.Color.parseColor("#38BDF8")
+                                textSize = 20f
+                                isFakeBoldText = true
+                                textAlign = android.graphics.Paint.Align.CENTER
+                                isAntiAlias = true
+                            }
+                            drawText(
+                                priceText,
+                                badgeLeft + (badgeWidth / 2f),
+                                badgeTop + (badgeHeight / 2f) + 6f,
+                                paint
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun Mql5NotificationsModalDialog(onDismiss: () -> Unit) {
+    val clipboardManager = androidx.compose.ui.platform.LocalClipboardManager.current
+    var copiedIndex by remember { mutableStateOf(-1) }
+    val notifications = com.example.data.EaNotificationEventsCatalog.ALL_NOTIFICATIONS
+
+    androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .fillMaxHeight(0.85f)
+                .padding(vertical = 12.dp),
+            color = Color(0xFF0F172A),
+            shape = RoundedCornerShape(20.dp),
+            border = BorderStroke(1.dp, Color(0xFF38BDF8).copy(alpha = 0.5f))
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(imageVector = Icons.Default.NotificationsActive, contentDescription = null, tint = Color(0xFF38BDF8))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column {
+                            Text("CATÁLOGO DE NOTIFICAÇÕES MQL5", style = MaterialTheme.typography.titleSmall.copy(color = Color.White, fontWeight = FontWeight.Bold))
+                            Text("Eventos de Trava, Gerenciamento & Equador", style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8), fontSize = 10.sp))
+                        }
+                    }
+                    IconButton(onClick = onDismiss) {
+                        Icon(imageVector = Icons.Default.Close, contentDescription = null, tint = Color.White)
+                    }
+                }
+
+                androidx.compose.foundation.lazy.LazyColumn(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    itemsIndexed(notifications) { index, item ->
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(1.dp, if (item.isSell) Color(0xFFEF4444).copy(alpha = 0.4f) else Color(0xFF38BDF8).copy(alpha = 0.4f)),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = item.title,
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            color = if (item.isSell) Color(0xFFEF4444) else Color(0xFF38BDF8),
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    )
+                                    Surface(
+                                        color = Color(0xFF0F172A),
+                                        shape = RoundedCornerShape(6.dp),
+                                        border = BorderStroke(1.dp, Color(0xFF334155))
+                                    ) {
+                                        Text(
+                                            text = item.category,
+                                            style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFFCBD5E1), fontSize = 9.sp),
+                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                        )
+                                    }
+                                }
+
+                                Text(
+                                    text = item.description,
+                                    style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8), fontSize = 11.sp)
+                                )
+
+                                Surface(
+                                    color = Color(0xFF020617),
+                                    shape = RoundedCornerShape(8.dp),
+                                    border = BorderStroke(1.dp, Color(0xFF0284C7).copy(alpha = 0.3f)),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text(
+                                        text = item.mql5CodeSnippet,
+                                        style = MaterialTheme.typography.bodySmall.copy(
+                                            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                                            color = Color(0xFF38BDF8),
+                                            fontSize = 9.5.sp
+                                        ),
+                                        modifier = Modifier.padding(8.dp)
+                                    )
+                                }
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.End
+                                ) {
+                                    Button(
+                                        onClick = {
+                                            clipboardManager.setText(androidx.compose.ui.text.AnnotatedString(item.mql5CodeSnippet))
+                                            copiedIndex = index
+                                        },
+                                        colors = ButtonDefaults.buttonColors(containerColor = if (copiedIndex == index) Color(0xFF10B981) else Color(0xFF0284C7)),
+                                        shape = RoundedCornerShape(8.dp),
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = if (copiedIndex == index) Icons.Default.Check else Icons.Default.ContentCopy,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(14.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text(
+                                            text = if (copiedIndex == index) "COPIADO!" else "COPIAR MQL5",
+                                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Button(
+                    onClick = onDismiss,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF334155)),
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Text("FECHAR", style = MaterialTheme.typography.labelMedium.copy(color = Color.White, fontWeight = FontWeight.Bold))
+                }
+            }
+        }
+    }
+}
+
+
+
 

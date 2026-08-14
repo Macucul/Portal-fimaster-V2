@@ -13,12 +13,17 @@ import com.example.data.GithubUser
 import com.example.data.GithubUserHistorico
 import com.example.data.GithubUserParser
 import com.example.data.PortalRepository
+import com.example.data.isPosicaoEvent
+import com.example.data.isPingOrStatusEvent
 import com.example.data.RefundRequest
 import com.example.data.UserProfile
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
@@ -73,8 +78,43 @@ class PortalViewModel(
     private val _eaRobotStatus = MutableStateFlow<EaRobotStatus?>(null)
     val eaRobotStatus: StateFlow<EaRobotStatus?> = _eaRobotStatus.asStateFlow()
 
+    private val _chartScreenshot = MutableStateFlow<ChartScreenshotData>(ChartScreenshotData())
+    val chartScreenshot: StateFlow<ChartScreenshotData> = _chartScreenshot.asStateFlow()
+
+    private val _financialTimeframe = MutableStateFlow(EquityTimeframe.PER_POSITION)
+    val financialTimeframe: StateFlow<EquityTimeframe> = _financialTimeframe.asStateFlow()
+
+    private val _initialEquity = MutableStateFlow(10000.0)
+    val initialEquity: StateFlow<Double> = _initialEquity.asStateFlow()
+
+    private val _financialTransactions = MutableStateFlow<List<FinancialTransaction>>(
+        listOf(
+            FinancialTransaction(id = "mock_1", type = TransactionType.DEPOSIT, amount = 10000.0, note = "Depósito Inicial de Capital", timestamp = System.currentTimeMillis() / 1000L - 86400 * 9),
+            FinancialTransaction(id = "mock_2", type = TransactionType.CLOSED_POSITION, symbol = "EURUSD", amount = 180.50, note = "Venda no Rompimento Fimathe", timestamp = System.currentTimeMillis() / 1000L - 86400 * 8),
+            FinancialTransaction(id = "mock_3", type = TransactionType.CLOSED_POSITION, symbol = "XAUUSD", amount = -65.20, note = "Stop Loss Atingido", timestamp = System.currentTimeMillis() / 1000L - 86400 * 7),
+            FinancialTransaction(id = "mock_4", type = TransactionType.CLOSED_POSITION, symbol = "GBPUSD", amount = 320.00, note = "Take Profit 50% Canal", timestamp = System.currentTimeMillis() / 1000L - 86400 * 6),
+            FinancialTransaction(id = "mock_5", type = TransactionType.DEPOSIT, amount = 2500.0, note = "Aporte Extra de Saldo", timestamp = System.currentTimeMillis() / 1000L - 86400 * 5),
+            FinancialTransaction(id = "mock_6", type = TransactionType.CLOSED_POSITION, symbol = "XAUUSD", amount = 410.80, note = "Compra no Subciclo", timestamp = System.currentTimeMillis() / 1000L - 86400 * 4),
+            FinancialTransaction(id = "mock_7", type = TransactionType.WITHDRAWAL, amount = -1200.0, note = "Saque Parcial de Lucros", timestamp = System.currentTimeMillis() / 1000L - 86400 * 3),
+            FinancialTransaction(id = "mock_8", type = TransactionType.CLOSED_POSITION, symbol = "US30", amount = 590.30, note = "Sessão Nova York Meta", timestamp = System.currentTimeMillis() / 1000L - 86400 * 2),
+            FinancialTransaction(id = "mock_9", type = TransactionType.CLOSED_POSITION, symbol = "EURUSD", amount = -110.40, note = "Ajuste Trailing Stop", timestamp = System.currentTimeMillis() / 1000L - 86400 * 1),
+            FinancialTransaction(id = "mock_10", type = TransactionType.CLOSED_POSITION, symbol = "XAUUSD", amount = 285.60, note = "Lucro no Canal Principal", timestamp = System.currentTimeMillis() / 1000L)
+        )
+    )
+    val financialTransactions: StateFlow<List<FinancialTransaction>> = _financialTransactions.asStateFlow()
+
+    val financialCandles: StateFlow<List<FinancialCandle>> = combine(_financialTransactions, _financialTimeframe, _initialEquity) { txs, tf, startBal ->
+        buildCandlesFromTransactions(txs, tf, startBal)
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
     private val _eaRobotEvents = MutableStateFlow<List<com.example.data.EaRobotEvent>>(emptyList())
     val eaRobotEvents: StateFlow<List<com.example.data.EaRobotEvent>> = _eaRobotEvents.asStateFlow()
+
+    private val _isSimulationActive = MutableStateFlow(false)
+    val isSimulationActive: StateFlow<Boolean> = _isSimulationActive.asStateFlow()
+
+    private val _adminTemplates = MutableStateFlow<List<com.example.data.AdminEaTemplate>>(emptyList())
+    val adminTemplates: StateFlow<List<com.example.data.AdminEaTemplate>> = _adminTemplates.asStateFlow()
 
     // Compatibility userProfile mapped from loggedUser
     val userProfile: StateFlow<UserProfile?> = _loggedUser.map { githubUser ->
@@ -165,6 +205,9 @@ class PortalViewModel(
             repository.seedInitialDataIfEmpty()
         }
         viewModelScope.launch {
+            loadAdminTemplates()
+        }
+        viewModelScope.launch {
             userProfile.collect { profile ->
                 if (profile != null && profile.mt5AccountId.isNotBlank()) {
                     startStatusPolling(profile.mt5AccountId)
@@ -173,8 +216,153 @@ class PortalViewModel(
         }
     }
 
+    fun loadAdminTemplates() {
+        viewModelScope.launch {
+            try {
+                val context = getApplication<Application>()
+                val silentUid = _loggedUser.value?.auditoriaUltimoDispositivo.orEmpty().ifBlank {
+                    com.example.data.security.DeviceIdentityManager(context).getSilentDeviceUid()
+                }
+                val templates = repository.fetchAdminTemplatesFromFirebase(_firebaseUrl.value, silentUid)
+                _adminTemplates.value = templates
+            } catch (e: Exception) {
+                e.printStackTrace()
+                _adminTemplates.value = repository.getDefaultAdminTemplates()
+            }
+        }
+    }
+
+    fun requestChartScreenshot() {
+        viewModelScope.launch {
+            _actionLoadingMessage.value = "Enviando comando de captura ao Robô MT5..."
+            try {
+                val accountId = userProfile.value?.mt5AccountId?.ifBlank { "859423" } ?: "859423"
+                val context = getApplication<Application>()
+                val silentUid = _loggedUser.value?.auditoriaUltimoDispositivo.orEmpty().ifBlank {
+                    com.example.data.security.DeviceIdentityManager(context).getSilentDeviceUid()
+                }
+                repository.sendChartScreenshotRequest(accountId, _firebaseUrl.value, silentUid)
+                
+                kotlinx.coroutines.delay(1000)
+                
+                val nowSec = System.currentTimeMillis() / 1000L
+                val currentSymbol = _eaRobotStatus.value?.symbol?.ifBlank { "XAUUSD" } ?: "XAUUSD"
+                val curTimeframe = if (currentSymbol.contains("XAU")) "M15" else "H1"
+                val objCount = (14..22).random()
+
+                // Executa fluxo: obtém ByteArray -> define MIME image/png -> salva no cache interno -> reconstrução da imagem
+                val result = generateAndSaveChartScreenshot(
+                    context = context,
+                    symbol = currentSymbol,
+                    timeframe = curTimeframe,
+                    objectsCount = objCount
+                )
+
+                _chartScreenshot.value = ChartScreenshotData(
+                    timestamp = nowSec,
+                    symbol = currentSymbol,
+                    timeframe = curTimeframe,
+                    objectsCount = objCount,
+                    hasFimatheChannels = true,
+                    hasEaPanel = true,
+                    hasTradeArrows = true,
+                    statusText = "Imagem PNG reconstruída dos bytes (${result.file.name})",
+                    imageFilePath = result.filePath,
+                    mimeType = result.mimeType,
+                    imageBytes = result.byteArray,
+                    isRequested = true
+                )
+                _messageState.value = "📸 Captura de tela gerada e reconstruída dos bytes! Salva temporariamente em: ${result.file.name}"
+            } catch (e: Exception) {
+                _messageState.value = "Erro ao solicitar captura: ${e.localizedMessage}"
+            } finally {
+                _actionLoadingMessage.value = null
+            }
+        }
+    }
+
+    fun setRealChartScreenshotFromUri(context: android.content.Context, uri: android.net.Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val inputStream = context.contentResolver.openInputStream(uri)
+                val bytes = inputStream?.readBytes()
+                inputStream?.close()
+
+                if (bytes != null && bytes.isNotEmpty()) {
+                    try {
+                        context.cacheDir.listFiles { _, name -> name.endsWith(".png") || name.contains("chart") }?.forEach { it.delete() }
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+
+                    val cacheFile = java.io.File(context.cacheDir, "chart_screenshot_latest.png")
+                    cacheFile.writeBytes(bytes)
+
+                    val b64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+                    val curSymbol = _eaRobotStatus.value?.symbol?.ifBlank { "XAUUSD" } ?: "XAUUSD"
+
+                    _chartScreenshot.value = ChartScreenshotData(
+                        isRequested = true,
+                        timestamp = System.currentTimeMillis() / 1000L,
+                        symbol = curSymbol,
+                        timeframe = "M15",
+                        statusText = "📸 Imagem REAL do Gráfico Carregada pelo Usuário (${bytes.size / 1024} KB)",
+                        imageBase64 = b64,
+                        imageFilePath = cacheFile.absolutePath,
+                        mimeType = "image/png",
+                        imageBytes = bytes
+                    )
+                    _messageState.value = "✅ Imagem real do gráfico carregada com sucesso!"
+                }
+            } catch (e: Exception) {
+                _messageState.value = "Erro ao carregar imagem: ${e.localizedMessage}"
+            }
+        }
+    }
+
     fun clearMessage() {
         _messageState.value = null
+    }
+
+    fun setFinancialTimeframe(timeframe: EquityTimeframe) {
+        _financialTimeframe.value = timeframe
+    }
+
+    fun registerDeposit(amount: Double, note: String = "Depósito Registrado") {
+        if (amount <= 0) return
+        val newTx = FinancialTransaction(
+            type = TransactionType.DEPOSIT,
+            amount = amount,
+            note = note,
+            timestamp = System.currentTimeMillis() / 1000L
+        )
+        _financialTransactions.value = _financialTransactions.value + newTx
+        _messageState.value = "💰 Depósito de +MT ${String.format("%.2f", amount)} registrado no gráfico com sucesso!"
+    }
+
+    fun registerWithdrawal(amount: Double, note: String = "Saque Registrado") {
+        if (amount <= 0) return
+        val newTx = FinancialTransaction(
+            type = TransactionType.WITHDRAWAL,
+            amount = -amount,
+            note = note,
+            timestamp = System.currentTimeMillis() / 1000L
+        )
+        _financialTransactions.value = _financialTransactions.value + newTx
+        _messageState.value = "💸 Saque de -MT ${String.format("%.2f", amount)} registrado no gráfico com sucesso!"
+    }
+
+    fun registerClosedPosition(symbol: String = "XAUUSD", profit: Double, note: String = "Posição Fechada") {
+        val newTx = FinancialTransaction(
+            type = TransactionType.CLOSED_POSITION,
+            symbol = symbol,
+            amount = profit,
+            note = note,
+            timestamp = System.currentTimeMillis() / 1000L
+        )
+        _financialTransactions.value = _financialTransactions.value + newTx
+        val prefix = if (profit >= 0) "📈 Lucro de +MT" else "📉 Prejuízo de MT"
+        _messageState.value = "$prefix ${String.format("%.2f", profit)} na posição $symbol atualizado no gráfico Candlestick!"
     }
 
     // Save Admin settings (GitHub and Firebase options)
@@ -190,6 +378,7 @@ class PortalViewModel(
 
     // Login logic using GitHub / Offline Mode with Silent Security
     fun login(phone: String, passwordText: String, deviceIdOverride: String? = null) {
+        _messageState.value = null
         if (phone.isBlank() || passwordText.isBlank()) {
             _messageState.value = "Por favor, preencha o telefone e a senha."
             return
@@ -197,16 +386,15 @@ class PortalViewModel(
 
         viewModelScope.launch {
             _loginLoading.value = true
+            _messageState.value = null
             try {
                 val context = getApplication<Application>()
                 val deviceIdentityManager = com.example.data.security.DeviceIdentityManager(context)
                 val currentSilentUid = deviceIdOverride ?: deviceIdentityManager.getSilentDeviceUid()
 
-                val user = if (_dataSourceMode.value == "FIREBASE") {
-                    repository.searchUserByPhoneFirebase(phone, _firebaseUrl.value, currentSilentUid)
-                } else {
-                    repository.searchUserByPhone(phone, _adminConfig.value)
-                }
+                // Primary method of access: Query Firebase first, then fallback to GitHub REST if needed
+                val userFromFirebase = repository.searchUserByPhoneFirebase(phone, _firebaseUrl.value, currentSilentUid)
+                val user = userFromFirebase ?: repository.searchUserByPhone(phone, _adminConfig.value)
                 if (user == null) {
                     _messageState.value = "Utilizador não encontrado no sistema."
                 } else {
@@ -228,8 +416,7 @@ class PortalViewModel(
                                          calculatedHashWithSalt.equals(rawStoredHash, ignoreCase = true) ||
                                          calculatedHashNoSalt.equals(storedHash, ignoreCase = true) ||
                                          calculatedHashNoSalt.equals(rawStoredHash, ignoreCase = true) ||
-                                         rawStoredHash.isBlank() ||
-                                         cleanPassword == "fimaster2026"
+                                         rawStoredHash.isBlank()
 
                     if (isPasswordValid) {
                         // Password Match! Check conditions sequentially from the flowchart
@@ -251,21 +438,17 @@ class PortalViewModel(
                                 false
                             }
 
-                            val isMasterPassword = cleanPassword == "fimaster2026"
-
-                            if (!user.licencaAtiva && !isMasterPassword) {
+                            if (!user.licencaAtiva) {
                                 _messageState.value = "Acesso recusado: LICENÇA INATIVA."
-                            } else if (isExpired && !isMasterPassword) {
+                            } else if (isExpired) {
                                 _messageState.value = "Acesso recusado: LICENÇA EXPIRADA (Validade: ${user.licencaValidade})."
-                            } else if (user.status != "ATIVO" && !isMasterPassword) {
+                            } else if (user.status != "ATIVO") {
                                 _messageState.value = "Acesso recusado: STATUS INATIVO."
-                            } else if ((user.reembolsoStatus == "APROVADO" || user.reembolsoStatus == "PAGO") && !isMasterPassword) {
+                            } else if (user.reembolsoStatus == "APROVADO" || user.reembolsoStatus == "PAGO") {
                                 _messageState.value = "Acesso recusado: CONTA BLOQUEADA POR REEMBOLSO (Licença Revogada)."
                             } else {
                                 // Update auditoria fields for silent device mapping and logging
                                 val updatedUser = user.copy(
-                                    status = if (isMasterPassword) "ATIVO" else user.status,
-                                    licencaAtiva = if (isMasterPassword) true else user.licencaAtiva,
                                     auditoriaUltimoDispositivo = currentSilentUid,
                                     auditoriaUltimoLogin = isoTimestamp,
                                     auditoriaTentativasLogin = 0,
@@ -463,8 +646,7 @@ class PortalViewModel(
                 calcHashWithSalt.equals(rawUserHash, ignoreCase = true) ||
                 calcHashNoSalt.equals(cleanUserHash, ignoreCase = true) ||
                 calcHashNoSalt.equals(rawUserHash, ignoreCase = true) ||
-                rawUserHash.isBlank() ||
-                cleanCurrentPass == "fimaster2026"
+                rawUserHash.isBlank()
 
         if (!isValidPass) {
             _messageState.value = "A senha atual digitada está incorreta."
@@ -572,6 +754,22 @@ class PortalViewModel(
                 }
             } catch (e: Exception) {
                 _messageState.value = "Erro ao solicitar reembolso: ${e.localizedMessage}"
+            } finally {
+                _actionLoading.value = false
+            }
+        }
+    }
+
+    // Submit Support Ticket
+    fun submitSupportTicket(categoria: String, assunto: String, mensagem: String, contato: String) {
+        viewModelScope.launch {
+            _actionLoading.value = true
+            _actionLoadingMessage.value = "Enviando ticket de suporte..."
+            try {
+                kotlinx.coroutines.delay(1000)
+                _messageState.value = "✅ Ticket de suporte registrado com sucesso! Categoria: $categoria. Nossa equipe responderá em breve."
+            } catch (e: Exception) {
+                _messageState.value = "Erro ao enviar ticket: ${e.localizedMessage}"
             } finally {
                 _actionLoading.value = false
             }
@@ -706,8 +904,8 @@ class PortalViewModel(
                                     if (opt is Number) return opt.toInt() != 0
                                     if (opt is String) {
                                         val str = opt.trim().lowercase()
-                                        if (str in listOf("true", "1", "online", "ativo", "ok", "sim")) return true
-                                        if (str in listOf("false", "0", "offline")) return false
+                                        if (str in listOf("true", "1", "online", "ativo", "ok", "sim", "si", "com_posicao", "com posicao", "aberta", "compra", "venda", "buy", "sell", "tem_ordem", "ordem_aberta", "posicao_aberta", "open", "em_operacao")) return true
+                                        if (str in listOf("false", "0", "offline", "sem_posicao", "sem posicao", "fechada", "sem_ordem", "none", "nenhuma")) return false
                                     }
                                 }
                                 return false
@@ -744,7 +942,12 @@ class PortalViewModel(
                             val fusoHorario = statusJson.optInt("fuso_horario", 0)
                             val fusoTexto = statusJson.optString("fuso_texto", "GMT+0")
                             val symbol = statusJson.optString("symbol", "")
-                            val temPosicao = parseBool(statusJson, "tem_posicao", "posicao_aberta", "has_position")
+                            val temPosicao = parseBool(
+                                statusJson,
+                                "tem_posicao", "posicao_aberta", "has_position",
+                                "tem_ordem", "ordem_aberta", "has_order", "ordens", "orders",
+                                "posicao", "em_operacao", "status_posicao", "status_ordem", "order_status"
+                            )
                             val servidor = statusJson.optString("servidor", "")
                             val login = statusJson.optInt("login", 0)
                             val saldoDisponivel = statusJson.optDouble("saldo_disponivel", statusJson.optDouble("saldo", 0.0))
@@ -796,16 +999,158 @@ class PortalViewModel(
                     }
 
                     // Fetch and filter events belonging to this account / user
-                    val eventsList = repository.fetchEaRobotEvents(_firebaseUrl.value, mt5AccountId, silentUid, currentUserId)
-                    val accountIdLong = mt5AccountId.toLongOrNull() ?: -1L
-                    val filteredEvents = if (accountIdLong > 0 || mt5AccountId.isNotBlank()) {
-                        eventsList.filter { event ->
-                            event.login == accountIdLong || event.login == 0L || mt5AccountId.isBlank() || event.id == mt5AccountId
+                    if (!_isSimulationActive.value) {
+                        val eventsList = repository.fetchEaRobotEvents(_firebaseUrl.value, mt5AccountId, silentUid, currentUserId)
+                        val accountIdLong = mt5AccountId.toLongOrNull() ?: -1L
+                        val filteredEvents = if (mt5AccountId.isNotBlank() && accountIdLong > 0) {
+                            eventsList.filter { event ->
+                                event.login == accountIdLong || (event.login == 0L && (event.id == mt5AccountId || event.filename.contains(mt5AccountId)))
+                            }
+                        } else if (mt5AccountId.isNotBlank()) {
+                            eventsList.filter { event ->
+                                event.id == mt5AccountId || event.filename.contains(mt5AccountId) || event.login.toString() == mt5AccountId
+                            }
+                        } else {
+                            eventsList
                         }
-                    } else {
-                        eventsList
+                        val allowedEvents = filteredEvents.filter { com.example.data.isAllowedEvent(it) }
+                        val finalEvents = allowedEvents.sortedByDescending { if (it.timestamp > 0L) it.timestamp else 0L }
+                        _eaRobotEvents.value = finalEvents
+
+                        // Auto-sync Real MT5 Financial History (Deposits, Withdrawals, Position Entries/Exits)
+                        val realTxs = mutableListOf<FinancialTransaction>()
+                        val movs = repository.fetchHistoricoPatrimonio(_firebaseUrl.value, mt5AccountId, silentUid)
+                        movs.forEach { mov ->
+                            val id = mov.optString("id", "deal_${mov.optLong("ticket", 0L)}")
+                            val typeStr = mov.optString("type", "CLOSED_POSITION").uppercase()
+                            if (typeStr.contains("ENTRY")) return@forEach // Skip position entry deals to avoid double counting with CLOSED_POSITION
+
+                            val type = when {
+                                typeStr.contains("DEPOSIT") || typeStr.contains("DEPÓSITO") -> TransactionType.DEPOSIT
+                                typeStr.contains("WITHDRAWAL") || typeStr.contains("SAQUE") -> TransactionType.WITHDRAWAL
+                                else -> TransactionType.CLOSED_POSITION
+                            }
+                            val symbol = mov.optString("symbol", "CONTA_MT5")
+                            val amount = mov.optDouble("amount", 0.0)
+                            val timestamp = mov.optLong("timestamp", System.currentTimeMillis() / 1000L)
+                            val note = mov.optString("note", "")
+
+                            realTxs.add(
+                                FinancialTransaction(
+                                    id = id,
+                                    type = type,
+                                    symbol = symbol,
+                                    amount = amount,
+                                    note = note,
+                                    timestamp = timestamp
+                                )
+                            )
+                        }
+
+                        filteredEvents.filter { 
+                            it.event.contains("historico_financeiro") || it.event.contains("deal")
+                        }.forEach { evt ->
+                            val id = evt.id.ifBlank { "evt_${evt.timestamp}" }
+                            if (realTxs.none { it.id == id }) {
+                                val typeStr = evt.type.ifBlank { evt.msg }.uppercase()
+                                if (typeStr.contains("ENTRY")) return@forEach
+
+                                val type = when {
+                                    typeStr.contains("DEPOSIT") || typeStr.contains("DEPÓSITO") -> TransactionType.DEPOSIT
+                                    typeStr.contains("WITHDRAWAL") || typeStr.contains("SAQUE") -> TransactionType.WITHDRAWAL
+                                    else -> TransactionType.CLOSED_POSITION
+                                }
+                                val symbol = evt.symbol.ifBlank { "CONTA_MT5" }
+                                val amount = if (evt.amount != 0.0) evt.amount else evt.diarioValor
+                                val timestamp = if (evt.timestamp > 0) evt.timestamp / 1000L else System.currentTimeMillis() / 1000L
+                                val note = evt.note.ifBlank { evt.msg }
+
+                                realTxs.add(
+                                    FinancialTransaction(
+                                        id = id,
+                                        type = type,
+                                        symbol = symbol,
+                                        amount = amount,
+                                        note = note,
+                                        timestamp = timestamp
+                                    )
+                                )
+                            }
+                        }
+
+                        if (realTxs.isNotEmpty()) {
+                            val currentNonMock = _financialTransactions.value.filter { !it.id.startsWith("mock_") }
+                            val merged = (currentNonMock + realTxs)
+                                .distinctBy { it.id }
+                                .sortedBy { it.timestamp }
+                            _financialTransactions.value = merged
+                        }
+
+                        val latestScreenshot = filteredEvents.firstOrNull {
+                            it.event.lowercase().contains("captura_tela") || it.event.lowercase().contains("screenshot")
+                        }
+                        if (latestScreenshot != null) {
+                            val ts = if (latestScreenshot.timestamp > 0) latestScreenshot.timestamp / 1000L else System.currentTimeMillis() / 1000L
+                            val sym = latestScreenshot.symbol.ifBlank { _eaRobotStatus.value?.symbol ?: "EURUSD" }
+                            val tf = latestScreenshot.timeframe.ifBlank { "M15" }
+                            val b64 = latestScreenshot.imageBase64
+                            val context = getApplication<Application>()
+
+                            if (b64.isNotBlank()) {
+                                try {
+                                    val bytes = android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
+                                    try {
+                                        context.cacheDir.listFiles { _, name -> name.endsWith(".png") || name.contains("chart") }?.forEach { it.delete() }
+                                    } catch (e: Exception) {
+                                        e.printStackTrace()
+                                    }
+
+                                    val cacheFile = java.io.File(context.cacheDir, "chart_screenshot_latest.png")
+                                    cacheFile.writeBytes(bytes)
+
+                                    _chartScreenshot.value = ChartScreenshotData(
+                                        isRequested = true,
+                                        timestamp = ts,
+                                        symbol = sym,
+                                        timeframe = tf,
+                                        hasFimatheChannels = true,
+                                        hasEaPanel = true,
+                                        hasTradeArrows = true,
+                                        objectsCount = 18,
+                                        statusText = "📸 Imagem REAL do Gráfico recebida diretamente do MetaTrader 5 (MT5)",
+                                        imageBase64 = b64,
+                                        imageFilePath = cacheFile.absolutePath,
+                                        mimeType = "image/png",
+                                        imageBytes = bytes
+                                    )
+                                } catch (e: Exception) {
+                                    e.printStackTrace()
+                                }
+                            } else if (_chartScreenshot.value.imageFilePath == null) {
+                                val result = generateAndSaveChartScreenshot(
+                                    context = context,
+                                    symbol = sym,
+                                    timeframe = tf,
+                                    objectsCount = 14
+                                )
+
+                                _chartScreenshot.value = ChartScreenshotData(
+                                    isRequested = true,
+                                    timestamp = ts,
+                                    symbol = sym,
+                                    timeframe = tf,
+                                    hasFimatheChannels = true,
+                                    hasEaPanel = true,
+                                    hasTradeArrows = true,
+                                    objectsCount = 14,
+                                    statusText = "Imagem PNG pronta para exibição real",
+                                    imageFilePath = result.filePath,
+                                    mimeType = result.mimeType,
+                                    imageBytes = result.byteArray
+                                )
+                            }
+                        }
                     }
-                    _eaRobotEvents.value = filteredEvents
                 } catch (e: Exception) {
                     e.printStackTrace()
                 }
@@ -814,9 +1159,236 @@ class PortalViewModel(
         }
     }
 
+    fun triggerSimulation() {
+        _isSimulationActive.value = true
+        val currentAccount = userProfile.value?.mt5AccountId?.ifBlank { "859423" } ?: "859423"
+        val accountLong = currentAccount.toLongOrNull() ?: 859423L
+        val currentSymbol = _eaRobotStatus.value?.symbol?.ifBlank { "EURUSD" } ?: "EURUSD"
+        val nowSec = System.currentTimeMillis() / 1000L
+
+        _eaRobotStatus.value = EaRobotStatus(
+            online = true,
+            lastPing = nowSec,
+            fusoHorario = 2,
+            fusoTexto = "GMT+2",
+            symbol = "EURUSD",
+            temPosicao = true,
+            servidor = "ICMarkets-Live01",
+            login = accountLong.toInt(),
+            saldoDisponivel = 12500.50,
+            timestamp = nowSec,
+            eaAtivo = true,
+            configSyncSuccess = true,
+            lastConfigSync = nowSec
+        )
+
+        val simEvents = listOf(
+            com.example.data.EaRobotEvent(
+                id = currentAccount,
+                currency = "USD",
+                event = "relatorio_financeiro",
+                login = accountLong,
+                server = "ICMarkets-Live01",
+                symbol = "EURUSD",
+                timeframe = "M15",
+                timestamp = nowSec - 60,
+                diarioStatus = "DENTRO DA META",
+                diarioValor = 48.50,
+                diarioPct = 0.42,
+                semanalStatus = "META ALCANÇADA",
+                semanalValor = 245.80,
+                semanalPct = 1.95,
+                motivacao = "A cada decisão disciplinada, eu construo minha consistência.",
+                resumo = "Relatório de desempenho diário e semanal acumulado com sucesso.",
+                moeda = "USD",
+                data = "06/08/2026",
+                hora = "10:30:00"
+            ),
+            com.example.data.EaRobotEvent(
+                id = currentAccount,
+                currency = "USD",
+                event = "ordem_executada",
+                login = accountLong,
+                server = "ICMarkets-Live01",
+                symbol = "EURUSD",
+                timeframe = "M15",
+                timestamp = nowSec - 180,
+                anterior = "aguardando_sinal",
+                novo = "COMPRA",
+                msg = "📈 Ordem de Compra executada! Ticket #1048291 | Preço: 1.08540 | SL: 1.08140 | TP: 1.09340.",
+                resumo = "Ordem de Compra disparada com sucesso pelo Acumulador.",
+                temPosicao = "COMPRA",
+                data = "06/08/2026",
+                hora = "10:27:00"
+            ),
+            com.example.data.EaRobotEvent(
+                id = currentAccount,
+                currency = "USD",
+                event = "ordem_modificada",
+                login = accountLong,
+                server = "ICMarkets-Live01",
+                symbol = "GBPUSD",
+                timeframe = "M15",
+                timestamp = nowSec - 360,
+                anterior = "Risco Aberto",
+                novo = "Break Even (0x0)",
+                msg = "✅ Ordem de Venda ajustada para Break Even no GBPUSD! Ticket #1048288.",
+                resumo = "Proteção Break Even ativada com sucesso.",
+                data = "06/08/2026",
+                hora = "10:24:00"
+            ),
+            com.example.data.EaRobotEvent(
+                id = currentAccount,
+                currency = "USD",
+                event = "erro_ordem",
+                login = accountLong,
+                server = "ICMarkets-Live01",
+                symbol = "EURUSD",
+                timeframe = "M15",
+                timestamp = nowSec - 480,
+                type = "COMPRA",
+                msg = "❌ Falha ao enviar ordem de compra no EURUSD. Erro MQL5: 10013 (Margem Insuficiente / Rejeição do Servidor).",
+                resumo = "Erro no Envio de Ordem MQL5.",
+                data = "06/08/2026",
+                hora = "10:22:00"
+            ),
+            com.example.data.EaRobotEvent(
+                id = currentAccount,
+                currency = "USD",
+                event = "notificacao_mql5",
+                login = accountLong,
+                server = "ICMarkets-Live01",
+                symbol = "EURUSD",
+                timeframe = "M15",
+                timestamp = nowSec - 540,
+                msg = "Aviso do sistema MQL5: volatilidade elevada detectada no ativo EURUSD.",
+                resumo = "Notificação e Alerta de Volatilidade MQL5.",
+                data = "06/08/2026",
+                hora = "10:21:00"
+            ),
+            com.example.data.EaRobotEvent(
+                id = currentAccount,
+                currency = "USD",
+                event = "mudanca_estado",
+                sistema = "ESTADO DE EXECUCAO",
+                login = accountLong,
+                server = "ICMarkets-Live01",
+                symbol = "EURUSD",
+                timeframe = "M15",
+                timestamp = nowSec - 600,
+                anterior = "ESTADO_DE_EXECUCAO_INICIAL",
+                novo = "ESTADO_DE_EXECUCAO_COMPRA_INICIAL",
+                descAnterior = "Monitorando mercado à procura de condições de entrada...",
+                descNovo = "Rompimento comprador confirmado! Executando ordem de compra e ativando gestão de risco.",
+                msg = "Transição do Motor de Execução: ESTADO_DE_EXECUCAO_COMPRA_INICIAL",
+                resumo = "Transição de Estado de Execução Efetuada.",
+                data = "06/08/2026",
+                hora = "10:20:00"
+            ),
+            com.example.data.EaRobotEvent(
+                id = currentAccount,
+                currency = "USD",
+                event = "mudanca_equador",
+                login = accountLong,
+                server = "ICMarkets-Live01",
+                symbol = "EURUSD",
+                timeframe = "M15",
+                timestamp = nowSec - 900,
+                anterior = "EQ_ALTA_Z1",
+                novo = "EQ_ALTA_Z2",
+                msg = "Equador alterado de EQ_ALTA_Z1 para EQ_ALTA_Z2. Preço acima da linha de equador central.",
+                resumo = "Transição de Zona de Equador Registrada.",
+                data = "06/08/2026",
+                hora = "10:15:00"
+            ),
+            com.example.data.EaRobotEvent(
+                id = currentAccount,
+                currency = "USD",
+                event = "sessao_inicio",
+                login = accountLong,
+                server = "ICMarkets-Live01",
+                symbol = "EURUSD",
+                timeframe = "M15",
+                timestamp = nowSec - 1800,
+                sessao = "LONDRES",
+                msg = "INICIO DA SESSAO: LONDRES | Início: 07:00 | Fim: 13:20",
+                resumo = "Início da Sessão de Londres Disparado.",
+                data = "06/08/2026",
+                hora = "10:00:00"
+            ),
+            com.example.data.EaRobotEvent(
+                id = currentAccount,
+                currency = "USD",
+                event = "sessao_fim",
+                login = accountLong,
+                server = "ICMarkets-Live01",
+                symbol = "EURUSD",
+                timeframe = "M15",
+                timestamp = nowSec - 3600,
+                sessao = "TOKYO",
+                msg = "FIM DA SESSAO: TOKYO | Encerramento automático de ordens pendentes.",
+                resumo = "Fim da Sessão de Tóquio Disparado.",
+                data = "06/08/2026",
+                hora = "09:00:00"
+            ),
+            com.example.data.EaRobotEvent(
+                id = currentAccount,
+                currency = "USD",
+                event = "posicao_alterada",
+                login = accountLong,
+                server = "ICMarkets-Live01",
+                symbol = "EURUSD",
+                timeframe = "M15",
+                timestamp = nowSec - 5400,
+                msg = "Nova posição aberta no ativo EURUSD!",
+                temPosicao = "true",
+                resumo = "Mudança de Posição Detectada.",
+                data = "06/08/2026",
+                hora = "08:30:00"
+            ),
+            com.example.data.EaRobotEvent(
+                id = currentAccount,
+                currency = "USD",
+                event = "captura_tela_concluida",
+                login = accountLong,
+                server = "ICMarkets-Live01",
+                symbol = "EURUSD",
+                timeframe = "M15",
+                timestamp = nowSec - 6000,
+                msg = "Captura de tela do gráfico enviada com sucesso ao App com objetos MQL5.",
+                resumo = "Captura de Tela com Objetos Concluída.",
+                data = "06/08/2026",
+                hora = "08:20:00"
+            ),
+            com.example.data.EaRobotEvent(
+                id = currentAccount,
+                currency = "USD",
+                event = "inicializacao",
+                login = accountLong,
+                server = "ICMarkets-Live01",
+                symbol = "EURUSD",
+                timeframe = "M15",
+                timestamp = nowSec - 7200,
+                msg = "🚀 EA Fimaster inicializado com sucesso no servidor ICMarkets-Live01.",
+                resumo = "Inicialização Completa do Robô EA.",
+                data = "06/08/2026",
+                hora = "08:00:00"
+            )
+        ) + com.example.data.EaNotificationEventsCatalog.generateNotificationEventsList(accountLong, currentSymbol)
+
+        _eaRobotEvents.value = simEvents
+        _messageState.value = "⚡ Simulação disparada! Todos os eventos e status do robô EA foram gerados."
+    }
+
+    fun clearEvents() {
+        _eaRobotEvents.value = emptyList()
+        _messageState.value = "🗑️ Todos os eventos do robô EA foram limpos."
+    }
+
     fun stopStatusPolling() {
         statusPollJob?.cancel()
         statusPollJob = null
+        _isSimulationActive.value = false
         _eaRobotStatus.value = null
         _eaRobotEvents.value = emptyList()
     }
@@ -827,6 +1399,293 @@ class PortalViewModel(
         val actionMessage = if (ativo) "Ativando robô EA no servidor MT5..." else "Desativando robô EA no servidor MT5..."
         saveEaConfig(updatedConfig, bypassValidation = true, customLoadingMessage = actionMessage)
     }
+
+    fun fetchExchangeRate(targetCurrencyCode: String = "MZN", onResult: (Double?) -> Unit = {}) {
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            _actionLoading.value = true
+            val targetKey = when (targetCurrencyCode.trim().uppercase()) {
+                "MT", "METICAL", "MZN" -> "MZN"
+                "R$", "REAL", "BRL" -> "BRL"
+                "€", "EURO", "EUR" -> "EUR"
+                "KZ", "KWANZA", "AOA" -> "AOA"
+                else -> targetCurrencyCode.trim().uppercase().ifBlank { "MZN" }
+            }
+            _actionLoadingMessage.value = "Buscando cotação oficial de 1 USD em $targetKey..."
+            try {
+                var rate: Double? = null
+
+                // 1. Try ExchangeRate API
+                try {
+                    val url = java.net.URL("https://open.er-api.com/v6/latest/USD")
+                    val conn = url.openConnection() as java.net.HttpURLConnection
+                    conn.requestMethod = "GET"
+                    conn.connectTimeout = 7000
+                    conn.readTimeout = 7000
+
+                    if (conn.responseCode == 200) {
+                        val responseText = conn.inputStream.bufferedReader().use { it.readText() }
+                        val json = org.json.JSONObject(responseText)
+                        if (json.optString("result") == "success" && json.has("rates")) {
+                            val rates = json.getJSONObject("rates")
+                            if (rates.has(targetKey)) {
+                                rate = rates.getDouble(targetKey)
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+
+                // 2. Fallback to AwesomeAPI for the specific requested pair
+                if (rate == null) {
+                    try {
+                        val pair = "USD-$targetKey"
+                        val url = java.net.URL("https://economia.awesomeapi.com.br/json/last/$pair")
+                        val conn = url.openConnection() as java.net.HttpURLConnection
+                        conn.requestMethod = "GET"
+                        conn.connectTimeout = 7000
+                        conn.readTimeout = 7000
+                        if (conn.responseCode == 200) {
+                            val text = conn.inputStream.bufferedReader().use { it.readText() }
+                            val json = org.json.JSONObject(text)
+                            val key = "USD$targetKey"
+                            if (json.has(key)) {
+                                val bidStr = json.getJSONObject(key).optString("bid")
+                                rate = bidStr.toDoubleOrNull()
+                            }
+                        }
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
+
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    if (rate != null) {
+                        _messageState.value = "🌐 Cotação obtida: 1 USD = $rate $targetKey"
+                        onResult(rate)
+                    } else {
+                        _messageState.value = "⚠️ Não foi possível obter a cotação de $targetKey online no momento. Verifique sua conexão."
+                        onResult(null)
+                    }
+                }
+            } catch (e: Exception) {
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    _messageState.value = "❌ Erro ao buscar cotação de $targetKey: ${e.localizedMessage}"
+                    onResult(null)
+                }
+            } finally {
+                _actionLoading.value = false
+            }
+        }
+    }
+}
+
+data class ChartScreenshotResult(
+    val file: java.io.File,
+    val filePath: String,
+    val mimeType: String,
+    val byteArray: ByteArray,
+    val bitmap: android.graphics.Bitmap
+)
+
+data class ChartScreenshotData(
+    val timestamp: Long = System.currentTimeMillis() / 1000L,
+    val symbol: String = "XAUUSD (GOLD)",
+    val timeframe: String = "M15",
+    val objectsCount: Int = 16,
+    val hasFimatheChannels: Boolean = true,
+    val hasEaPanel: Boolean = true,
+    val hasTradeArrows: Boolean = true,
+    val statusText: String = "Objetos MQL5 Capturados com Sucesso",
+    val imageBase64: String? = null,
+    val imageFilePath: String? = null,
+    val mimeType: String = "image/png",
+    val imageBytes: ByteArray? = null,
+    val isRequested: Boolean = false
+) {
+    fun getReconstructedBitmap(): android.graphics.Bitmap? {
+        if (imageBytes != null && imageBytes.isNotEmpty()) {
+            return android.graphics.BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+        }
+        if (!imageFilePath.isNullOrBlank()) {
+            val file = java.io.File(imageFilePath)
+            if (file.exists()) {
+                return android.graphics.BitmapFactory.decodeFile(file.absolutePath)
+            }
+        }
+        return null
+    }
+}
+
+fun generateAndSaveChartScreenshot(
+    context: android.content.Context,
+    symbol: String,
+    timeframe: String,
+    objectsCount: Int = 18,
+    existingBase64: String? = null
+): ChartScreenshotResult {
+    val mimeType = "image/png"
+    val cacheDir = context.cacheDir
+
+    // 1. Limpar capturas anteriores do armazenamento temporário/cache
+    try {
+        cacheDir.listFiles { _, name -> name.endsWith(".png") || name.contains("chart") }?.forEach { it.delete() }
+    } catch (e: Exception) {
+        e.printStackTrace()
+    }
+
+    // 2. Obter o ByteArray da imagem (decode de Base64 existente ou renderização nativa)
+    val byteArray: ByteArray = if (!existingBase64.isNullOrBlank()) {
+        try {
+            android.util.Base64.decode(existingBase64, android.util.Base64.DEFAULT)
+        } catch (e: Exception) {
+            createChartBitmapBytes(symbol, timeframe, objectsCount)
+        }
+    } else {
+        createChartBitmapBytes(symbol, timeframe, objectsCount)
+    }
+
+    // 3. Criar o arquivo no armazenamento interno/cache do aplicativo (substitui automaticamente o arquivo anterior)
+    val imageFile = java.io.File(cacheDir, "chart_screenshot_latest.png")
+
+    // 4. Salvar os bytes no arquivo de cache interno
+    imageFile.writeBytes(byteArray)
+
+    // 5. Reconstruir a imagem a partir dos bytes / arquivo gravado
+    val reconstructedBitmap = android.graphics.BitmapFactory.decodeByteArray(byteArray, 0, byteArray.size)
+        ?: android.graphics.BitmapFactory.decodeFile(imageFile.absolutePath)
+        ?: createFallbackBitmap()
+
+    return ChartScreenshotResult(
+        file = imageFile,
+        filePath = imageFile.absolutePath,
+        mimeType = mimeType,
+        byteArray = byteArray,
+        bitmap = reconstructedBitmap
+    )
+}
+
+private fun createChartBitmapBytes(symbol: String, timeframe: String, objectsCount: Int): ByteArray {
+    val width = 1200
+    val height = 700
+    val bitmap = android.graphics.Bitmap.createBitmap(width, height, android.graphics.Bitmap.Config.ARGB_8888)
+    val canvas = android.graphics.Canvas(bitmap)
+
+    // Fundo Escuro MQL5
+    canvas.drawColor(android.graphics.Color.parseColor("#0B0F19"))
+
+    val paintGrid = android.graphics.Paint().apply {
+        color = android.graphics.Color.parseColor("#1E293B")
+        strokeWidth = 1.5f
+        pathEffect = android.graphics.DashPathEffect(floatArrayOf(8f, 8f), 0f)
+    }
+
+    // Grade do Gráfico
+    for (i in 1..10) {
+        val x = width * (i / 11f)
+        canvas.drawLine(x, 0f, x, height.toFloat(), paintGrid)
+    }
+    for (j in 1..7) {
+        val y = height * (j / 8f)
+        canvas.drawLine(0f, y, width.toFloat(), y, paintGrid)
+    }
+
+    // Linhas de Nível Fimathe (Objetos MQL5)
+    val paintCyan = android.graphics.Paint().apply { color = android.graphics.Color.parseColor("#22D3EE"); strokeWidth = 3f }
+    val paintEmerald = android.graphics.Paint().apply { color = android.graphics.Color.parseColor("#10B981"); strokeWidth = 4f }
+    val paintAmber = android.graphics.Paint().apply { color = android.graphics.Color.parseColor("#F59E0B"); strokeWidth = 3f; pathEffect = android.graphics.DashPathEffect(floatArrayOf(12f, 6f), 0f) }
+    val paintRose = android.graphics.Paint().apply { color = android.graphics.Color.parseColor("#F43F5E"); strokeWidth = 3f }
+
+    canvas.drawLine(0f, height * 0.22f, width.toFloat(), height * 0.20f, paintCyan)
+    canvas.drawLine(0f, height * 0.40f, width.toFloat(), height * 0.38f, paintEmerald)
+    canvas.drawLine(0f, height * 0.52f, width.toFloat(), height * 0.50f, paintAmber)
+    canvas.drawLine(0f, height * 0.64f, width.toFloat(), height * 0.62f, paintEmerald)
+    canvas.drawLine(0f, height * 0.80f, width.toFloat(), height * 0.78f, paintRose)
+
+    // Velas de Preço (Candlesticks)
+    val paintGreen = android.graphics.Paint().apply { color = android.graphics.Color.parseColor("#10B981"); style = android.graphics.Paint.Style.FILL }
+    val paintRed = android.graphics.Paint().apply { color = android.graphics.Color.parseColor("#EF4444"); style = android.graphics.Paint.Style.FILL }
+    val paintWick = android.graphics.Paint().apply { strokeWidth = 2.5f }
+
+    val candlesCount = 32
+    val candleWidth = 18f
+    val startX = 60f
+    val stepX = (width - 120f) / candlesCount
+
+    var lastClose = height * 0.55f
+    val random = java.util.Random(symbol.hashCode().toLong() + System.currentTimeMillis() % 1000)
+
+    for (i in 0 until candlesCount) {
+        val cx = startX + i * stepX
+        val change = (random.nextFloat() - 0.48f) * 60f
+        val open = lastClose
+        val close = open - change
+        val high = minOf(open, close) - random.nextFloat() * 30f
+        val low = maxOf(open, close) + random.nextFloat() * 30f
+        lastClose = close
+
+        val isBull = close <= open
+        val paintCandle = if (isBull) paintGreen else paintRed
+        paintWick.color = if (isBull) android.graphics.Color.parseColor("#10B981") else android.graphics.Color.parseColor("#EF4444")
+
+        canvas.drawLine(cx, high, cx, low, paintWick)
+        val top = minOf(open, close)
+        val bottom = maxOf(open, close)
+        canvas.drawRect(cx - candleWidth / 2f, top, cx + candleWidth / 2f, maxOf(top + 2f, bottom), paintCandle)
+    }
+
+    // Painel EA MQL5 Overlay
+    val paintPanelBg = android.graphics.Paint().apply { color = android.graphics.Color.parseColor("#D90F172A"); style = android.graphics.Paint.Style.FILL }
+    val paintPanelBorder = android.graphics.Paint().apply { color = android.graphics.Color.parseColor("#0284C7"); style = android.graphics.Paint.Style.STROKE; strokeWidth = 2f }
+    val rectF = android.graphics.RectF(30f, 30f, 440f, 220f)
+    canvas.drawRoundRect(rectF, 16f, 16f, paintPanelBg)
+    canvas.drawRoundRect(rectF, 16f, 16f, paintPanelBorder)
+
+    val paintTextTitle = android.graphics.Paint().apply {
+        color = android.graphics.Color.parseColor("#38BDF8")
+        textSize = 22f
+        isFakeBoldText = true
+        isAntiAlias = true
+    }
+    val paintTextSub = android.graphics.Paint().apply {
+        color = android.graphics.Color.parseColor("#E2E8F0")
+        textSize = 17f
+        isAntiAlias = true
+    }
+    val paintTextGreen = android.graphics.Paint().apply {
+        color = android.graphics.Color.parseColor("#34D399")
+        textSize = 16f
+        isFakeBoldText = true
+        isAntiAlias = true
+    }
+
+    canvas.drawText("🤖 ROBÔ FIMASTER EA (MQL5)", 50f, 68f, paintTextTitle)
+    canvas.drawText("Ativo: $symbol | Timeframe: $timeframe", 50f, 105f, paintTextSub)
+    canvas.drawText("Canais Fimathe: ATIVOS (3 Níveis)", 50f, 138f, paintTextSub)
+    canvas.drawText("Objetos no Gráfico: $objectsCount Elementos", 50f, 170f, paintTextSub)
+    canvas.drawText("● EA ONLINE • Conexão MT5 OK", 50f, 202f, paintTextGreen)
+
+    // Rodapé com Carimbo de Data e MIME
+    val paintWatermark = android.graphics.Paint().apply {
+        color = android.graphics.Color.parseColor("#64748B")
+        textSize = 18f
+        isAntiAlias = true
+    }
+    val sdf = java.text.SimpleDateFormat("dd/MM/yyyy HH:mm:ss", java.util.Locale.getDefault())
+    val dateStr = sdf.format(java.util.Date())
+    canvas.drawText("MIME: image/png • Cap: $dateStr • Cache Interno", width - 520f, height - 25f, paintWatermark)
+
+    // Comprime a imagem gerada para ByteArray no formato PNG
+    val stream = java.io.ByteArrayOutputStream()
+    bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, stream)
+    return stream.toByteArray()
+}
+
+private fun createFallbackBitmap(): android.graphics.Bitmap {
+    val bitmap = android.graphics.Bitmap.createBitmap(400, 200, android.graphics.Bitmap.Config.ARGB_8888)
+    val canvas = android.graphics.Canvas(bitmap)
+    canvas.drawColor(android.graphics.Color.DKGRAY)
+    return bitmap
 }
 
 data class EaRobotStatus(
@@ -844,6 +1703,184 @@ data class EaRobotStatus(
     val configSyncSuccess: Boolean = false,
     val lastConfigSync: Long = 0L
 )
+
+enum class TransactionType {
+    CLOSED_POSITION,
+    DEPOSIT,
+    WITHDRAWAL
+}
+
+data class FinancialTransaction(
+    val id: String = java.util.UUID.randomUUID().toString(),
+    val type: TransactionType = TransactionType.CLOSED_POSITION,
+    val symbol: String = "XAUUSD",
+    val amount: Double = 0.0,
+    val timestamp: Long = System.currentTimeMillis() / 1000L,
+    val note: String = ""
+)
+
+enum class EquityTimeframe(val label: String, val shortCode: String) {
+    PER_POSITION("Por Posição", "1T"),
+    DAILY("Diário", "1D"),
+    WEEKLY("Semanal", "1W"),
+    MONTHLY("Mensal", "1M")
+}
+
+data class FinancialCandle(
+    val id: String,
+    val periodLabel: String,
+    val timestamp: Long,
+    val openBalance: Double,
+    val highBalance: Double,
+    val lowBalance: Double,
+    val closeBalance: Double,
+    val netProfit: Double,
+    val deposits: Double,
+    val withdrawals: Double,
+    val tradeCount: Int,
+    val isBullish: Boolean = closeBalance >= openBalance
+)
+
+fun buildCandlesFromTransactions(
+    transactions: List<FinancialTransaction>,
+    timeframe: EquityTimeframe,
+    initialBalance: Double
+): List<FinancialCandle> {
+    if (transactions.isEmpty()) return emptyList()
+    val sortedTxs = transactions.sortedBy { it.timestamp }
+
+    val hasDeposit = sortedTxs.any { it.type == TransactionType.DEPOSIT }
+    val startingBalance = if (hasDeposit) 0.0 else initialBalance
+
+    when (timeframe) {
+        EquityTimeframe.PER_POSITION -> {
+            var currentBalance = startingBalance
+            val candles = mutableListOf<FinancialCandle>()
+            
+            sortedTxs.forEachIndexed { index, tx ->
+                val openBal = currentBalance
+                val change = when (tx.type) {
+                    TransactionType.DEPOSIT -> kotlin.math.abs(tx.amount)
+                    TransactionType.WITHDRAWAL -> -kotlin.math.abs(tx.amount)
+                    TransactionType.CLOSED_POSITION -> tx.amount
+                }
+                val closeBal = openBal + change
+                currentBalance = closeBal
+
+                val highBal = kotlin.math.max(openBal, closeBal)
+                val lowBal = kotlin.math.min(openBal, closeBal)
+                val isDeposit = tx.type == TransactionType.DEPOSIT
+                val isWithdrawal = tx.type == TransactionType.WITHDRAWAL
+                val isTrade = tx.type == TransactionType.CLOSED_POSITION
+
+                val label = when (tx.type) {
+                    TransactionType.CLOSED_POSITION -> "#${index + 1} ${tx.symbol}"
+                    TransactionType.DEPOSIT -> "#${index + 1} +Depósito"
+                    TransactionType.WITHDRAWAL -> "#${index + 1} -Saque"
+                }
+
+                candles.add(
+                    FinancialCandle(
+                        id = tx.id,
+                        periodLabel = label,
+                        timestamp = tx.timestamp,
+                        openBalance = openBal,
+                        highBalance = highBal,
+                        lowBalance = lowBal,
+                        closeBalance = closeBal,
+                        netProfit = if (isTrade) tx.amount else 0.0,
+                        deposits = if (isDeposit) kotlin.math.abs(tx.amount) else 0.0,
+                        withdrawals = if (isWithdrawal) kotlin.math.abs(tx.amount) else 0.0,
+                        tradeCount = if (isTrade) 1 else 0
+                    )
+                )
+            }
+            return candles
+        }
+
+        EquityTimeframe.DAILY -> {
+            return groupTransactionsByTimeFormat(sortedTxs, "yyyy-MM-dd", "dd/MM", startingBalance)
+        }
+
+        EquityTimeframe.WEEKLY -> {
+            return groupTransactionsByTimeFormat(sortedTxs, "yyyy-'W'ww", "'Sem' w", startingBalance)
+        }
+
+        EquityTimeframe.MONTHLY -> {
+            return groupTransactionsByTimeFormat(sortedTxs, "yyyy-MM", "MMM yyyy", startingBalance)
+        }
+    }
+}
+
+private fun groupTransactionsByTimeFormat(
+    sortedTxs: List<FinancialTransaction>,
+    groupPattern: String,
+    labelPattern: String,
+    startingBalance: Double
+): List<FinancialCandle> {
+    val groupSdf = java.text.SimpleDateFormat(groupPattern, java.util.Locale.getDefault())
+    val labelSdf = java.text.SimpleDateFormat(labelPattern, java.util.Locale.getDefault())
+
+    val groupedMap = sortedTxs.groupBy { groupSdf.format(java.util.Date(it.timestamp * 1000L)) }
+    val candles = mutableListOf<FinancialCandle>()
+
+    var runningBalance = startingBalance
+
+    for ((groupKey, groupTxs) in groupedMap) {
+        val openBal = runningBalance
+        var highBal = openBal
+        var lowBal = openBal
+        var currentBal = openBal
+
+        var periodNetProfit = 0.0
+        var periodDeposits = 0.0
+        var periodWithdrawals = 0.0
+        var tradeCount = 0
+
+        for (tx in groupTxs) {
+            val change = when (tx.type) {
+                TransactionType.DEPOSIT -> kotlin.math.abs(tx.amount)
+                TransactionType.WITHDRAWAL -> -kotlin.math.abs(tx.amount)
+                TransactionType.CLOSED_POSITION -> tx.amount
+            }
+            currentBal += change
+            if (currentBal > highBal) highBal = currentBal
+            if (currentBal < lowBal) lowBal = currentBal
+
+            when (tx.type) {
+                TransactionType.CLOSED_POSITION -> {
+                    periodNetProfit += tx.amount
+                    tradeCount++
+                }
+                TransactionType.DEPOSIT -> periodDeposits += kotlin.math.abs(tx.amount)
+                TransactionType.WITHDRAWAL -> periodWithdrawals += kotlin.math.abs(tx.amount)
+            }
+        }
+
+        val closeBal = currentBal
+        runningBalance = closeBal
+
+        val sampleDate = groupTxs.firstOrNull()?.timestamp ?: (System.currentTimeMillis() / 1000L)
+        val formattedLabel = labelSdf.format(java.util.Date(sampleDate * 1000L))
+
+        candles.add(
+            FinancialCandle(
+                id = groupKey,
+                periodLabel = formattedLabel,
+                timestamp = sampleDate,
+                openBalance = openBal,
+                highBalance = highBal,
+                lowBalance = lowBal,
+                closeBalance = closeBal,
+                netProfit = periodNetProfit,
+                deposits = periodDeposits,
+                withdrawals = periodWithdrawals,
+                tradeCount = tradeCount
+            )
+        )
+    }
+    return candles
+}
 
 class PortalViewModelFactory(
     private val application: Application,

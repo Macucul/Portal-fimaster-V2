@@ -1,0 +1,151 @@
+//+------------------------------------------------------------------+
+//|                                     ea_eventos_notificacoes.mql5 |
+//|                                 Copyright 2026, EA Fimaster      |
+//|                                      https://bit.ly/4jJQJsl      |
+//+------------------------------------------------------------------+
+#property copyright "EA Fimaster - Módulo Oficial de Notificações e Travas"
+#property link      "https://bit.ly/4jJQJsl"
+#property version   "14.0"
+#property description "Módulo MQL5 de Notificações de Travas, Gerenciamento e Condições de Entrada do EA Fimaster"
+#property strict
+
+// ====================================================================
+// 📊 PARÂMETROS GLOBAIS DE ENTRADA E CONTROLE
+// ====================================================================
+input bool g_param_ativar_venda = true;             // Ativar operações de VENDA
+input bool g_param_ativar_compra = true;            // Ativar operações de COMPRA
+input double pontsDEentrada = 10.0;                 // Limite Máximo de Pontos de Entrada
+
+// Variáveis Globais de Estado Interno (Simuladas / Atualizadas pelo MQL5)
+double pntosDEvelaV = 0.0;
+double pntosDEvelaC = 0.0;
+bool condicao = true;
+bool condicao2 = true;
+bool comando_venda = true;
+bool comando_compra = true;
+bool contol_de_gerenciamento = true;                // Gerenciamento Diário (true = OK / false = Bloqueado)
+bool contol_de_gerenciamento_semanal = true;        // Gerenciamento Semanal (true = OK / false = Bloqueado)
+string notifica = "";
+
+// ====================================================================
+// 📨 FUNÇÃO DE ENVIO DE NOTIFICAÇÕES (TERMINAL, MOBILE E APP FIREBASE)
+// ====================================================================
+void enviarnotificacvao(string textoNotificacao)
+  {
+   // 1. Exibe no Terminal do MetaTrader 5
+   Print("🔔 [NOTIFICAÇÃO EA FIMASTER]: ", textoNotificacao);
+   
+   // 2. Envia notificação Push nativa para o MetaTrader Mobile (se configurado MetaQuotes ID)
+   SendNotification("EA Fimaster [" + Symbol() + "]: " + textoNotificacao);
+   
+   // 3. Registra evento no log interno de eventos para transmissão ao App Android via REST/Firebase
+   RegistrarEventoNotificacaoApp(textoNotificacao);
+  }
+
+// ====================================================================
+// 🔐 MÓDULO DE VERIFICAÇÃO E NOTIFICAÇÕES DE COMPRA
+// ====================================================================
+bool VerificarTravasECondicoesCompra()
+  {
+   // 1. Verificação de desativação global de compra
+   if(!g_param_ativar_compra)
+     {
+        Print(" ordem de compra desativado");
+        notifica = " ordem de compra desativado";
+        enviarnotificacvao(notifica);
+        return false;
+     }
+
+   // 2. Trava de Fechamento de Vela (tamanho da vela vs pontos de entrada)
+   if(!condicao2)
+     {
+        Print(" ordem de compra travado por fechamento :", pntosDEvelaC, " > ", pontsDEentrada, ": pontos de entrada");
+        notifica = " ordem de compra travado por fechamento :" + DoubleToString(pntosDEvelaC, 1) + " > " + DoubleToString(pontsDEentrada, 1) + ": pontos de entrada";
+        enviarnotificacvao(notifica);
+        return false;
+     }
+
+   // 3. Trava por Linha de Equador ou Filtro de Tendência
+   if(!comando_compra)
+     {
+        Print(" ordem de compra trvado por linha de equador ou por tendência :", comando_compra);
+        notifica = " ordem de compra trvado por linha de equador ou por tendência :" + (!comando_compra ? "verdade" : "falso");
+        enviarnotificacvao(notifica);
+        return false;
+     }
+
+   // 4. Trava de Gerenciamento de Risco (Diário ou Semanal)
+   if(!contol_de_gerenciamento || !contol_de_gerenciamento_semanal)
+     {
+        Print("ordem de compra trvado por contol_de_gerenciamento DIARIO  :", contol_de_gerenciamento, ". SEMANAL :", contol_de_gerenciamento_semanal);
+        notifica = "ordem de compra trvado por contol_de_gerenciamento DIARIO  :" + (!contol_de_gerenciamento ? "SIM" : "NÂO :") + " SEMANAL :" + (!contol_de_gerenciamento_semanal ? "SIM" : "NÃO");
+        enviarnotificacvao(notifica);
+        return false;
+     }
+
+   return true; // Compra autorizada
+  }
+
+// ====================================================================
+// 🔐 MÓDULO DE VERIFICAÇÃO E NOTIFICAÇÕES DE VENDA
+// ====================================================================
+bool VerificarTravasECondicoesVenda()
+  {
+   // 1. Verificação de desativação global de venda
+   if(!g_param_ativar_venda)
+     {
+        Print(" ordem de venda desativado :");
+        notifica = " ordem de venda desativado :" ;
+        enviarnotificacvao(notifica);
+        return false;
+     }
+
+   // 2. Trava de Fechamento de Vela (tamanho da vela vs pontos de entrada)
+   if(!condicao)
+     {
+        Print(" ordem de venda travado por fechamento :", pntosDEvelaV, " > ", pontsDEentrada, ": pontos de entrada");
+        notifica = " ordem de venda travado por fechamento :" + DoubleToString(pntosDEvelaV, 1) + " > " + DoubleToString(pontsDEentrada, 1) + ": pontos de entrada";
+        enviarnotificacvao(notifica);
+        return false;
+     }
+
+   // 3. Trava por Linha de Equador ou Filtro de Tendência
+   if(!comando_venda)
+     {
+        Print(" ordem de venda travdo por linha de equador  :", comando_venda);
+        notifica = " ordem de venda trvado por linha de equador ou por tendência :" + (!comando_venda ? "verdade" : "falso");
+        enviarnotificacvao(notifica);
+        return false;
+     }
+
+   // 4. Trava de Gerenciamento de Risco (Diário e Semanal)
+   if(!contol_de_gerenciamento && !contol_de_gerenciamento_semanal)
+     {
+        Print(" ordem de venda travdo por contol_de_gerenciamento. DIARIO  :", contol_de_gerenciamento, ". SEMANAL :", contol_de_gerenciamento_semanal);
+        notifica = "ordem de venda trvado por contol_de_gerenciamento DIARIO  :" + (!contol_de_gerenciamento ? "SIM" : "NÂO :") + " SEMANAL :" + (!contol_de_gerenciamento_semanal ? "SIM" : "NÃO");
+        enviarnotificacvao(notifica);
+        return false;
+     }
+
+   return true; // Venda autorizada
+  }
+
+// ====================================================================
+// 🌐 REGISTRO DE EVENTO PARA O APLICATIVO ANDROID
+// ====================================================================
+void RegistrarEventoNotificacaoApp(string mensagemNotificacao)
+  {
+   ulong accountId = AccountInfoInteger(ACCOUNT_LOGIN);
+   string symbol = Symbol();
+   datetime nowTime = TimeCurrent();
+   
+   string payloadJson = "{" +
+                        "\"event\":\"notificacao_mql5\"," +
+                        "\"login\":" + IntegerToString(accountId) + "," +
+                        "\"symbol\":\"" + symbol + "\"," +
+                        "\"msg\":\"" + mensagemNotificacao + "\"," +
+                        "\"timestamp\":" + IntegerToString((long)nowTime) +
+                        "}";
+                        
+   Print("📡 Evento MQL5 pronto para o App: ", payloadJson);
+  }

@@ -47,7 +47,7 @@ class PortalRepository(
 
     private fun getMockUserForInput(rawInput: String, cleanDigits: String, phone9: String): GithubUser? {
         val salt = mockPasswordSalt ?: "abc12345"
-        val hash = mockPasswordHash ?: GithubUserParser.sha256("fimaster2026" + salt)
+        val hash = mockPasswordHash ?: GithubUserParser.sha256("123456" + salt)
 
         val upperRaw = rawInput.uppercase()
         if (phone9 == "842216571" || upperRaw == "USR000001" || upperRaw == "USR00001" || cleanDigits == "859423" || phone9 == "841234567" || phone9 == "999999999" || phone9 == "123") {
@@ -550,7 +550,7 @@ class PortalRepository(
                 id = 1,
                 fullName = "Jossias Fimaster",
                 mt5AccountId = "859423",
-                passwordHash = "fimaster2026",
+                passwordHash = "123456",
                 licenseStatus = "Ativa",
                 licenseExpiryDate = "15 de Dezembro, 2026",
                 balanceMT = 145250.00,
@@ -1238,7 +1238,7 @@ class PortalRepository(
             if (userId.isNotBlank()) {
                 db.getReference("dados/usuarios").child(userId).child("config").setValue(configMap).await()
             }
-            return "✅ Parâmetros enviados com sucesso ao servidor! Aguardando o robô sincronizar."
+            return " Parâmetros enviados com sucesso ao servidor! Aguardando o robô sincronizar."
         } catch (e: Exception) {
             // SDK attempt failed, fallback to REST
         }
@@ -1275,7 +1275,7 @@ class PortalRepository(
                 }
 
                 if (anySuccess) {
-                    "✅ Parâmetros enviados com sucesso ao servidor! Aguardando o robô sincronizar."
+                    " Parâmetros enviados com sucesso ao servidor! Aguardando o robô sincronizar."
                 } else {
                     "Salvo localmente! Verifique a conexão com o servidor."
                 }
@@ -1336,6 +1336,274 @@ class PortalRepository(
                 }
             }
             false
+        }
+    }
+
+    suspend fun fetchAdminTemplatesFromFirebase(firebaseUrl: String, authKey: String = ""): List<AdminEaTemplate> {
+        val defaultTemplates = getDefaultAdminTemplates()
+        val parsed = parseFirebaseUrl(firebaseUrl)
+        val candidateList = mutableListOf<AdminEaTemplate>()
+
+        if (parsed.baseUrl.isNotBlank()) {
+            withContext(Dispatchers.IO) {
+                val client = OkHttpClient()
+                val pathsToTry = listOf(
+                    "/dados/indices/instrucoes_admin_templates/instrucoes_admin_templates.json",
+                    "/dados/indices/instrucoes_admin_templates.json"
+                )
+
+                for (p in pathsToTry) {
+                    val url = buildFirebaseEndpoint(parsed, p, authKey)
+                    try {
+                        val request = Request.Builder().url(url).get().build()
+                        client.newCall(request).execute().use { response ->
+                            if (response.isSuccessful) {
+                                val body = response.body?.string()
+                                if (body != null && body != "null" && body != "{}" && body != "[]") {
+                                    val list = mutableListOf<AdminEaTemplate>()
+                                    if (body.trim().startsWith("[")) {
+                                        val arr = JSONArray(body)
+                                        for (i in 0 until arr.length()) {
+                                            val item = arr.optJSONObject(i)
+                                            if (item != null) {
+                                                parseTemplateJsonObject(item)?.let { list.add(it) }
+                                            }
+                                        }
+                                    } else if (body.trim().startsWith("{")) {
+                                        val obj = JSONObject(body)
+                                        list.addAll(parseJsonBodyToTemplates(obj))
+                                    }
+                                    if (list.isNotEmpty()) {
+                                        candidateList.addAll(list)
+                                        return@use
+                                    }
+                                }
+                            }
+                        }
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                    if (candidateList.isNotEmpty()) break
+                }
+            }
+        }
+
+        // Filter valid non-expired templates
+        val validRemoteTemplates = candidateList.filter { it.isTemplateValido() }
+        val result = mutableListOf<AdminEaTemplate>()
+        result.addAll(validRemoteTemplates)
+
+        // Automatic Substitution: If any template expires, substitute with next valid template to keep EXACTLY 3 active published templates
+        for (defaultTpl in defaultTemplates) {
+            if (result.size >= 3) break
+            if (defaultTpl.isTemplateValido() && result.none { it.id == defaultTpl.id }) {
+                result.add(defaultTpl)
+            }
+        }
+
+        return result.take(3)
+    }
+
+    private fun parseJsonBodyToTemplates(obj: JSONObject): List<AdminEaTemplate> {
+        val result = mutableListOf<AdminEaTemplate>()
+
+        // 1. Recursively unwrap nested wrapper containers
+        var current: JSONObject = obj
+        var depth = 0
+        val wrapperKeys = listOf("dados", "indices", "instrucoes_admin_templates", "templates_ea")
+        
+        while (depth < 6) {
+            depth++
+            var unwrapped = false
+            for (key in wrapperKeys) {
+                if (current.has(key) && !isSingleTemplateObject(current)) {
+                    val child = current.optJSONObject(key)
+                    if (child != null && !isSingleTemplateObject(child)) {
+                        current = child
+                        unwrapped = true
+                        break
+                    }
+                }
+            }
+            if (!unwrapped) break
+        }
+
+        // 2. Check if current container has a sub-field "templates"
+        val templatesMap = if (current.has("templates")) {
+            current.optJSONObject("templates") ?: current
+        } else {
+            current
+        }
+
+        // 3. Check if templatesMap itself IS a single template or single config
+        if (isSingleTemplateObject(templatesMap)) {
+            parseTemplateJsonObject(templatesMap, fallbackId = "tpl_admin_01")?.let { result.add(it) }
+            return result
+        }
+
+        // 4. Otherwise, iterate keys of templatesMap to parse dictionary items
+        val keys = templatesMap.keys()
+        while (keys.hasNext()) {
+            val key = keys.next()
+            val child = templatesMap.optJSONObject(key)
+            if (child != null) {
+                if (isSingleTemplateObject(child) || child.has("id") || child.has("titulo") || child.has("config")) {
+                    parseTemplateJsonObject(child, fallbackId = key)?.let { result.add(it) }
+                }
+            }
+        }
+
+        // 5. Fallback check if original root obj is a single template
+        if (result.isEmpty() && isSingleTemplateObject(obj)) {
+            parseTemplateJsonObject(obj, fallbackId = "tpl_admin_single")?.let { result.add(it) }
+        }
+
+        return result
+    }
+
+    private fun isSingleTemplateObject(obj: JSONObject): Boolean {
+        return obj.has("config") || obj.has("parametros") || obj.has("ESTRATÉGIA") ||
+                obj.has("OperationalPeriod") || obj.has("SENHA") || obj.has("cor_de_canal")
+    }
+
+    private fun parseTemplateJsonObject(obj: JSONObject, fallbackId: String = ""): AdminEaTemplate? {
+        val id = obj.optString("id", fallbackId).ifBlank { fallbackId }
+        val titulo = obj.optString("titulo", obj.optString("nome", "Template Admin")).ifBlank { "Template Admin" }
+        val descricao = obj.optString("descricao", "Template publicado pelo Administrador Master")
+        val autor = obj.optString("autor", "Admin Master")
+        val dataPublicacao = obj.optString("dataPublicacao", obj.optString("data", "02/08/2026"))
+        val validoAte = obj.optString("validoAte", obj.optString("validade", "31/12/2026"))
+        val disponivel = when {
+            obj.has("disponivel") -> obj.optBoolean("disponivel", true)
+            obj.has("valido") -> obj.optBoolean("valido", true)
+            obj.has("ativo") -> obj.optBoolean("ativo", true)
+            obj.has("disponivelMercado") -> obj.optBoolean("disponivelMercado", true)
+            obj.has("status") -> {
+                val s = obj.optString("status").trim().lowercase()
+                s in listOf("true", "1", "ativo", "valido", "disponivel", "online", "ok")
+            }
+            else -> true
+        }
+        val versaoMinima = obj.optString("versaoMinimaEa", "v3.2")
+        val pontosAtivo = obj.optString("pontosAtivo", obj.optString("pontos", obj.optString("pontos_ativo", "250 pts"))).ifBlank { "250 pts" }
+        val paridade = obj.optString("paridade", obj.optString("par", obj.optString("symbol", obj.optString("paridadeAtivo", "XAUUSD")))).ifBlank { "XAUUSD" }
+
+        val configObj = obj.optJSONObject("config") ?: obj.optJSONObject("parametros") ?: obj
+        val cfg = if (configObj != null) {
+            EaConfigEntity(
+                mt5AccountId = "TEMPLATE",
+                SENHA = configObj.optString("SENHA", "123456"),
+                ESQUEMA_CORES_ENUM = configObj.optString("ESQUEMA_CORES_ENUM", "CYAN_NEON"),
+                cor_de_canal = configObj.optString("cor_de_canal", "#22D3EE"),
+                cor_de_linhas = configObj.optString("cor_de_linhas", "#FF00E5"),
+                corr_de_equador = configObj.optString("corr_de_equador", "#FFFF00"),
+                LINHAS_DE_EQUADOR = configObj.optBoolean("LINHAS_DE_EQUADOR", false),
+                TREND = configObj.optString("TREND", "UP_TREND"),
+                M_equador_alta = configObj.optDouble("M_equador_alta", 1.2500),
+                M_equador_baixa = configObj.optDouble("M_equador_baixa", 1.2400),
+                TEMA = configObj.optBoolean("TEMA", false),
+                ESTRATÉGIA = configObj.optString("ESTRATÉGIA", "FIMATHE"),
+                virada_de_jogo = configObj.optBoolean("virada_de_jogo", false),
+                Nives = configObj.optDouble("Nives", 1.0),
+                Costurar = configObj.optBoolean("Costurar", true),
+                OperationalPeriod = configObj.optString("OperationalPeriod", "PERIOD_M15"),
+                lot = configObj.optDouble("lot", 0.00),
+                EA_ATIVO = configObj.optBoolean("EA_ATIVO", true),
+                EA_AUTO = configObj.optBoolean("EA_AUTO", false),
+                AUTO_PERIOD = configObj.optString("AUTO_PERIOD", "PERIOD_H1"),
+                AUTO_SURFADA = configObj.optBoolean("AUTO_SURFADA", false),
+                SESSAO_ASIA_TOQUIO = configObj.optBoolean("SESSAO_ASIA_TOQUIO", false),
+                SESSAO_LONDRES = configObj.optBoolean("SESSAO_LONDRES", false),
+                SESSAO_NOVA_YORQUI = configObj.optBoolean("SESSAO_NOVA_YORQUI", false),
+                EXPANSAO_MINIMA = configObj.optInt("EXPANSAO_MINIMA", 10),
+                EXPANSAO_MAXIMA = configObj.optInt("EXPANSAO_MAXIMA", 30),
+                compra = configObj.optDouble("compra", 1.2550),
+                venda = configObj.optDouble("venda", 1.2500),
+                santo = configObj.optDouble("santo", 20.0),
+                dedo = configObj.optInt("dedo", 10),
+                posicaoTake = configObj.optBoolean("posicaoTake", false),
+                buy_take = configObj.optDouble("buy_take", 0.0),
+                sell_take = configObj.optDouble("sell_take", 0.0),
+                SALDO = configObj.optDouble("SALDO", 1000.0),
+                GERENCIAMENTO_DE_RISCO_DIARIO = configObj.optBoolean("GERENCIAMENTO_DE_RISCO_DIARIO", true),
+                porcentos = configObj.optDouble("porcentos", 1.0),
+                poercentosg = configObj.optDouble("poercentosg", 1.0),
+                GERENCIAMENTO_DE_RISCO_SEMANAL = configObj.optBoolean("GERENCIAMENTO_DE_RISCO_SEMANAL", false),
+                PORCENTOO = configObj.optDouble("PORCENTOO", 2.0),
+                PORCENTOSS = configObj.optDouble("PORCENTOSS", 2.0),
+                GMAIL = configObj.optBoolean("GMAIL", true),
+                notific = configObj.optBoolean("notific", true),
+                ativar_ou_desativar_venda = configObj.optBoolean("ativar_ou_desativar_venda", true),
+                ativar_ou_desativar_compra = configObj.optBoolean("ativar_ou_desativar_compra", true),
+                Modify_Sl_For_OxO = configObj.optBoolean("Modify_Sl_For_OxO", true),
+                condicao_De_rompimento_c = configObj.optBoolean("condicao_De_rompimento_c", true),
+                condicao_De_rompimento_v = configObj.optBoolean("condicao_De_rompimento_v", true),
+                CAMBIO = configObj.optDouble("CAMBIO", 64.0)
+            )
+        } else {
+            EaConfigEntity(mt5AccountId = "TEMPLATE", lot = 0.00)
+        }
+
+        return AdminEaTemplate(
+            id = id,
+            titulo = titulo,
+            descricao = descricao,
+            autor = autor,
+            dataPublicacao = dataPublicacao,
+            validoAte = validoAte,
+            disponivel = disponivel,
+            versaoMinimaEa = versaoMinima,
+            pontosAtivo = pontosAtivo,
+            paridade = paridade,
+            config = cfg
+        )
+    }
+
+    fun getDefaultAdminTemplates(): List<AdminEaTemplate> {
+        return emptyList()
+    }
+
+    suspend fun sendChartScreenshotRequest(mt5AccountId: String, firebaseUrl: String, authKey: String = ""): Boolean {
+        val parsed = parseFirebaseUrl(firebaseUrl)
+        if (parsed.baseUrl.isBlank()) return true
+
+        return withContext(Dispatchers.IO) {
+            try {
+                val payload = JSONObject().apply {
+                    put("cmd", "REQUEST_SCREENSHOT")
+                    put("include_objects", true)
+                    put("timestamp", System.currentTimeMillis() / 1000L)
+                    put("requester", "Portal Mobile App")
+                }.toString()
+
+                val client = OkHttpClient()
+                val mediaType = "application/json; charset=utf-8".toMediaTypeOrNull()
+
+                val targetPaths = listOf(
+                    "/dados/eventos/$mt5AccountId/capturar_tela.json"
+                )
+
+                var success = false
+                for (targetPath in targetPaths) {
+                    try {
+                        val body = payload.toRequestBody(mediaType)
+                        val url = buildFirebaseEndpoint(parsed, targetPath, authKey)
+                        val request = Request.Builder().url(url).put(body).build()
+
+                        client.newCall(request).execute().use { response ->
+                            if (response.isSuccessful) {
+                                success = true
+                            }
+                        }
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
+                success
+            } catch (e: Exception) {
+                e.printStackTrace()
+                return@withContext false
+            }
         }
     }
 
@@ -1407,12 +1675,28 @@ class PortalRepository(
             // 1. Direct MT5 Account ID node (Primary written by EA: /dados/eventos/{ACCOUNT_LOGIN}.json)
             if (mt5AccountId.isNotBlank()) {
                 pathsToTry.add("/dados/eventos/$mt5AccountId.json")
-                pathsToTry.add("/eventos/$mt5AccountId.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/relatorio_financeiro.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/posicao_alterada.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/erro_ordem.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/ordem_executada.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/ordem_modificada.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/ordem_não_executada.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/ordem_nao_executada.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/inicializacao.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/ping.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/captura_tela.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/sessao_inicio.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/sessao_fim.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/mudanca_estado.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/mudanca_equador.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/notificacao_mql5.json")
             }
 
             // 2. User ID nodes
             if (userId.isNotBlank()) {
                 pathsToTry.add("/dados/usuarios/$userId/eventos.json")
+                pathsToTry.add("/dados/usuarios/$userId/relatorio_financeiro.json")
+                pathsToTry.add("/dados/usuarios/$userId/posicao_alterada.json")
                 if (mt5AccountId.isNotBlank()) {
                     pathsToTry.add("/dados/usuarios/$userId/$mt5AccountId/eventos.json")
                     pathsToTry.add("/dados/usuarios/$userId/eventos/$mt5AccountId.json")
@@ -1427,6 +1711,12 @@ class PortalRepository(
             // 4. Fallback collection reading
             pathsToTry.add("/dados/eventos.json")
             pathsToTry.add("/eventos.json")
+            pathsToTry.add("/dados/relatorio_financeiro.json")
+            pathsToTry.add("/dados/posicao_alterada.json")
+            pathsToTry.add("/dados/ordens.json")
+            pathsToTry.add("/relatorio_financeiro.json")
+            pathsToTry.add("/posicao_alterada.json")
+            pathsToTry.add("/ordens.json")
 
             val urlsToTry = mutableListOf<String>()
             for (p in pathsToTry.distinct()) {
@@ -1457,33 +1747,85 @@ class PortalRepository(
                 }
             }
 
-            allEvents.distinctBy { "${it.id}_${it.timestamp}_${it.event}_${it.login}" }
-                .sortedByDescending { it.timestamp }
+            val distinctList = allEvents.distinctBy { evt ->
+                val cleanId = evt.id.trim()
+                val isPushKey = cleanId.startsWith("-") && cleanId.length >= 10
+                val timeSec = if (evt.timestamp > 0L) evt.timestamp / 1000L else 0L
+                val cleanMsg = evt.msg.trim().lowercase().take(40)
+                val cleanResumo = evt.resumo.trim().lowercase().take(40)
+                val cleanNovo = evt.novo.trim().lowercase()
+                val cleanSymbol = evt.symbol.trim().uppercase()
+                val cleanEvent = evt.event.trim().lowercase()
+
+                if (isPushKey) {
+                    "${evt.login}_${cleanId}"
+                } else if (timeSec > 0L) {
+                    "${evt.login}_${cleanEvent}_${cleanSymbol}_${timeSec}_${cleanNovo}_${cleanMsg}"
+                } else {
+                    "${evt.login}_${cleanEvent}_${cleanSymbol}_${evt.data}_${evt.hora}_${cleanNovo}_${cleanMsg}_${cleanResumo}"
+                }
+            }
+
+            val filteredList = distinctList.filter { isAllowedEvent(it) }
+
+            filteredList.sortedByDescending { if (it.timestamp > 0L) it.timestamp else 0L }
         }
     }
 
     private fun parseEventObject(id: String, obj: JSONObject, defaultLogin: Long = 0L, contextName: String = ""): EaRobotEvent {
-        val loginVal = obj.optLong("login", defaultLogin)
-        val currency = obj.optString("currency", "")
-        
-        var event = obj.optString("event", obj.optString("evento", obj.optString("tipo", obj.optString("name", ""))))
-        if (event.isBlank()) {
-            if (contextName.isNotBlank() && !contextName.startsWith("-") && contextName.toLongOrNull() == null) {
-                event = contextName
-            } else if (!id.startsWith("-") && id.toLongOrNull() == null && id != "event") {
-                event = id
-            } else {
-                event = "evento"
-            }
+        var loginVal = obj.optLong("login", 0L)
+        if (loginVal == 0L) loginVal = obj.optLong("account", 0L)
+        if (loginVal == 0L) loginVal = obj.optLong("conta", 0L)
+        if (loginVal == 0L) loginVal = obj.optLong("mt5_account", 0L)
+        if (loginVal == 0L) loginVal = obj.optLong("mt5AccountId", 0L)
+        if (loginVal == 0L) {
+            val loginStr = obj.optString("login",
+                obj.optString("account",
+                    obj.optString("conta",
+                        obj.optString("mt5_account",
+                            obj.optString("mt5AccountId", "")
+                        )
+                    )
+                )
+            )
+            loginVal = loginStr.toLongOrNull() ?: 0L
+        }
+        if (loginVal == 0L && defaultLogin > 0L) {
+            loginVal = defaultLogin
+        }
+        if (loginVal == 0L) {
+            loginVal = contextName.toLongOrNull() ?: id.toLongOrNull() ?: 0L
         }
 
-        val server = obj.optString("servidor", obj.optString("server", ""))
-        val symbol = obj.optString("symbol", "")
-        val timeframe = obj.optString("timeframe", "")
+        val currency = obj.optString("currency", obj.optString("moeda", "USD"))
         
-        var timestamp = obj.optLong("timestamp", 0L)
-        val dataStr = obj.optString("data", "")
-        val horaStr = obj.optString("hora", "")
+        var event = obj.optString("event",
+            obj.optString("evento",
+                obj.optString("tipo",
+                    obj.optString("type",
+                        obj.optString("event_type",
+                            obj.optString("name",
+                                obj.optString("acao",
+                                    obj.optString("action", "")
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+        )
+
+        val server = obj.optString("servidor", obj.optString("server", obj.optString("broker", obj.optString("corretora", ""))))
+        val symbol = obj.optString("symbol", obj.optString("ativo", obj.optString("par", obj.optString("pair", "")))).uppercase()
+        val timeframe = obj.optString("timeframe", obj.optString("tf", obj.optString("periodo", "")))
+        
+        var timestamp = obj.optLong("timestamp", obj.optLong("time", obj.optLong("data_hora", obj.optLong("datetime", 0L))))
+        if (timestamp == 0L) {
+            val tsStr = obj.optString("timestamp", obj.optString("time", obj.optString("datetime", "")))
+            timestamp = tsStr.toLongOrNull() ?: 0L
+        }
+        val dataStr = obj.optString("data", obj.optString("date", ""))
+        val horaStr = obj.optString("hora", obj.optString("time_str", ""))
 
         if (timestamp == 0L && dataStr.isNotBlank()) {
             try {
@@ -1499,28 +1841,107 @@ class PortalRepository(
             }
         }
 
-        // Fix for 21.01.1970 bug: Unix timestamps in seconds (< 10_000_000_000L) must be multiplied by 1000 for Java/Kotlin milliseconds
+        // Fix Unix timestamps in seconds (< 10_000_000_000L) convert to milliseconds
         if (timestamp in 1L..9_999_999_999L) {
             timestamp *= 1000L
         }
 
-        val sistema = obj.optString("sistema", "")
-        val anterior = obj.optString("anterior", "")
-        val novo = obj.optString("novo", "")
-        val descAnterior = obj.optString("descAnterior", "")
-        val descNovo = obj.optString("descNovo", "")
+        val sistema = obj.optString("sistema", obj.optString("system", obj.optString("modulo", obj.optString("module", ""))))
+        val anterior = obj.optString("anterior", obj.optString("estado_anterior", obj.optString("from", obj.optString("previous", ""))))
+        val novo = obj.optString("novo", obj.optString("estado_novo", obj.optString("to", obj.optString("current", obj.optString("state", obj.optString("status", ""))))))
+        val descAnterior = obj.optString("descAnterior", obj.optString("desc_anterior", obj.optString("desc_from", obj.optString("discricao_anterior", obj.optString("discriçao_anterior", "")))))
+        var descNovo = obj.optString("discriçao_novo", obj.optString("discricao_novo", obj.optString("descricao_novo", obj.optString("discriçao", obj.optString("discricao", obj.optString("discrição", obj.optString("descricao", obj.optString("descNovo", obj.optString("desc_novo", obj.optString("desc_to", obj.optString("desc", obj.optString("description", ""))))))))))))
+        if (descNovo.isBlank()) {
+            val candidate = obj.optString("detalhes", obj.optString("texto", obj.optString("mensagem", "")))
+            if (candidate.isNotBlank() && candidate != sistema && candidate != novo) {
+                descNovo = candidate
+            }
+        }
 
-        val motivacao = obj.optString("motivacao", "")
-        val moeda = obj.optString("moeda", "")
-        val diarioStatus = obj.optString("diario_status", "")
-        val diarioValor = obj.optDouble("diario_valor", 0.0)
-        val diarioPct = obj.optDouble("diario_pct", 0.0)
-        val semanalStatus = obj.optString("semanal_status", "")
-        val semanalValor = obj.optDouble("semanal_valor", 0.0)
-        val semanalPct = obj.optDouble("semanal_pct", 0.0)
-        val resumo = obj.optString("resumo", "")
+        // Auto-fill official state description if matched
+        val officialMapped = resolveOfficialStateDescription(novo)
+            ?: resolveOfficialStateDescription(descNovo)
+            ?: resolveOfficialStateDescription(event)
+            ?: resolveOfficialStateDescription(obj.optString("msg", ""))
+        if (officialMapped != null) {
+            descNovo = officialMapped
+        }
 
-        val sessao = obj.optString("sessao", "")
+        val motivacao = obj.optString("motivacao", obj.optString("motivation", obj.optString("motivo", obj.optString("reason", ""))))
+        val moeda = obj.optString("moeda", obj.optString("currency", "USD"))
+        val diarioStatus = obj.optString("diario_status", obj.optString("diarioStatus", obj.optString("daily_status", obj.optString("dailyStatus", ""))))
+        val diarioValor = obj.optDouble("diario_valor", obj.optDouble("diarioValor", obj.optDouble("daily_value", obj.optDouble("dailyValue", 0.0))))
+        val diarioPct = obj.optDouble("diario_pct", obj.optDouble("diarioPct", obj.optDouble("daily_pct", obj.optDouble("dailyPct", 0.0))))
+        val semanalStatus = obj.optString("semanal_status", obj.optString("semanalStatus", obj.optString("weekly_status", obj.optString("weeklyStatus", ""))))
+        val semanalValor = obj.optDouble("semanal_valor", obj.optDouble("semanalValor", obj.optDouble("weekly_value", obj.optDouble("weeklyValue", 0.0))))
+        val semanalPct = obj.optDouble("semanal_pct", obj.optDouble("semanalPct", obj.optDouble("weekly_pct", obj.optDouble("weeklyPct", 0.0))))
+        val resumo = obj.optString("resumo", obj.optString("summary", obj.optString("descricao", "")))
+
+        val sessao = obj.optString("sessao", obj.optString("session", ""))
+
+        val amountVal = obj.optDouble("amount", obj.optDouble("valor", 0.0))
+        val typeVal = obj.optString("type", obj.optString("tipo", ""))
+        val noteVal = obj.optString("note", obj.optString("nota", obj.optString("descricao", "")))
+
+        // Trade / Order extra fields parsing
+        val ticketVal = obj.optString("ticket", obj.optString("ticket_id", obj.optString("ordem", obj.optString("order", obj.optString("order_ticket", "")))))
+        val volumeVal = obj.optDouble("volume", obj.optDouble("lote", obj.optDouble("lots", obj.optDouble("v", 0.0))))
+        val precoVal = obj.optDouble("preco", obj.optDouble("price", obj.optDouble("price_open", obj.optDouble("preco_abertura", 0.0))))
+        val lucroVal = obj.optDouble("profit", obj.optDouble("lucro", obj.optDouble("pnl", obj.optDouble("resultado", 0.0))))
+        val slVal = obj.optDouble("sl", obj.optDouble("stoploss", obj.optDouble("stop_loss", 0.0)))
+        val tpVal = obj.optDouble("tp", obj.optDouble("takeprofit", obj.optDouble("take_profit", 0.0)))
+        val direcaoVal = obj.optString("direcao", obj.optString("dir", obj.optString("direction", obj.optString("side", obj.optString("venda_compra", ""))))).uppercase()
+        val commentVal = obj.optString("comment", obj.optString("comentario", obj.optString("motivo", obj.optString("reason", ""))))
+
+        val tradeParts = mutableListOf<String>()
+        if (direcaoVal.isNotBlank()) tradeParts.add("Operação: $direcaoVal")
+        if (volumeVal > 0.0) tradeParts.add("Volume: ${String.format(java.util.Locale.US, "%.2f", volumeVal)} lotes")
+        if (precoVal > 0.0) tradeParts.add("Preço: ${String.format(java.util.Locale.US, "%.5f", precoVal)}")
+        if (ticketVal.isNotBlank() && ticketVal != "0") tradeParts.add("Ticket: #$ticketVal")
+        if (lucroVal != 0.0) tradeParts.add("Lucro: R$ ${String.format(java.util.Locale.US, "%.2f", lucroVal)}")
+        if (slVal > 0.0) tradeParts.add("SL: ${String.format(java.util.Locale.US, "%.5f", slVal)}")
+        if (tpVal > 0.0) tradeParts.add("TP: ${String.format(java.util.Locale.US, "%.5f", tpVal)}")
+        if (commentVal.isNotBlank()) tradeParts.add("Obs: $commentVal")
+
+        var msg = obj.optString("msg", obj.optString("mensagem", obj.optString("message", obj.optString("text", obj.optString("texto", obj.optString("detalhes", ""))))))
+        if (msg.isBlank()) {
+            if (event.contains("historico_financeiro") || event.contains("deal")) {
+                msg = "Histórico Financeiro: $typeVal no valor de R$ $amountVal. $noteVal".trim()
+            } else if (event.contains("captura_tela") || event.contains("screenshot")) {
+                val objetos = obj.optInt("objetos", 0)
+                msg = "Captura de tela confirmada. $objetos objetos MQL5 desenhados no gráfico."
+            } else if (tradeParts.isNotEmpty()) {
+                msg = tradeParts.joinToString(" | ")
+            }
+        } else if (tradeParts.isNotEmpty()) {
+            val tradeStr = tradeParts.joinToString(" | ")
+            if (!msg.contains(tradeStr) && ticketVal.isNotBlank() && !msg.contains(ticketVal)) {
+                msg = "$msg ($tradeStr)"
+            }
+        }
+
+        if (event.isBlank() || event.equals("evento", ignoreCase = true) || event.equals("event", ignoreCase = true) || event.equals("desconhecido", ignoreCase = true)) {
+            if (contextName.isNotBlank() && !contextName.startsWith("-") && contextName.toLongOrNull() == null) {
+                event = contextName
+            } else if (!id.startsWith("-") && id.toLongOrNull() == null && id != "event" && id != "evento") {
+                event = id
+            } else {
+                val objType = obj.optString("tipo", obj.optString("type", obj.optString("acao", obj.optString("action", ""))))
+                if (objType.isNotBlank() && !objType.equals("evento", ignoreCase = true) && !objType.equals("event", ignoreCase = true)) {
+                    event = objType
+                } else if (sistema.isNotBlank()) {
+                    event = sistema
+                } else if (novo.isNotBlank() || anterior.isNotBlank()) {
+                    event = "mudanca_estado"
+                } else if (tradeParts.isNotEmpty() || ticketVal.isNotBlank()) {
+                    event = "posicao_alterada"
+                } else if (msg.isNotBlank()) {
+                    event = "notificacao"
+                } else {
+                    event = "registro_ea"
+                }
+            }
+        }
 
         // Handle session hours flexibly (support strings, numbers, timestamps, and hh:mm formats)
         var rawHoraInicio = obj.optLong("hora_inicio", -1L)
@@ -1572,11 +1993,21 @@ class PortalRepository(
             parseHourMinute(rawHoraFim, rawMinutoFim, timestamp)
         } else Pair(-1, -1)
 
-        val msg = obj.optString("msg", obj.optString("mensagem", ""))
-        val temPosicao = obj.optString("tem_posicao", "")
+        val temPosicao = obj.optString("tem_posicao", obj.optString("temPosicao", obj.optString("has_position", "")))
         val fusoHorario = obj.optInt("fuso_horario", 0)
         val fusoTexto = obj.optString("fuso_texto", "")
-        val saldoDisponivel = obj.optDouble("saldo_disponivel", 0.0)
+        val saldoDisponivel = obj.optDouble("saldo_disponivel", obj.optDouble("saldoDisponivel", obj.optDouble("saldo", obj.optDouble("balance", obj.optDouble("equity", obj.optDouble("patrimonio", 0.0))))))
+        val imageBase64 = obj.optString("image_base64", obj.optString("imageBase64", obj.optString("image_data", "")))
+        val filename = obj.optString("filename", obj.optString("arquivo", ""))
+
+        val tipoStr = obj.optString("tipo", obj.optString("type", ""))
+        val novoSlVal = obj.optDouble("novo_sl", obj.optDouble("novoSl", 0.0))
+        val novoTpVal = obj.optDouble("novo_tp", obj.optDouble("novoTp", 0.0))
+        val alvoMtVal = obj.optDouble("alvo_mt", obj.optDouble("alvoMt", 0.0))
+        val protecaoMtVal = obj.optDouble("protecao_mt", obj.optDouble("protecaoMt", 0.0))
+        val lucroPctVal = obj.optDouble("lucro_pct", obj.optDouble("lucroPct", 0.0))
+        val perdaPctVal = obj.optDouble("perda_pct", obj.optDouble("perdaPct", 0.0))
+        val erroCodeVal = obj.optInt("erro_code", obj.optInt("erroCode", obj.optInt("error_code", obj.optInt("code", 0))))
 
         return EaRobotEvent(
             id = id,
@@ -1612,8 +2043,64 @@ class PortalRepository(
             temPosicao = temPosicao,
             fusoHorario = fusoHorario,
             fusoTexto = fusoTexto,
-            saldoDisponivel = saldoDisponivel
+            saldoDisponivel = saldoDisponivel,
+            amount = amountVal,
+            type = typeVal,
+            tipo = tipoStr,
+            price = precoVal,
+            volume = volumeVal,
+            sl = slVal,
+            tp = tpVal,
+            novoSl = novoSlVal,
+            novoTp = novoTpVal,
+            alvoMt = alvoMtVal,
+            protecaoMt = protecaoMtVal,
+            lucroPct = lucroPctVal,
+            perdaPct = perdaPctVal,
+            erroCode = erroCodeVal,
+            note = noteVal,
+            ticket = ticketVal,
+            imageBase64 = imageBase64,
+            filename = filename
         )
+    }
+
+    suspend fun fetchHistoricoPatrimonio(
+        firebaseUrl: String,
+        accountId: String,
+        authKey: String = ""
+    ): List<JSONObject> {
+        return withContext(Dispatchers.IO) {
+            val list = mutableListOf<JSONObject>()
+            if (firebaseUrl.isBlank() || accountId.isBlank()) return@withContext list
+            val parsed = parseFirebaseUrl(firebaseUrl)
+            if (parsed.baseUrl.isBlank()) return@withContext list
+
+            val path = "/dados/eventos/historico_patrimonio/$accountId.json"
+            val endpoint = buildFirebaseEndpoint(parsed, path, authKey)
+
+            try {
+                val client = OkHttpClient()
+                val request = Request.Builder().url(endpoint).get().build()
+                val response = client.newCall(request).execute()
+                val responseBody = response.body?.string() ?: ""
+                if (response.isSuccessful && responseBody.isNotBlank() && responseBody != "null") {
+                    val rootObj = JSONObject(responseBody)
+                    val movsArray = rootObj.optJSONArray("movimentos")
+                    if (movsArray != null) {
+                        for (i in 0 until movsArray.length()) {
+                            val movObj = movsArray.optJSONObject(i)
+                            if (movObj != null) {
+                                list.add(movObj)
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+            list
+        }
     }
 
     private fun extractEventsFromObject(
@@ -1639,7 +2126,10 @@ class PortalRepository(
                 obj.has("hora") || obj.has("msg") || obj.has("mensagem") ||
                 obj.has("resumo") || obj.has("motivacao") || obj.has("servidor") || obj.has("server") ||
                 obj.has("diario_status") || obj.has("semanal_status") || obj.has("sessao") || obj.has("novo") ||
-                obj.has("sistema") || obj.has("anterior") || obj.has("hora_inicio")
+                obj.has("sistema") || obj.has("anterior") || obj.has("hora_inicio") ||
+                obj.has("relatorio_financeiro") || obj.has("posicao_alterada") || obj.has("posicao") ||
+                obj.has("ordem") || obj.has("order") || obj.has("ordens") || obj.has("orders") ||
+                obj.has("ticket") || obj.has("tipo") || obj.has("tem_posicao") || obj.has("diario_valor")
 
         if (!hasChildJson || hasEventFields) {
             val loginVal = obj.optLong("login", defaultLogin)
@@ -1696,20 +2186,15 @@ class PortalRepository(
 fun EaConfigEntity.toJsonContent(): String {
     return """{
   "mt5AccountId": "$mt5AccountId",
-  "lJJ": "$lJJ",
-  "xFF": "$xFF",
   "SENHA": "$SENHA",
-  "aYY": "$aYY",
   "ESQUEMA_CORES_ENUM": "$ESQUEMA_CORES_ENUM",
   "cor_de_canal": "$cor_de_canal",
   "cor_de_linhas": "$cor_de_linhas",
   "corr_de_equador": "$corr_de_equador",
-  "sJJ": "$sJJ",
   "LINHAS_DE_EQUADOR": $LINHAS_DE_EQUADOR,
   "TREND": "$TREND",
   "M_equador_alta": $M_equador_alta,
   "M_equador_baixa": $M_equador_baixa,
-  "xxx": "$xxx",
   "TEMA": $TEMA,
   "ESTRATÉGIA": "$ESTRATÉGIA",
   "virada_de_jogo": $virada_de_jogo,
@@ -1717,7 +2202,6 @@ fun EaConfigEntity.toJsonContent(): String {
   "Costurar": $Costurar,
   "OperationalPeriod": "$OperationalPeriod",
   "lot": $lot,
-  "dS": "$dS",
   "EA_ATIVO": $EA_ATIVO,
   "ea_ativo": $EA_ATIVO,
   "EA_AUTO": $EA_AUTO,
@@ -1728,7 +2212,6 @@ fun EaConfigEntity.toJsonContent(): String {
   "SESSAO_NOVA_YORQUI": $SESSAO_NOVA_YORQUI,
   "EXPANSAO_MINIMA": $EXPANSAO_MINIMA,
   "EXPANSAO_MAXIMA": $EXPANSAO_MAXIMA,
-  "dSS": "$dSS",
   "compra": $compra,
   "venda": $venda,
   "santo": $santo,
@@ -1736,7 +2219,6 @@ fun EaConfigEntity.toJsonContent(): String {
   "posicaoTake": $posicaoTake,
   "buy_take": $buy_take,
   "sell_take": $sell_take,
-  "fDD": "$fDD",
   "SALDO": $SALDO,
   "GERENCIAMENTO_DE_RISCO_DIARIO": $GERENCIAMENTO_DE_RISCO_DIARIO,
   "porcentos": $porcentos,
@@ -1744,7 +2226,6 @@ fun EaConfigEntity.toJsonContent(): String {
   "GERENCIAMENTO_DE_RISCO_SEMANAL": $GERENCIAMENTO_DE_RISCO_SEMANAL,
   "PORCENTOO": $PORCENTOO,
   "PORCENTOSS": $PORCENTOSS,
-  "gG": "$gG",
   "GMAIL": $GMAIL,
   "notific": $notific,
   "ativar_ou_desativar_venda": $ativar_ou_desativar_venda,
@@ -1752,7 +2233,6 @@ fun EaConfigEntity.toJsonContent(): String {
   "Modify_Sl_For_OxO": $Modify_Sl_For_OxO,
   "condicao_De_rompimento_c": $condicao_De_rompimento_c,
   "condicao_De_rompimento_v": $condicao_De_rompimento_v,
-  "hFF": "$hFF",
   "mony": "$mony",
   "CAMBIO": $CAMBIO,
   "LER_CONEXAO_LICENCA": $LER_CONEXAO_LICENCA,
@@ -1770,20 +2250,15 @@ fun EaConfigEntity.toJsonContent(): String {
 
 fun EaConfigEntity.toSetFileContent(): String {
     return buildString {
-        appendLine("lJJ=$lJJ")
-        appendLine("xFF=$xFF")
         appendLine("SENHA=$SENHA")
-        appendLine("aYY=$aYY")
         appendLine("ESQUEMA_CORES_ENUM=$ESQUEMA_CORES_ENUM")
         appendLine("cor_de_canal=$cor_de_canal")
         appendLine("cor_de_linhas=$cor_de_linhas")
         appendLine("corr_de_equador=$corr_de_equador")
-        appendLine("sJJ=$sJJ")
         appendLine("LINHAS_DE_EQUADOR=${if (LINHAS_DE_EQUADOR) "1" else "0"}")
         appendLine("TREND=$TREND")
         appendLine("M_equador_alta=$M_equador_alta")
         appendLine("M_equador_baixa=$M_equador_baixa")
-        appendLine("xxx=$xxx")
         appendLine("TEMA=${if (TEMA) "1" else "0"}")
         appendLine("ESTRATÉGIA=$ESTRATÉGIA")
         appendLine("virada_de_jogo=${if (virada_de_jogo) "1" else "0"}")
@@ -1791,7 +2266,6 @@ fun EaConfigEntity.toSetFileContent(): String {
         appendLine("Costurar=${if (Costurar) "1" else "0"}")
         appendLine("OperationalPeriod=$OperationalPeriod")
         appendLine("lot=$lot")
-        appendLine("dS=$dS")
         appendLine("EA_ATIVO=${if (EA_ATIVO) "1" else "0"}")
         appendLine("EA_AUTO=${if (EA_AUTO) "1" else "0"}")
         appendLine("AUTO_PERIOD=$AUTO_PERIOD")
@@ -1801,7 +2275,6 @@ fun EaConfigEntity.toSetFileContent(): String {
         appendLine("SESSAO_NOVA_YORQUI=${if (SESSAO_NOVA_YORQUI) "1" else "0"}")
         appendLine("EXPANSAO_MINIMA=$EXPANSAO_MINIMA")
         appendLine("EXPANSAO_MAXIMA=$EXPANSAO_MAXIMA")
-        appendLine("dSS=$dSS")
         appendLine("compra=$compra")
         appendLine("venda=$venda")
         appendLine("santo=$santo")
@@ -1809,7 +2282,6 @@ fun EaConfigEntity.toSetFileContent(): String {
         appendLine("posicaoTake=${if (posicaoTake) "1" else "0"}")
         appendLine("buy_take=$buy_take")
         appendLine("sell_take=$sell_take")
-        appendLine("fDD=$fDD")
         appendLine("SALDO=$SALDO")
         appendLine("GERENCIAMENTO_DE_RISCO_DIARIO=${if (GERENCIAMENTO_DE_RISCO_DIARIO) "1" else "0"}")
         appendLine("porcentos=$porcentos")
@@ -1817,7 +2289,6 @@ fun EaConfigEntity.toSetFileContent(): String {
         appendLine("GERENCIAMENTO_DE_RISCO_SEMANAL=${if (GERENCIAMENTO_DE_RISCO_SEMANAL) "1" else "0"}")
         appendLine("PORCENTOO=$PORCENTOO")
         appendLine("PORCENTOSS=$PORCENTOSS")
-        appendLine("gG=$gG")
         appendLine("GMAIL=${if (GMAIL) "1" else "0"}")
         appendLine("notific=${if (notific) "1" else "0"}")
         appendLine("ativar_ou_desativar_venda=${if (ativar_ou_desativar_venda) "1" else "0"}")
@@ -1825,7 +2296,6 @@ fun EaConfigEntity.toSetFileContent(): String {
         appendLine("Modify_Sl_For_OxO=${if (Modify_Sl_For_OxO) "1" else "0"}")
         appendLine("condicao_De_rompimento_c=${if (condicao_De_rompimento_c) "1" else "0"}")
         appendLine("condicao_De_rompimento_v=${if (condicao_De_rompimento_v) "1" else "0"}")
-        appendLine("hFF=$hFF")
         appendLine("mony=$mony")
         appendLine("CAMBIO=$CAMBIO")
     }

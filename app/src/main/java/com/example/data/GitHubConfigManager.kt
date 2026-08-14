@@ -79,7 +79,7 @@ class GitHubConfigManager(context: Context) {
 
     // New Data Source Mode support (GITHUB or FIREBASE)
     fun getDataSourceMode(): String {
-        return prefs.getString("data_source_mode", "GITHUB") ?: "GITHUB"
+        return prefs.getString("data_source_mode", "FIREBASE") ?: "FIREBASE"
     }
 
     fun setDataSourceMode(mode: String) {

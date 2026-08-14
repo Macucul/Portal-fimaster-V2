@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//|                                         fimaster_notificar.mql5  |
+//|                                      ea_fimaster_completo.mql5   |
 //|                                 Copyright 2026, Jossias Macucul  |
 //|                                      https://bit.ly/4jJQJsl      |
 //+------------------------------------------------------------------+
@@ -8,7 +8,7 @@
 //| VERSÃO ATUALIZADA DO MÓDULO EA FIMASTER                          |
 #property version   "13.0"
 //| DESCRIÇÃO SINTÉTICA DO MÓDULO DE NOTIFICAÇÃO E TELEMETRIA        |
-#property description "Modulo de Notificacao e Transicao de Estados - EA FIMASTER"
+#property description "EA FIMASTER - Sistema Integrado de Trading e Notificações"
 //| COMPILAÇÃO EM MODO ESTRITO COM VERIFICAÇÃO RIGOROSA DE TIPOS     |
 #property strict
 
@@ -1507,8 +1507,6 @@ void OnTimer()
 //+------------------------------------------------------------------+
 void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
   {
-   ProcessarEventoPainelVisual(id, sparam);
-
    // Tecla 'C' (código ASCII 67) para Captura Instantânea do Gráfico
    if(id == CHARTEVENT_KEYDOWN && lparam == 67)
      {
