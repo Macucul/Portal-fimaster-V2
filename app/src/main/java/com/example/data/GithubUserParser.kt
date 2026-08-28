@@ -46,9 +46,9 @@ object GithubUserParser {
             val mt5IdConta = mt5Obj?.optString("id_conta") ?: ""
 
             val licencaObj = userObj.optJSONObject("licenca")
-            val licencaAtiva = licencaObj?.optBoolean("ativa") ?: false
-            val licencaProduto = licencaObj?.optString("produto") ?: "Fimaster"
-            val licencaPlano = licencaObj?.optString("plano") ?: "Anual"
+            val licencaAtiva = licencaObj?.optBoolean("ativa", false) ?: false
+            val licencaProduto = licencaObj?.optString("produto", "FiMaster EA") ?: "FiMaster EA"
+            val licencaPlano = licencaObj?.optString("plano", "") ?: ""
             val licencaValidade = licencaObj?.optString("validade", "") ?: ""
             val licencaUltimaRenovacao = licencaObj?.optString("ultima_renovacao", "") ?: ""
             val licencaTotalRenovacoes = licencaObj?.optInt("total_renovacoes", 0) ?: 0

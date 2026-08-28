@@ -41,3 +41,54 @@ interface EaConfigDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertOrUpdateEaConfig(config: EaConfigEntity)
 }
+
+@Dao
+interface EaRobotEventDao {
+    @Query("SELECT * FROM ea_robot_events ORDER BY timestamp DESC")
+    fun getAllEvents(): Flow<List<EaRobotEventEntity>>
+
+    @Query("SELECT * FROM ea_robot_events WHERE login = :accountId OR (login == 0 AND id = :accountIdStr) OR (:accountId = 0 AND :accountIdStr = '') ORDER BY timestamp DESC")
+    fun getEventsForAccount(accountId: Long, accountIdStr: String): Flow<List<EaRobotEventEntity>>
+
+    @Query("SELECT * FROM ea_robot_events WHERE gid = :gid LIMIT 1")
+    suspend fun getEventByGid(gid: String): EaRobotEventEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertOrUpdateEvents(events: List<EaRobotEventEntity>)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertOrUpdateEvent(event: EaRobotEventEntity)
+
+    @Query("SELECT MAX(timestamp) FROM ea_robot_events WHERE login = :accountId OR (login == 0 AND id = :accountIdStr) OR (:accountId = 0 AND :accountIdStr = '')")
+    suspend fun getMaxTimestamp(accountId: Long, accountIdStr: String): Long?
+
+    @Query("SELECT gid FROM ea_robot_events WHERE login = :accountId OR (login == 0 AND id = :accountIdStr) OR (:accountId = 0 AND :accountIdStr = '') ORDER BY timestamp DESC LIMIT 1")
+    suspend fun getLastGid(accountId: Long, accountIdStr: String): String?
+
+    @Query("SELECT COUNT(*) FROM ea_robot_events WHERE login = :accountId OR (login == 0 AND id = :accountIdStr) OR (:accountId = 0 AND :accountIdStr = '')")
+    suspend fun getEventsCount(accountId: Long, accountIdStr: String): Int
+
+    @Query("DELETE FROM ea_robot_events WHERE login = :accountId OR (login == 0 AND id = :accountIdStr)")
+    suspend fun deleteEventsForAccount(accountId: Long, accountIdStr: String)
+
+    @Query("DELETE FROM ea_robot_events")
+    suspend fun clearAllEvents()
+}
+
+@Dao
+interface SyncMetadataDao {
+    @Query("SELECT * FROM sync_metadata WHERE accountId = :accountId LIMIT 1")
+    suspend fun getMetadata(accountId: String): SyncMetadataEntity?
+
+    @Query("SELECT * FROM sync_metadata WHERE accountId = :accountId LIMIT 1")
+    fun getMetadataFlow(accountId: String): Flow<SyncMetadataEntity?>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertOrUpdateMetadata(metadata: SyncMetadataEntity)
+
+    @Query("DELETE FROM sync_metadata WHERE accountId = :accountId")
+    suspend fun deleteMetadata(accountId: String)
+
+    @Query("DELETE FROM sync_metadata")
+    suspend fun clearAllMetadata()
+}

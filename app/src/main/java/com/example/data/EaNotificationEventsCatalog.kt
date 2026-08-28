@@ -208,6 +208,7 @@ object EaNotificationEventsCatalog {
 
         return EaRobotEvent(
             id = account.toString(),
+            gid = java.util.UUID.randomUUID().toString(),
             currency = "USD",
             event = definition.eventType,
             login = account,
@@ -238,6 +239,7 @@ object EaNotificationEventsCatalog {
 
             EaRobotEvent(
                 id = account.toString(),
+                gid = java.util.UUID.randomUUID().toString(),
                 currency = "USD",
                 event = def.eventType,
                 login = account,

@@ -110,11 +110,29 @@ class PortalViewModel(
     private val _eaRobotEvents = MutableStateFlow<List<com.example.data.EaRobotEvent>>(emptyList())
     val eaRobotEvents: StateFlow<List<com.example.data.EaRobotEvent>> = _eaRobotEvents.asStateFlow()
 
+    private val _isSyncing = MutableStateFlow(false)
+    val isSyncing: StateFlow<Boolean> = _isSyncing.asStateFlow()
+
+    private val _syncMetadata = MutableStateFlow<com.example.data.SyncMetadataEntity?>(null)
+    val syncMetadata: StateFlow<com.example.data.SyncMetadataEntity?> = _syncMetadata.asStateFlow()
+
     private val _isSimulationActive = MutableStateFlow(false)
     val isSimulationActive: StateFlow<Boolean> = _isSimulationActive.asStateFlow()
 
     private val _adminTemplates = MutableStateFlow<List<com.example.data.AdminEaTemplate>>(emptyList())
     val adminTemplates: StateFlow<List<com.example.data.AdminEaTemplate>> = _adminTemplates.asStateFlow()
+
+    private val _globalLicenseConfig = MutableStateFlow(com.example.data.GlobalLicenseConfig())
+    val globalLicenseConfig: StateFlow<com.example.data.GlobalLicenseConfig> = _globalLicenseConfig.asStateFlow()
+
+    val userEffectivePlanConfig: StateFlow<com.example.data.LicensePlanConfig> = combine(_loggedUser, _globalLicenseConfig) { user, globalCfg ->
+        val tier = user?.let { com.example.data.LicenseTier.fromPlanString(it.licencaPlano, it.licencaProduto) } ?: com.example.data.LicenseTier.TRIAL
+        globalCfg.getConfigForTier(tier)
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000),
+        initialValue = com.example.data.LicensePlanConfig()
+    )
 
     // Compatibility userProfile mapped from loggedUser
     val userProfile: StateFlow<UserProfile?> = _loggedUser.map { githubUser ->
@@ -203,15 +221,172 @@ class PortalViewModel(
     init {
         viewModelScope.launch {
             repository.seedInitialDataIfEmpty()
+            autoAuthenticateAndRegisterDevice()
         }
         viewModelScope.launch {
             loadAdminTemplates()
+            loadLicensePlanConfig()
         }
         viewModelScope.launch {
             userProfile.collect { profile ->
                 if (profile != null && profile.mt5AccountId.isNotBlank()) {
+                    val accountId = profile.mt5AccountId
+                    // Carrega eventos locais do Room instantaneamente
+                    launch {
+                        repository.getLocalEventsFlow(accountId).collect { localEvts ->
+                            if (!_isSimulationActive.value) {
+                                val allowed = localEvts.filter { com.example.data.isAllowedEvent(it) }
+                                _eaRobotEvents.value = allowed.sortedByDescending { if (it.timestamp > 0L) it.timestamp else 0L }
+                            }
+                        }
+                    }
+                    launch {
+                        repository.getSyncMetadataFlow(accountId).collect { meta ->
+                            _syncMetadata.value = meta
+                        }
+                    }
                     startStatusPolling(profile.mt5AccountId)
                 }
+            }
+        }
+    }
+
+    /**
+     * Autenticação e Registro Automático com UID do Dispositivo no Firebase
+     */
+    fun autoAuthenticateAndRegisterDevice(forceRegisterNew: Boolean = false) {
+        viewModelScope.launch {
+            if (_isLoggedIn.value && !forceRegisterNew) return@launch
+            _loginLoading.value = true
+            try {
+                val context = getApplication<Application>()
+                val deviceIdentityManager = com.example.data.security.DeviceIdentityManager(context)
+                val deviceUid = deviceIdentityManager.getSilentDeviceUid()
+
+                // 1. Silent Firebase Auth (signInAnonymously or existing session)
+                val authResult = deviceIdentityManager.authenticateDeviceWithFirebase()
+                val effectiveFirebaseUid = authResult.firebaseAuthUid ?: deviceUid
+
+                val isoFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
+                    timeZone = TimeZone.getTimeZone("UTC")
+                }
+                val isoTimestamp = isoFormat.format(Date())
+
+                // 2. Busca perfil existente no Firebase pelo deviceUid ou effectiveFirebaseUid
+                var existingUser = repository.fetchUserByUidFirebase(deviceUid, _firebaseUrl.value, deviceUid)
+                if (existingUser == null && effectiveFirebaseUid != deviceUid) {
+                    existingUser = repository.fetchUserByUidFirebase(effectiveFirebaseUid, _firebaseUrl.value, deviceUid)
+                }
+
+                // 3. Fallback: Se não encontrado no Firebase, verifica perfil local em cache
+                if (existingUser == null) {
+                    val currentProfile = _userProfileStateDirect()
+                    if (currentProfile != null && currentProfile.fullName.isNotBlank()) {
+                        existingUser = GithubUser(
+                            id = deviceUid,
+                            nome = currentProfile.fullName,
+                            numero = "",
+                            senhaHash = currentProfile.passwordHash,
+                            saldo = currentProfile.balanceMT,
+                            status = "ATIVO",
+                            mt5IdConta = currentProfile.mt5AccountId.ifBlank { "859423" },
+                            licencaAtiva = currentProfile.licenseStatus.equals("Ativa", ignoreCase = true),
+                            licencaPlano = "trial",
+                            licencaProduto = "Fimaster EA Pro",
+                            licencaValidade = currentProfile.licenseExpiryDate,
+                            auditoriaUltimoDispositivo = deviceUid,
+                            auditoriaUltimoLogin = isoTimestamp,
+                            dataRegistro = isoTimestamp,
+                            ultimaAtualizacao = isoTimestamp
+                        )
+                    }
+                }
+
+                val finalUser = if (existingUser != null && !forceRegisterNew) {
+                    // Usuário já cadastrado para este dispositivo: atualiza auditoria e login
+                    val updated = existingUser.copy(
+                        auditoriaUltimoDispositivo = deviceUid,
+                        auditoriaUltimoLogin = isoTimestamp,
+                        ultimaAtualizacao = isoTimestamp
+                    )
+                    val targetId = updated.id.ifBlank { deviceUid }
+                    repository.updateSilentSecurityInFirebase(targetId, deviceUid, isoTimestamp, _firebaseUrl.value, deviceUid)
+                    repository.saveUserToFirebaseWithDetails(updated, _firebaseUrl.value, deviceUid)
+                    updated
+                } else {
+                    // Novo usuário: registra automaticamente no Firebase com UID do dispositivo
+                    val newUser = deviceIdentityManager.createDefaultDeviceUser(deviceUid, effectiveFirebaseUid)
+                    repository.saveUserToFirebaseWithDetails(newUser, _firebaseUrl.value, deviceUid)
+                    repository.updateSilentSecurityInFirebase(deviceUid, deviceUid, isoTimestamp, _firebaseUrl.value, deviceUid)
+                    newUser
+                }
+
+                // Efetiva Login e ativação de sessão
+                _loggedUser.value = finalUser
+                _isLoggedIn.value = true
+
+                // Salva/atualiza perfil no banco local Room
+                val localProfile = UserProfile(
+                    id = 1,
+                    fullName = finalUser.nome,
+                    mt5AccountId = finalUser.mt5IdConta,
+                    passwordHash = finalUser.senhaHash,
+                    licenseStatus = if (finalUser.licencaAtiva) "Ativa" else "Expirada",
+                    licenseExpiryDate = finalUser.licencaValidade,
+                    balanceMT = finalUser.saldo,
+                    githubToken = _adminConfig.value.token,
+                    githubRepo = _adminConfig.value.repository,
+                    githubBranch = _adminConfig.value.branch,
+                    deviceId = deviceUid
+                )
+                repository.insertOrUpdateProfileLocally(localProfile)
+
+                if (finalUser.mt5IdConta.isNotBlank()) {
+                    repository.insertOrUpdateEaConfigLocally(EaConfigEntity(mt5AccountId = finalUser.mt5IdConta))
+                    startStatusPolling(finalUser.mt5IdConta)
+                }
+
+                _messageState.value = "Dispositivo autenticado com sucesso! Bem-vindo, ${finalUser.nome}."
+            } catch (e: Exception) {
+                e.printStackTrace()
+                _messageState.value = "Erro na autenticação do dispositivo: ${e.localizedMessage}"
+            } finally {
+                _loginLoading.value = false
+            }
+        }
+    }
+
+    private fun _userProfileStateDirect(): UserProfile? {
+        return userProfile.value
+    }
+
+    fun loadLicensePlanConfig() {
+        viewModelScope.launch {
+            try {
+                val config = repository.fetchLicensePlanConfig(_adminConfig.value, _firebaseUrl.value)
+                _globalLicenseConfig.value = config
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    fun updateLicensePlanConfig(newConfig: com.example.data.GlobalLicenseConfig) {
+        viewModelScope.launch {
+            _actionLoadingMessage.value = "Sincronizando regras de licença em dados/indice/licenca.json..."
+            _actionLoading.value = true
+            try {
+                _globalLicenseConfig.value = newConfig
+                val ok = repository.saveLicensePlanConfig(newConfig, _adminConfig.value, _firebaseUrl.value)
+                if (ok) {
+                    _messageState.value = "✅ Configuração de licenças sincronizada em dados/indice/licenca.json com sucesso!"
+                } else {
+                    _messageState.value = "⚠️ Configuração aplicada localmente, verifique as credenciais do GitHub/Firebase."
+                }
+            } catch (e: Exception) {
+                _messageState.value = "Erro ao sincronizar licenças: ${e.localizedMessage}"
+            } finally {
+                _actionLoading.value = false
             }
         }
     }
@@ -998,24 +1173,24 @@ class PortalViewModel(
                         _eaRobotStatus.value = EaRobotStatus(online = false, lastPing = 0L)
                     }
 
-                    // Fetch and filter events belonging to this account / user
+                    // Intelligent Sync Flow: First login fetches all events into Room local DB; subsequent syncs only fetch new/altered events with GID unique key
                     if (!_isSimulationActive.value) {
-                        val eventsList = repository.fetchEaRobotEvents(_firebaseUrl.value, mt5AccountId, silentUid, currentUserId)
-                        val accountIdLong = mt5AccountId.toLongOrNull() ?: -1L
-                        val filteredEvents = if (mt5AccountId.isNotBlank() && accountIdLong > 0) {
-                            eventsList.filter { event ->
-                                event.login == accountIdLong || (event.login == 0L && (event.id == mt5AccountId || event.filename.contains(mt5AccountId)))
-                            }
-                        } else if (mt5AccountId.isNotBlank()) {
-                            eventsList.filter { event ->
-                                event.id == mt5AccountId || event.filename.contains(mt5AccountId) || event.login.toString() == mt5AccountId
-                            }
-                        } else {
-                            eventsList
+                        try {
+                            _isSyncing.value = true
+                            val syncResult = repository.smartSyncEaRobotEvents(
+                                firebaseUrl = _firebaseUrl.value,
+                                mt5AccountId = mt5AccountId,
+                                authKey = silentUid,
+                                userId = currentUserId,
+                                forceFullSync = false
+                            )
+                            val meta = repository.getSyncMetadata(mt5AccountId)
+                            _syncMetadata.value = meta
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                        } finally {
+                            _isSyncing.value = false
                         }
-                        val allowedEvents = filteredEvents.filter { com.example.data.isAllowedEvent(it) }
-                        val finalEvents = allowedEvents.sortedByDescending { if (it.timestamp > 0L) it.timestamp else 0L }
-                        _eaRobotEvents.value = finalEvents
 
                         // Auto-sync Real MT5 Financial History (Deposits, Withdrawals, Position Entries/Exits)
                         val realTxs = mutableListOf<FinancialTransaction>()
@@ -1047,7 +1222,7 @@ class PortalViewModel(
                             )
                         }
 
-                        filteredEvents.filter { 
+                        _eaRobotEvents.value.filter { 
                             it.event.contains("historico_financeiro") || it.event.contains("deal")
                         }.forEach { evt ->
                             val id = evt.id.ifBlank { "evt_${evt.timestamp}" }
@@ -1086,7 +1261,7 @@ class PortalViewModel(
                             _financialTransactions.value = merged
                         }
 
-                        val latestScreenshot = filteredEvents.firstOrNull {
+                        val latestScreenshot = _eaRobotEvents.value.firstOrNull {
                             it.event.lowercase().contains("captura_tela") || it.event.lowercase().contains("screenshot")
                         }
                         if (latestScreenshot != null) {
@@ -1376,13 +1551,49 @@ class PortalViewModel(
             )
         ) + com.example.data.EaNotificationEventsCatalog.generateNotificationEventsList(accountLong, currentSymbol)
 
-        _eaRobotEvents.value = simEvents
+        _eaRobotEvents.value = simEvents.map { com.example.data.EaEventGidManager.ensureGid(it) }
         _messageState.value = "⚡ Simulação disparada! Todos os eventos e status do robô EA foram gerados."
     }
 
     fun clearEvents() {
-        _eaRobotEvents.value = emptyList()
-        _messageState.value = "🗑️ Todos os eventos do robô EA foram limpos."
+        viewModelScope.launch {
+            val accountId = userProfile.value?.mt5AccountId?.ifBlank { "859423" } ?: "859423"
+            repository.clearLocalEventsPreservingSyncPosition(accountId)
+            _eaRobotEvents.value = emptyList()
+            _syncMetadata.value = repository.getSyncMetadata(accountId)
+            _messageState.value = "🗑️ Eventos limpos localmente. Apenas novos eventos a partir deste ponto serão baixados no próximo Smart Sync."
+        }
+    }
+
+    fun triggerSmartSync(forceFull: Boolean = false) {
+        viewModelScope.launch {
+            if (_isSimulationActive.value) {
+                _messageState.value = "⚡ Modo de simulação ativo. Desative a simulação para sincronizar dados reais."
+                return@launch
+            }
+            val accountId = userProfile.value?.mt5AccountId?.ifBlank { "859423" } ?: "859423"
+            val context = getApplication<Application>()
+            val silentUid = _loggedUser.value?.auditoriaUltimoDispositivo.orEmpty().ifBlank {
+                com.example.data.security.DeviceIdentityManager(context).getSilentDeviceUid()
+            }
+            val currentUserId = _loggedUser.value?.id.orEmpty()
+            _isSyncing.value = true
+            try {
+                val syncResult = repository.smartSyncEaRobotEvents(
+                    firebaseUrl = _firebaseUrl.value,
+                    mt5AccountId = accountId,
+                    authKey = silentUid,
+                    userId = currentUserId,
+                    forceFullSync = forceFull
+                )
+                _syncMetadata.value = repository.getSyncMetadata(accountId)
+                _messageState.value = "🔄 ${syncResult.message}"
+            } catch (e: Exception) {
+                _messageState.value = "❌ Falha na sincronização: ${e.localizedMessage ?: "Erro de conexão"}"
+            } finally {
+                _isSyncing.value = false
+            }
+        }
     }
 
     fun stopStatusPolling() {
@@ -1679,6 +1890,106 @@ private fun createChartBitmapBytes(symbol: String, timeframe: String, objectsCou
     val stream = java.io.ByteArrayOutputStream()
     bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, stream)
     return stream.toByteArray()
+}
+
+fun shareChartScreenshot(
+    context: android.content.Context,
+    chartScreenshot: ChartScreenshotData
+) {
+    try {
+        val cacheDir = java.io.File(context.cacheDir, "shared_images").apply { mkdirs() }
+        val shareFile = java.io.File(cacheDir, "chart_capture_${System.currentTimeMillis()}.png")
+
+        val bitmap = chartScreenshot.getReconstructedBitmap()
+        if (bitmap != null) {
+            val fos = java.io.FileOutputStream(shareFile)
+            bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, fos)
+            fos.flush()
+            fos.close()
+        } else if (!chartScreenshot.imageBase64.isNullOrBlank()) {
+            val bytes = android.util.Base64.decode(chartScreenshot.imageBase64, android.util.Base64.DEFAULT)
+            shareFile.writeBytes(bytes)
+        } else if (chartScreenshot.imageBytes != null && chartScreenshot.imageBytes.isNotEmpty()) {
+            shareFile.writeBytes(chartScreenshot.imageBytes)
+        } else if (!chartScreenshot.imageFilePath.isNullOrBlank() && java.io.File(chartScreenshot.imageFilePath).exists()) {
+            java.io.File(chartScreenshot.imageFilePath).copyTo(shareFile, overwrite = true)
+        } else {
+            val bytes = createChartBitmapBytes(chartScreenshot.symbol, chartScreenshot.timeframe, chartScreenshot.objectsCount)
+            shareFile.writeBytes(bytes)
+        }
+
+        val contentUri: android.net.Uri = androidx.core.content.FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            shareFile
+        )
+
+        val timeStr = if (chartScreenshot.timestamp > 0) {
+            val sdf = java.text.SimpleDateFormat("dd/MM/yyyy HH:mm:ss", java.util.Locale.getDefault())
+            sdf.format(java.util.Date(chartScreenshot.timestamp * 1000L))
+        } else ""
+
+        val shareIntent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+            type = "image/png"
+            putExtra(android.content.Intent.EXTRA_STREAM, contentUri)
+            val shareText = buildString {
+                append("📊 Captura do Gráfico MT5 - Robô Fimaster\n")
+                append("Paridade: ${chartScreenshot.symbol} (${chartScreenshot.timeframe})\n")
+                if (timeStr.isNotEmpty()) append("Horário: $timeStr\n")
+                append("Status: ${chartScreenshot.statusText}")
+            }
+            putExtra(android.content.Intent.EXTRA_TEXT, shareText)
+            putExtra(android.content.Intent.EXTRA_SUBJECT, "Captura do Gráfico MT5 - ${chartScreenshot.symbol}")
+            addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+
+        val chooser = android.content.Intent.createChooser(shareIntent, "Compartilhar Captura do Gráfico")
+        chooser.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(chooser)
+    } catch (e: Exception) {
+        e.printStackTrace()
+        android.widget.Toast.makeText(context, "Erro ao compartilhar imagem: ${e.localizedMessage}", android.widget.Toast.LENGTH_SHORT).show()
+    }
+}
+
+fun shareEventScreenshot(
+    context: android.content.Context,
+    event: com.example.data.EaRobotEvent
+) {
+    try {
+        val cacheDir = java.io.File(context.cacheDir, "shared_images").apply { mkdirs() }
+        val shareFile = java.io.File(cacheDir, "event_capture_${System.currentTimeMillis()}.png")
+
+        if (event.imageBase64.isNotBlank()) {
+            val bytes = android.util.Base64.decode(event.imageBase64, android.util.Base64.DEFAULT)
+            shareFile.writeBytes(bytes)
+        } else {
+            val sym = if (event.symbol.isNotBlank()) event.symbol else "XAUUSD"
+            val tf = if (event.timeframe.isNotBlank()) event.timeframe else "M15"
+            val bytes = createChartBitmapBytes(sym, tf, 18)
+            shareFile.writeBytes(bytes)
+        }
+
+        val contentUri: android.net.Uri = androidx.core.content.FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            shareFile
+        )
+
+        val shareIntent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+            type = "image/png"
+            putExtra(android.content.Intent.EXTRA_STREAM, contentUri)
+            val shareText = "📊 Captura do Gráfico MT5 - ${event.symbol} (${event.timeframe})\n${event.msg}"
+            putExtra(android.content.Intent.EXTRA_TEXT, shareText)
+            addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        val chooser = android.content.Intent.createChooser(shareIntent, "Compartilhar Captura")
+        chooser.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(chooser)
+    } catch (e: Exception) {
+        e.printStackTrace()
+        android.widget.Toast.makeText(context, "Erro ao compartilhar captura: ${e.localizedMessage}", android.widget.Toast.LENGTH_SHORT).show()
+    }
 }
 
 private fun createFallbackBitmap(): android.graphics.Bitmap {

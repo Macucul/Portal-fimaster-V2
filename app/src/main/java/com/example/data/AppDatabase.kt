@@ -5,11 +5,23 @@ import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
 
-@Database(entities = [UserProfile::class, RefundRequest::class, EaConfigEntity::class], version = 10, exportSchema = false)
+@Database(
+    entities = [
+        UserProfile::class,
+        RefundRequest::class,
+        EaConfigEntity::class,
+        EaRobotEventEntity::class,
+        SyncMetadataEntity::class
+    ],
+    version = 11,
+    exportSchema = false
+)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun userProfileDao(): UserProfileDao
     abstract fun refundRequestDao(): RefundRequestDao
     abstract fun eaConfigDao(): EaConfigDao
+    abstract fun eaRobotEventDao(): EaRobotEventDao
+    abstract fun syncMetadataDao(): SyncMetadataDao
 
     companion object {
         @Volatile

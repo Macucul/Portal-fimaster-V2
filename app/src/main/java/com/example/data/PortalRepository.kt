@@ -5,6 +5,7 @@ import com.google.firebase.database.FirebaseDatabase
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.firstOrNull
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
@@ -17,7 +18,9 @@ import org.json.JSONObject
 class PortalRepository(
     private val userProfileDao: UserProfileDao,
     private val refundRequestDao: RefundRequestDao,
-    private val eaConfigDao: EaConfigDao
+    private val eaConfigDao: EaConfigDao,
+    private val eaRobotEventDao: EaRobotEventDao,
+    private val syncMetadataDao: SyncMetadataDao
 ) {
     companion object {
         var mockPasswordHash: String? = null
@@ -28,6 +31,59 @@ class PortalRepository(
 
     val userProfile: Flow<UserProfile?> = userProfileDao.getUserProfile()
     val refundRequests: Flow<List<RefundRequest>> = refundRequestDao.getAllRefundRequests()
+
+    fun getLocalEventsFlow(accountId: String): Flow<List<EaRobotEvent>> {
+        val accountIdLong = accountId.toLongOrNull() ?: 0L
+        return eaRobotEventDao.getEventsForAccount(accountIdLong, accountId).map { entities ->
+            entities.map { it.toDomain() }
+        }
+    }
+
+    fun getAllLocalEventsFlow(): Flow<List<EaRobotEvent>> {
+        return eaRobotEventDao.getAllEvents().map { entities ->
+            entities.map { it.toDomain() }
+        }
+    }
+
+    fun getSyncMetadataFlow(accountId: String): Flow<SyncMetadataEntity?> {
+        return syncMetadataDao.getMetadataFlow(accountId)
+    }
+
+    suspend fun getSyncMetadata(accountId: String): SyncMetadataEntity? {
+        return syncMetadataDao.getMetadata(accountId)
+    }
+
+    suspend fun resetSyncForAccount(accountId: String) {
+        val accountIdLong = accountId.toLongOrNull() ?: 0L
+        eaRobotEventDao.deleteEventsForAccount(accountIdLong, accountId)
+        syncMetadataDao.deleteMetadata(accountId)
+    }
+
+    suspend fun clearLocalEventsPreservingSyncPosition(accountId: String) {
+        val accountIdLong = accountId.toLongOrNull() ?: 0L
+        val currentMaxTs = eaRobotEventDao.getMaxTimestamp(accountIdLong, accountId) ?: 0L
+        val currentLastGid = eaRobotEventDao.getLastGid(accountIdLong, accountId) ?: ""
+        val currentMeta = syncMetadataDao.getMetadata(accountId)
+
+        // Exclui todos os eventos locais da conta
+        eaRobotEventDao.deleteEventsForAccount(accountIdLong, accountId)
+
+        // Preserva a posição da última sincronização para que eventos passados não voltem
+        val effectiveLastTs = maxOf(currentMaxTs, currentMeta?.lastEventTimestamp ?: 0L)
+        val effectiveLastGid = currentLastGid.ifBlank { currentMeta?.lastGid.orEmpty() }
+        val now = System.currentTimeMillis()
+
+        val updatedMeta = (currentMeta ?: SyncMetadataEntity(accountId = accountId)).copy(
+            lastSyncTime = now,
+            lastGid = effectiveLastGid,
+            lastEventTimestamp = effectiveLastTs,
+            totalEventsCount = 0,
+            isInitialSyncCompleted = true,
+            syncStatus = "CLEARED",
+            lastSyncSummary = "Eventos limpos localmente. Posição de sincronização preservada."
+        )
+        syncMetadataDao.insertOrUpdateMetadata(updatedMeta)
+    }
 
     fun getEaConfig(accountId: String): Flow<EaConfigEntity?> {
         return eaConfigDao.getEaConfig(accountId)
@@ -798,6 +854,48 @@ class PortalRepository(
         }
     }
 
+    suspend fun fetchUserByUidFirebase(userId: String, firebaseUrl: String, authKey: String = ""): GithubUser? {
+        if (userId.isBlank()) return null
+        val cleanId = userId.trim()
+        val parsed = parseFirebaseUrl(firebaseUrl)
+
+        // 1. Try SDK first
+        try {
+            val db = if (parsed.baseUrl.isNotBlank()) FirebaseDatabase.getInstance(parsed.baseUrl) else FirebaseDatabase.getInstance()
+            val snapshot = db.getReference("dados/usuarios").child(cleanId).get().await()
+            if (snapshot.exists() && snapshot.value != null) {
+                val userMap = snapshot.value as? Map<*, *>
+                if (userMap != null) {
+                    val jsonStr = JSONObject(userMap).toString()
+                    val parsedUser = GithubUserParser.parseUserJson(jsonStr, "$cleanId.json", "")
+                    if (parsedUser != null) return parsedUser
+                }
+            }
+        } catch (e: Exception) {
+            // fallback to REST
+        }
+
+        // 2. REST fallback
+        return withContext(Dispatchers.IO) {
+            try {
+                val client = OkHttpClient()
+                val userUrl = buildFirebaseEndpoint(parsed, "/dados/usuarios/$cleanId.json", authKey)
+                val req = Request.Builder().url(userUrl).get().build()
+                client.newCall(req).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        val body = resp.body?.string()
+                        if (!body.isNullOrBlank() && body != "null" && body != "{}") {
+                            return@withContext GithubUserParser.parseUserJson(body, "$cleanId.json", "")
+                        }
+                    }
+                }
+                null
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+
     suspend fun saveUserToFirebaseWithDetails(user: GithubUser, firebaseUrl: String, authKey: String = ""): Pair<Boolean, String> {
         val parsed = parseFirebaseUrl(firebaseUrl)
         if (parsed.baseUrl.isBlank()) return Pair(false, "URL do Firebase não configurada.")
@@ -1563,6 +1661,195 @@ class PortalRepository(
         return emptyList()
     }
 
+    private var cachedLicenseConfig: GlobalLicenseConfig = GlobalLicenseConfig()
+
+    suspend fun fetchLicensePlanConfig(adminConfig: GitHubAdminConfig, firebaseUrl: String): GlobalLicenseConfig {
+        return withContext(Dispatchers.IO) {
+            val token = adminConfig.token.trim()
+            val repo = adminConfig.repository.trim()
+            val branch = if (adminConfig.branch.isNotBlank()) adminConfig.branch.trim() else "main"
+            val client = OkHttpClient()
+
+            // 1. Tentar ler do GitHub no nó dados/indice/licenca.json
+            if (token.isNotBlank() && repo.isNotBlank() && repo.contains("/")) {
+                val pathsToTry = listOf(
+                    "dados/indice/licenca.json",
+                    "dados/indices/licenca.json",
+                    "indice/licenca.json",
+                    "dados/licenca.json"
+                )
+
+                for (filePath in pathsToTry) {
+                    try {
+                        val url = "https://api.github.com/repos/$repo/contents/$filePath?ref=$branch"
+                        val request = Request.Builder()
+                            .url(url)
+                            .addHeader("Authorization", "Bearer $token")
+                            .addHeader("Accept", "application/vnd.github+json")
+                            .get()
+                            .build()
+
+                        client.newCall(request).execute().use { response ->
+                            if (response.isSuccessful) {
+                                val bodyString = response.body?.string() ?: ""
+                                val json = JSONObject(bodyString)
+                                var fileContent: String? = null
+
+                                val downloadUrl = json.optString("download_url", "")
+                                if (downloadUrl.isNotEmpty()) {
+                                    val dlRequest = Request.Builder().url(downloadUrl).get().build()
+                                    client.newCall(dlRequest).execute().use { dlResp ->
+                                        if (dlResp.isSuccessful) {
+                                            fileContent = dlResp.body?.string()
+                                        }
+                                    }
+                                }
+
+                                if (fileContent == null) {
+                                    val contentBase64 = json.optString("content", "")
+                                    if (contentBase64.isNotEmpty()) {
+                                        val cleanBase64 = contentBase64.replace("\n", "").replace("\r", "")
+                                        fileContent = String(Base64.decode(cleanBase64, Base64.DEFAULT), Charsets.UTF_8)
+                                    }
+                                }
+
+                                if (!fileContent.isNullOrBlank()) {
+                                    val parsedConfig = GlobalLicenseConfig.fromJson(fileContent!!)
+                                    cachedLicenseConfig = parsedConfig
+                                    return@withContext parsedConfig
+                                }
+                            }
+                        }
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
+            }
+
+            // 2. Tentar ler do Firebase Realtime Database
+            val parsedFirebase = parseFirebaseUrl(firebaseUrl)
+            if (parsedFirebase.baseUrl.isNotBlank()) {
+                val firebasePaths = listOf(
+                    "/dados/indice/licenca.json",
+                    "/dados/indices/licenca.json",
+                    "/indice/licenca.json",
+                    "/dados/licenca.json"
+                )
+
+                for (fbPath in firebasePaths) {
+                    try {
+                        val fbUrl = buildFirebaseEndpoint(parsedFirebase, fbPath, "")
+                        val request = Request.Builder().url(fbUrl).get().build()
+                        client.newCall(request).execute().use { response ->
+                            if (response.isSuccessful) {
+                                val body = response.body?.string()
+                                if (!body.isNullOrBlank() && body != "null" && body != "{}") {
+                                    val parsedConfig = GlobalLicenseConfig.fromJson(body)
+                                    cachedLicenseConfig = parsedConfig
+                                    return@withContext parsedConfig
+                                }
+                            }
+                        }
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
+            }
+
+            // 3. Retornar cache ou padrão se offline
+            cachedLicenseConfig
+        }
+    }
+
+    suspend fun saveLicensePlanConfig(
+        config: GlobalLicenseConfig,
+        adminConfig: GitHubAdminConfig,
+        firebaseUrl: String
+    ): Boolean {
+        return withContext(Dispatchers.IO) {
+            var success = false
+            cachedLicenseConfig = config
+            val jsonPayload = config.toJsonString()
+
+            // 1. Salvar no GitHub em dados/indice/licenca.json
+            val token = adminConfig.token.trim()
+            val repo = adminConfig.repository.trim()
+            val branch = if (adminConfig.branch.isNotBlank()) adminConfig.branch.trim() else "main"
+
+            if (token.isNotBlank() && repo.isNotBlank() && repo.contains("/")) {
+                try {
+                    val client = OkHttpClient()
+                    val filePath = "dados/indice/licenca.json"
+                    val getUrl = "https://api.github.com/repos/$repo/contents/$filePath?ref=$branch"
+
+                    var existingSha: String? = null
+                    try {
+                        val getReq = Request.Builder()
+                            .url(getUrl)
+                            .addHeader("Authorization", "Bearer $token")
+                            .addHeader("Accept", "application/vnd.github+json")
+                            .get()
+                            .build()
+                        client.newCall(getReq).execute().use { resp ->
+                            if (resp.isSuccessful) {
+                                val obj = JSONObject(resp.body?.string() ?: "")
+                                existingSha = obj.optString("sha", null)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        // File may not exist yet
+                    }
+
+                    val encodedContent = Base64.encodeToString(jsonPayload.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+                    val putBodyObj = JSONObject().apply {
+                        put("message", "Atualização da configuração de planos de licença [dados/indice/licenca.json]")
+                        put("content", encodedContent)
+                        put("branch", branch)
+                        if (existingSha != null) {
+                            put("sha", existingSha)
+                        }
+                    }
+
+                    val mediaType = "application/json; charset=utf-8".toMediaTypeOrNull()
+                    val putReq = Request.Builder()
+                        .url(getUrl)
+                        .addHeader("Authorization", "Bearer $token")
+                        .addHeader("Accept", "application/vnd.github+json")
+                        .put(putBodyObj.toString().toRequestBody(mediaType))
+                        .build()
+
+                    client.newCall(putReq).execute().use { putResp ->
+                        if (putResp.isSuccessful) {
+                            success = true
+                        }
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+
+            // 2. Salvar no Firebase Realtime Database
+            val parsedFb = parseFirebaseUrl(firebaseUrl)
+            if (parsedFb.baseUrl.isNotBlank()) {
+                try {
+                    val client = OkHttpClient()
+                    val mediaType = "application/json; charset=utf-8".toMediaTypeOrNull()
+                    val fbUrl = buildFirebaseEndpoint(parsedFb, "/dados/indice/licenca.json", "")
+                    val fbReq = Request.Builder().url(fbUrl).put(jsonPayload.toRequestBody(mediaType)).build()
+                    client.newCall(fbReq).execute().use { fbResp ->
+                        if (fbResp.isSuccessful) {
+                            success = true
+                        }
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+
+            success || token.isBlank()
+        }
+    }
+
     suspend fun sendChartScreenshotRequest(mt5AccountId: String, firebaseUrl: String, authKey: String = ""): Boolean {
         val parsed = parseFirebaseUrl(firebaseUrl)
         if (parsed.baseUrl.isBlank()) return true
@@ -1769,6 +2056,247 @@ class PortalRepository(
             val filteredList = distinctList.filter { isAllowedEvent(it) }
 
             filteredList.sortedByDescending { if (it.timestamp > 0L) it.timestamp else 0L }
+        }
+    }
+
+    /**
+     * Fluxo de Sincronização Inteligente (Smart Sync):
+     * 1. No primeiro login / primeira sincronização: busca todos os eventos no Firebase e salva no banco Room local com o GID como chave única, registrando `lastSyncTime` e `lastGid`.
+     * 2. Nos próximos logins: não faz download de tudo de novo. Envia `lastSyncTime` / `lastGid` / `sinceTimestamp` e obtém apenas eventos novos ou modificados.
+     * 3. Utiliza o GID como chave única no SQLite Room (`OnConflictStrategy.REPLACE`). Se o evento já existir, atualiza; se não existir, cria um novo.
+     */
+    suspend fun smartSyncEaRobotEvents(
+        firebaseUrl: String,
+        mt5AccountId: String = "",
+        authKey: String = "",
+        userId: String = "",
+        forceFullSync: Boolean = false
+    ): SmartSyncResult {
+        return withContext(Dispatchers.IO) {
+            val effectiveKey = if (mt5AccountId.isNotBlank()) mt5AccountId else if (userId.isNotBlank()) userId else "GLOBAL"
+            val existingMeta = syncMetadataDao.getMetadata(effectiveKey)
+            val isFirstLogin = forceFullSync || existingMeta == null || !existingMeta.isInitialSyncCompleted || existingMeta.lastSyncTime == 0L
+
+            if (isFirstLogin) {
+                // [PRIMEIRO LOGIN] Baixa todo o histórico e salva no banco local Room
+                val allRemoteEvents = fetchEaRobotEvents(firebaseUrl, mt5AccountId, authKey, userId)
+                val filtered = allRemoteEvents.filter { isAllowedEvent(it) }
+                val entities = filtered.map { evt ->
+                    val withGid = EaEventGidManager.ensureGid(evt)
+                    withGid.toEntity()
+                }
+
+                if (entities.isNotEmpty()) {
+                    eaRobotEventDao.insertOrUpdateEvents(entities)
+                }
+
+                val accountIdLong = mt5AccountId.toLongOrNull() ?: 0L
+                val newestGid = eaRobotEventDao.getLastGid(accountIdLong, mt5AccountId) ?: ""
+                val maxTs = eaRobotEventDao.getMaxTimestamp(accountIdLong, mt5AccountId) ?: System.currentTimeMillis()
+                val totalCount = eaRobotEventDao.getEventsCount(accountIdLong, mt5AccountId)
+                val now = System.currentTimeMillis()
+
+                val newMeta = SyncMetadataEntity(
+                    accountId = effectiveKey,
+                    lastSyncTime = now,
+                    lastGid = newestGid,
+                    lastEventTimestamp = maxTs,
+                    totalEventsCount = totalCount,
+                    isInitialSyncCompleted = true,
+                    syncStatus = "SUCCESS",
+                    lastSyncSummary = "Sincronização inicial: ${entities.size} eventos salvos localmente"
+                )
+                syncMetadataDao.insertOrUpdateMetadata(newMeta)
+
+                SmartSyncResult(
+                    isInitial = true,
+                    newOrUpdatedCount = entities.size,
+                    totalLocalCount = totalCount,
+                    lastSyncTime = now,
+                    lastGid = newestGid,
+                    message = "Primeiro login: ${entities.size} eventos baixados e salvos no banco local"
+                )
+            } else {
+                // [PRÓXIMOS LOGINS] Sincronização incremental: busca apenas novos ou alterados
+                val lastSyncTime = existingMeta.lastSyncTime
+                val lastGid = existingMeta.lastGid
+                val lastTs = existingMeta.lastEventTimestamp
+
+                val candidateEvents = fetchIncrementalEaRobotEvents(
+                    firebaseUrl = firebaseUrl,
+                    mt5AccountId = mt5AccountId,
+                    authKey = authKey,
+                    userId = userId,
+                    sinceTimestamp = lastTs,
+                    lastSyncTime = lastSyncTime,
+                    lastGid = lastGid
+                )
+
+                var newOrUpdatedCount = 0
+                val entitiesToUpsert = mutableListOf<EaRobotEventEntity>()
+
+                for (evt in candidateEvents) {
+                    if (!isAllowedEvent(evt)) continue
+                    val withGid = EaEventGidManager.ensureGid(evt)
+                    val entity = withGid.toEntity()
+                    val existingInDb = eaRobotEventDao.getEventByGid(withGid.gid)
+
+                    if (existingInDb == null) {
+                        // Se o evento não está no banco local e é anterior ou igual ao ponto da última sincronização/limpeza,
+                        // significa que é um evento antigo que o usuário limpou. Portanto, NÃO reimportamos a menos que forceFullSync = true.
+                        if (lastTs > 0L && entity.timestamp > 0L && entity.timestamp <= lastTs) {
+                            continue
+                        }
+                        newOrUpdatedCount++
+                        entitiesToUpsert.add(entity)
+                    } else if (existingInDb.timestamp != entity.timestamp ||
+                        existingInDb.event != entity.event ||
+                        existingInDb.novo != entity.novo ||
+                        existingInDb.msg != entity.msg ||
+                        existingInDb.price != entity.price ||
+                        existingInDb.sl != entity.sl ||
+                        existingInDb.tp != entity.tp ||
+                        existingInDb.diarioValor != entity.diarioValor ||
+                        existingInDb.imageBase64 != entity.imageBase64
+                    ) {
+                        newOrUpdatedCount++
+                        entitiesToUpsert.add(entity)
+                    }
+                }
+
+                if (entitiesToUpsert.isNotEmpty()) {
+                    eaRobotEventDao.insertOrUpdateEvents(entitiesToUpsert)
+                }
+
+                val accountIdLong = mt5AccountId.toLongOrNull() ?: 0L
+                val newestGid = eaRobotEventDao.getLastGid(accountIdLong, mt5AccountId) ?: lastGid
+                val maxTs = eaRobotEventDao.getMaxTimestamp(accountIdLong, mt5AccountId) ?: lastTs
+                val totalCount = eaRobotEventDao.getEventsCount(accountIdLong, mt5AccountId)
+                val now = System.currentTimeMillis()
+
+                val updatedMeta = existingMeta.copy(
+                    lastSyncTime = now,
+                    lastGid = newestGid,
+                    lastEventTimestamp = maxOf(lastTs, maxTs),
+                    totalEventsCount = totalCount,
+                    syncStatus = "SUCCESS",
+                    lastSyncSummary = if (newOrUpdatedCount > 0) {
+                        "Incremental: $newOrUpdatedCount novos/atualizados (Total: $totalCount)"
+                    } else {
+                        "Sincronizado: Base local atualizada ($totalCount eventos)"
+                    }
+                )
+                syncMetadataDao.insertOrUpdateMetadata(updatedMeta)
+
+                SmartSyncResult(
+                    isInitial = false,
+                    newOrUpdatedCount = newOrUpdatedCount,
+                    totalLocalCount = totalCount,
+                    lastSyncTime = now,
+                    lastGid = newestGid,
+                    message = if (newOrUpdatedCount > 0) {
+                        "Sincronização inteligente: $newOrUpdatedCount evento(s) novo(s)/atualizado(s)"
+                    } else {
+                        "Sincronização inteligente: Base local já sincronizada"
+                    }
+                )
+            }
+        }
+    }
+
+    suspend fun fetchIncrementalEaRobotEvents(
+        firebaseUrl: String,
+        mt5AccountId: String = "",
+        authKey: String = "",
+        userId: String = "",
+        sinceTimestamp: Long = 0L,
+        lastSyncTime: Long = 0L,
+        lastGid: String = ""
+    ): List<EaRobotEvent> {
+        val parsed = parseFirebaseUrl(firebaseUrl)
+        if (parsed.baseUrl.isBlank()) return emptyList()
+
+        return withContext(Dispatchers.IO) {
+            val client = OkHttpClient()
+            val pathsToTry = mutableListOf<String>()
+
+            if (mt5AccountId.isNotBlank()) {
+                pathsToTry.add("/dados/eventos/$mt5AccountId.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/relatorio_financeiro.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/posicao_alterada.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/ordem_executada.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/ordem_modificada.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/ordem_não_executada.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/erro_ordem.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/captura_tela.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/sessao_inicio.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/sessao_fim.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/mudanca_estado.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/mudanca_equador.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/notificacao_mql5.json")
+            }
+
+            if (userId.isNotBlank()) {
+                pathsToTry.add("/dados/usuarios/$userId/eventos.json")
+                pathsToTry.add("/dados/usuarios/$userId/relatorio_financeiro.json")
+                pathsToTry.add("/dados/usuarios/$userId/posicao_alterada.json")
+                if (mt5AccountId.isNotBlank()) {
+                    pathsToTry.add("/dados/usuarios/$userId/$mt5AccountId/eventos.json")
+                }
+            }
+
+            // Also check latest events root
+            pathsToTry.add("/dados/eventos.json")
+            pathsToTry.add("/eventos.json")
+
+            val urlsToTry = mutableListOf<String>()
+            for (p in pathsToTry.distinct()) {
+                if (authKey.isNotBlank()) {
+                    urlsToTry.add(buildFirebaseEndpoint(parsed, p, authKey))
+                }
+                urlsToTry.add(buildFirebaseEndpoint(parsed, p, ""))
+            }
+
+            val candidateEvents = mutableListOf<EaRobotEvent>()
+
+            for (url in urlsToTry.distinct()) {
+                try {
+                    val request = Request.Builder().url(url).get().build()
+                    client.newCall(request).execute().use { response ->
+                        if (response.isSuccessful) {
+                            val body = response.body?.string()
+                            if (!body.isNullOrBlank() && body != "null" && body != "{}") {
+                                val parsedList = parseEventsFromJson(body, mt5AccountId)
+                                if (parsedList.isNotEmpty()) {
+                                    candidateEvents.addAll(parsedList)
+                                }
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+
+            val distinctList = candidateEvents.distinctBy { evt ->
+                val cleanId = evt.id.trim()
+                val isPushKey = cleanId.startsWith("-") && cleanId.length >= 10
+                val timeSec = if (evt.timestamp > 0L) evt.timestamp / 1000L else 0L
+                val cleanMsg = evt.msg.trim().lowercase().take(40)
+                val cleanNovo = evt.novo.trim().lowercase()
+                val cleanSymbol = evt.symbol.trim().uppercase()
+                val cleanEvent = evt.event.trim().lowercase()
+
+                if (isPushKey) {
+                    "${evt.login}_${cleanId}"
+                } else if (timeSec > 0L) {
+                    "${evt.login}_${cleanEvent}_${cleanSymbol}_${timeSec}_${cleanNovo}_${cleanMsg}"
+                } else {
+                    "${evt.login}_${cleanEvent}_${cleanSymbol}_${evt.data}_${evt.hora}_${cleanNovo}_${cleanMsg}"
+                }
+            }
+
+            distinctList.filter { isAllowedEvent(it) }
         }
     }
 
@@ -2009,8 +2537,23 @@ class PortalRepository(
         val perdaPctVal = obj.optDouble("perda_pct", obj.optDouble("perdaPct", 0.0))
         val erroCodeVal = obj.optInt("erro_code", obj.optInt("erroCode", obj.optInt("error_code", obj.optInt("code", 0))))
 
+        val rawGid = obj.optString("gid", obj.optString("uuid", obj.optString("event_id", obj.optString("global_id", ""))))
+        val resolvedGid = if (rawGid.isNotBlank()) rawGid else EaEventGidManager.getOrCreateGid(
+            id = id,
+            login = loginVal,
+            timestamp = timestamp,
+            eventType = event,
+            sistema = sistema,
+            novo = novo,
+            msg = msg,
+            ticket = ticketVal,
+            hora = horaStr,
+            data = dataStr
+        )
+
         return EaRobotEvent(
             id = id,
+            gid = resolvedGid,
             currency = currency,
             event = event,
             login = loginVal,

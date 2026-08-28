@@ -1,6 +1,8 @@
 package com.example.ui
 
 import com.example.data.isTemplateValido
+import com.example.data.getResolvedGid
+import com.example.data.EaEventGidManager
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.*
 import androidx.compose.animation.fadeIn
@@ -10,6 +12,9 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.Image
@@ -25,6 +30,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
@@ -34,6 +40,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.text.style.TextOverflow
@@ -43,6 +50,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
@@ -61,6 +69,14 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.R
+import com.example.data.LicenseTier
+import com.example.data.LocalLicenseTier
+import com.example.data.LocalLicensePlanConfig
+import com.example.data.LocalGlobalLicenseConfig
+import com.example.data.LicensePlanConfig
+import com.example.data.GlobalLicenseConfig
+import com.example.data.buildDynamicFeatures
+import com.example.data.effectiveLicenseTier
 import com.example.data.RefundRequest
 import com.example.data.UserProfile
 import com.example.data.validarParametros
@@ -81,19 +97,23 @@ enum class NotificationSeverity {
 }
 
 data class SystemNotification(
-    val id: String,
+    val id: String = "",
+    val gid: String = id.ifBlank { java.util.UUID.randomUUID().toString() },
     val title: String,
     val message: String,
     val severity: NotificationSeverity,
     val icon: androidx.compose.ui.graphics.vector.ImageVector,
-    val targetTab: PortalTab? = null
+    val targetTab: PortalTab? = null,
+    val targetEventGid: String? = null,
+    val timestamp: Long = System.currentTimeMillis()
 )
 
 fun calculateSystemNotifications(
     loggedUser: com.example.data.GithubUser?,
     eaRobotStatus: com.example.ui.EaRobotStatus?,
     eaConfig: com.example.data.EaConfigEntity?,
-    eaRobotEvents: List<com.example.data.EaRobotEvent>
+    eaRobotEvents: List<com.example.data.EaRobotEvent>,
+    viewedGids: Set<String> = emptySet()
 ): List<SystemNotification> {
     if (loggedUser == null) return emptyList()
     val list = mutableListOf<SystemNotification>()
@@ -116,53 +136,66 @@ fun calculateSystemNotifications(
             val daysRemaining = java.util.concurrent.TimeUnit.MILLISECONDS.toDays(diffMs)
 
             if (!loggedUser.licencaAtiva || daysRemaining <= 0) {
-                list.add(
-                    SystemNotification(
-                        id = "lic_expired",
-                        title = "🚨 LICENÇA EXPIRADA OU VENCIDA",
-                        message = "Sua licença do robô EA expirou (Validade: $validadeStr). Entre em contato com o suporte para renovação.",
-                        severity = NotificationSeverity.CRITICAL,
-                        icon = Icons.Default.LockClock,
-                        targetTab = PortalTab.CLIENT_LICENSE
+                val licExpiredGid = "lic_expired_${loggedUser.id}"
+                if (!viewedGids.contains(licExpiredGid)) {
+                    list.add(
+                        SystemNotification(
+                            id = licExpiredGid,
+                            gid = licExpiredGid,
+                            title = "🚨 LICENÇA EXPIRADA OU VENCIDA",
+                            message = "Sua licença do robô EA expirou (Validade: $validadeStr). Entre em contato com o suporte para renovação.",
+                            severity = NotificationSeverity.CRITICAL,
+                            icon = Icons.Default.LockClock,
+                            targetTab = PortalTab.CLIENT_LICENSE
+                        )
                     )
-                )
+                }
             } else if (daysRemaining in 1..7) {
-                val diasTexto = if (daysRemaining == 1L) "1 dia" else "$daysRemaining dias"
-                list.add(
-                    SystemNotification(
-                        id = "lic_warning_7days",
-                        title = "⚠️ LICENÇA EXPIRANDO EM $diasTexto",
-                        message = "Atenção: Sua licença vence em $diasTexto (Validade: $validadeStr). Faltam menos de 7 dias! Renove para não interromper o robô no MT5.",
-                        severity = NotificationSeverity.WARNING,
-                        icon = Icons.Default.Warning,
-                        targetTab = PortalTab.CLIENT_LICENSE
+                val licWarnGid = "lic_warning_7days_${loggedUser.id}_${daysRemaining}"
+                if (!viewedGids.contains(licWarnGid)) {
+                    val diasTexto = if (daysRemaining == 1L) "1 dia" else "$daysRemaining dias"
+                    list.add(
+                        SystemNotification(
+                            id = licWarnGid,
+                            gid = licWarnGid,
+                            title = "⚠️ LICENÇA EXPIRANDO EM $diasTexto",
+                            message = "Atenção: Sua licença vence em $diasTexto (Validade: $validadeStr). Faltam menos de 7 dias! Renove para não interromper o robô no MT5.",
+                            severity = NotificationSeverity.WARNING,
+                            icon = Icons.Default.Warning,
+                            targetTab = PortalTab.CLIENT_LICENSE
+                        )
                     )
-                )
+                }
             }
         }
     } else if (!loggedUser.licencaAtiva) {
-        list.add(
-            SystemNotification(
-                id = "lic_inactive",
-                title = "🚨 LICENÇA INATIVA",
-                message = "Sua licença no Portal Fimaster está desativada. Solicite a liberação no suporte.",
-                severity = NotificationSeverity.CRITICAL,
-                icon = Icons.Default.Lock,
-                targetTab = PortalTab.CLIENT_LICENSE
-            )
-        )
-    }
-
-    // 2. Robot Attention Checks (robô exigir atenção)
-    val hasMt5Account = loggedUser.mt5IdConta.isNotBlank() && loggedUser.mt5Registrado
-    if (hasMt5Account) {
-        val isRobotOnline = eaRobotStatus?.online == true
-        val isEaAtivo = eaConfig?.EA_ATIVO == true
-
-        if (!isEaAtivo) {
+        val licInactGid = "lic_inactive_${loggedUser.id}"
+        if (!viewedGids.contains(licInactGid)) {
             list.add(
                 SystemNotification(
-                    id = "robot_disabled",
+                    id = licInactGid,
+                    gid = licInactGid,
+                    title = "🚨 LICENÇA INATIVA",
+                    message = "Sua licença no Portal Fimaster está desativada. Solicite a liberação no suporte.",
+                    severity = NotificationSeverity.CRITICAL,
+                    icon = Icons.Default.Lock,
+                    targetTab = PortalTab.CLIENT_LICENSE
+                )
+            )
+        }
+    }
+
+    // 2. Robot Execution Attention Checks
+    val hasMt5Account = loggedUser.mt5IdConta.isNotBlank() && loggedUser.mt5Registrado
+    val isEaAtivo = eaConfig?.EA_ATIVO == true
+
+    if (hasMt5Account && !isEaAtivo) {
+        val robotDisabledGid = "robot_disabled_${loggedUser.id}"
+        if (!viewedGids.contains(robotDisabledGid)) {
+            list.add(
+                SystemNotification(
+                    id = robotDisabledGid,
+                    gid = robotDisabledGid,
                     title = "⚠️ ATENÇÃO AO ROBÔ: EXECUÇÃO DESATIVADA",
                     message = "O robô está conectado no MT5, mas a chave 'EA ATIVO' está desligada no aplicativo.",
                     severity = NotificationSeverity.WARNING,
@@ -171,35 +204,88 @@ fun calculateSystemNotifications(
                 )
             )
         }
-
-        val recentErrors = eaRobotEvents.filter {
-            val evtLower = it.event.lowercase()
-            evtLower.contains("erro") || evtLower.contains("alerta") || evtLower.contains("warning") || evtLower.contains("margin")
-        }
-        if (recentErrors.isNotEmpty()) {
-            val lastError = recentErrors.first()
+    } else if (!hasMt5Account && eaRobotEvents.isEmpty()) {
+        val noMt5Gid = "no_mt5_${loggedUser.id}"
+        if (!viewedGids.contains(noMt5Gid)) {
             list.add(
                 SystemNotification(
-                    id = "robot_event_error",
-                    title = "⚡ ALERTA DE EXECUÇÃO NO MT5",
-                    message = "Último evento crítico do robô: ${lastError.resumo} (${lastError.hora}). Confira a aba de Eventos.",
-                    severity = NotificationSeverity.WARNING,
-                    icon = Icons.Default.ReportProblem,
-                    targetTab = PortalTab.EA_EVENTS
+                    id = noMt5Gid,
+                    gid = noMt5Gid,
+                    title = "ℹ️ CONTA MT5 NÃO VINCULADA",
+                    message = "Cadastre o número da sua conta MT5 na aba 'Conta EA' para sincronizar seu robô em tempo real.",
+                    severity = NotificationSeverity.INFO,
+                    icon = Icons.Default.AccountBalance,
+                    targetTab = PortalTab.DASHBOARD
                 )
             )
         }
-    } else {
-        list.add(
-            SystemNotification(
-                id = "no_mt5",
-                title = "ℹ️ CONTA MT5 NÃO VINCULADA",
-                message = "Cadastre o número da sua conta MT5 na aba 'Conta EA' para sincronizar seu robô em tempo real.",
-                severity = NotificationSeverity.INFO,
-                icon = Icons.Default.AccountBalance,
-                targetTab = PortalTab.DASHBOARD
-            )
-        )
+    }
+
+    // 3. Process each Robot Event and identify Errors, Warnings, and Order Executions via GID
+    eaRobotEvents.forEach { evt ->
+        val eventGid = evt.getResolvedGid()
+        val notifGid = "notif_evt_$eventGid"
+
+        // Skip if this notification or event was already marked as viewed or resolved
+        if (!viewedGids.contains(notifGid) && !viewedGids.contains(eventGid)) {
+            val fullTextLower = "${evt.event} ${evt.sistema} ${evt.novo} ${evt.descNovo} ${evt.resumo} ${evt.msg} ${evt.motivacao} ${evt.note}".lowercase()
+            val isError = evt.erroCode != 0 ||
+                fullTextLower.contains("erro") ||
+                fullTextLower.contains("error") ||
+                fullTextLower.contains("fail") ||
+                fullTextLower.contains("falha") ||
+                fullTextLower.contains("rejeit") ||
+                fullTextLower.contains("invalid") ||
+                fullTextLower.contains("inválid") ||
+                fullTextLower.contains("desconect") ||
+                fullTextLower.contains("desconex") ||
+                fullTextLower.contains("expirad")
+
+            val isWarning = fullTextLower.contains("alerta") ||
+                fullTextLower.contains("warning") ||
+                fullTextLower.contains("margin") ||
+                fullTextLower.contains("margem") ||
+                fullTextLower.contains("travad") ||
+                fullTextLower.contains("bloquead") ||
+                fullTextLower.contains("pausad") ||
+                fullTextLower.contains("interrompid") ||
+                fullTextLower.contains("sem saldo") ||
+                evt.novo.equals("TRAVADO", ignoreCase = true) ||
+                evt.novo.equals("BLOQUEADO", ignoreCase = true)
+
+            val isOrder = fullTextLower.contains("ordem") ||
+                fullTextLower.contains("posicao") ||
+                fullTextLower.contains("posição") ||
+                fullTextLower.contains("compra") ||
+                fullTextLower.contains("venda") ||
+                fullTextLower.contains("take profit") ||
+                fullTextLower.contains("stop loss") ||
+                evt.temPosicao.isNotBlank()
+
+            if (isError || isWarning || isOrder) {
+                val title = when {
+                    isError -> "⚡ ERRO DE EXECUÇÃO NO MT5"
+                    isWarning -> "⚠️ ALERTA DO ROBÔ EA"
+                    else -> "📊 ATIVIDADE NO MT5"
+                }
+                val desc = if (evt.resumo.isNotBlank()) evt.resumo else if (evt.msg.isNotBlank()) evt.msg else evt.event
+                val timeTag = if (evt.hora.isNotBlank()) " (${evt.hora})" else ""
+
+                list.add(
+                    SystemNotification(
+                        id = notifGid,
+                        gid = notifGid,
+                        title = title,
+                        message = "$desc$timeTag",
+                        severity = if (isError) NotificationSeverity.CRITICAL else if (isWarning) NotificationSeverity.WARNING else NotificationSeverity.INFO,
+                        icon = if (isError) Icons.Default.ReportProblem else if (isWarning) Icons.Default.Warning else Icons.Default.TrendingUp,
+                        targetTab = PortalTab.EA_EVENTS,
+                        targetEventGid = eventGid,
+                        timestamp = if (evt.timestamp > 0L) evt.timestamp else System.currentTimeMillis()
+                    )
+                )
+            }
+        }
     }
 
     return list
@@ -208,7 +294,9 @@ fun calculateSystemNotifications(
 @Composable
 fun SystemNotificationsBannerCard(
     notifications: List<SystemNotification>,
-    onNavigateToTab: (PortalTab) -> Unit
+    onNavigateToTab: (PortalTab) -> Unit,
+    onResolveNotification: ((SystemNotification) -> Unit)? = null,
+    onMarkAsViewed: ((SystemNotification) -> Unit)? = null
 ) {
     if (notifications.isEmpty()) return
 
@@ -234,61 +322,96 @@ fun SystemNotificationsBannerCard(
                 color = bgColor.copy(alpha = 0.95f),
                 border = BorderStroke(1.dp, borderColor.copy(alpha = 0.7f))
             ) {
-                Row(
-                    modifier = Modifier.padding(14.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(38.dp)
-                            .clip(CircleShape)
-                            .background(borderColor.copy(alpha = 0.2f)),
-                        contentAlignment = Alignment.Center
+                Column(modifier = Modifier.padding(14.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(
-                            imageVector = notif.icon,
-                            contentDescription = null,
-                            tint = borderColor,
-                            modifier = Modifier.size(20.dp)
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.width(12.dp))
-
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = notif.title,
-                            style = MaterialTheme.typography.labelMedium.copy(
-                                fontWeight = FontWeight.Black,
-                                color = borderColor,
-                                fontSize = 12.sp
-                            )
-                        )
-                        Spacer(modifier = Modifier.height(2.dp))
-                        Text(
-                            text = notif.message,
-                            style = MaterialTheme.typography.bodySmall.copy(
-                                color = Color.White.copy(alpha = 0.95f),
-                                fontSize = 11.5.sp
-                            )
-                        )
-                    }
-
-                    if (notif.targetTab != null) {
-                        Spacer(modifier = Modifier.width(8.dp))
-                        IconButton(
-                            onClick = { onNavigateToTab(notif.targetTab) },
+                        Box(
                             modifier = Modifier
+                                .size(36.dp)
                                 .clip(CircleShape)
-                                .background(borderColor.copy(alpha = 0.2f))
-                                .size(32.dp)
+                                .background(borderColor.copy(alpha = 0.2f)),
+                            contentAlignment = Alignment.Center
                         ) {
                             Icon(
-                                imageVector = Icons.Default.ArrowForward,
-                                contentDescription = "Ver detalhe",
+                                imageVector = notif.icon,
+                                contentDescription = null,
                                 tint = borderColor,
-                                modifier = Modifier.size(16.dp)
+                                modifier = Modifier.size(20.dp)
                             )
+                        }
+
+                        Spacer(modifier = Modifier.width(10.dp))
+
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = notif.title,
+                                style = MaterialTheme.typography.labelMedium.copy(
+                                    fontWeight = FontWeight.Black,
+                                    color = borderColor,
+                                    fontSize = 12.sp
+                                )
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = notif.message,
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    color = Color.White.copy(alpha = 0.95f),
+                                    fontSize = 11.5.sp
+                                )
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    // Action buttons row
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            if (onMarkAsViewed != null) {
+                                TextButton(
+                                    onClick = { onMarkAsViewed(notif) },
+                                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp)
+                                ) {
+                                    Text(
+                                        text = "Visualizado ✔️",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            color = Color(0xFF94A3B8),
+                                            fontSize = 10.sp
+                                        )
+                                    )
+                                }
+                            }
+
+                            Button(
+                                onClick = {
+                                    if (onResolveNotification != null) {
+                                        onResolveNotification(notif)
+                                    } else if (notif.targetTab != null) {
+                                        onNavigateToTab(notif.targetTab)
+                                    }
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = borderColor.copy(alpha = 0.85f)),
+                                shape = RoundedCornerShape(8.dp),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                            ) {
+                                Text(
+                                    text = "Resolver 🎯",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 10.5.sp
+                                    )
+                                )
+                            }
                         }
                     }
                 }
@@ -301,110 +424,313 @@ fun SystemNotificationsBannerCard(
 fun SystemNotificationsDialog(
     notifications: List<SystemNotification>,
     onNavigateToTab: (PortalTab) -> Unit,
+    onResolveNotification: (SystemNotification) -> Unit = {},
+    onMarkAsViewed: (SystemNotification) -> Unit = {},
+    onMarkAllAsViewed: () -> Unit = {},
     onDismiss: () -> Unit
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        containerColor = Color(0xFF0F172A),
+        containerColor = Color(0xFF0B132B),
+        shape = RoundedCornerShape(20.dp),
         title = {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(
-                    imageVector = Icons.Default.NotificationsActive,
-                    contentDescription = null,
-                    tint = Color(0xFFF59E0B),
-                    modifier = Modifier.size(22.dp)
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = "Central de Notificações e Alertas",
-                    style = MaterialTheme.typography.titleMedium.copy(
-                        fontWeight = FontWeight.Bold,
-                        color = Color.White
-                    )
-                )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .size(32.dp)
+                            .clip(CircleShape)
+                            .background(Color(0xFFF59E0B).copy(alpha = 0.18f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.NotificationsActive,
+                            contentDescription = null,
+                            tint = Color(0xFFF59E0B),
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Column {
+                        Text(
+                            text = "Central de Alertas",
+                            style = MaterialTheme.typography.titleSmall.copy(
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White,
+                                fontSize = 15.sp
+                            )
+                        )
+                        Text(
+                            text = "Robô EA & Notificações",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                color = Color(0xFF94A3B8),
+                                fontSize = 10.sp
+                            )
+                        )
+                    }
+                }
+
+                if (notifications.isNotEmpty()) {
+                    Surface(
+                        color = Color(0xFFEF4444).copy(alpha = 0.2f),
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, Color(0xFFEF4444).copy(alpha = 0.7f))
+                    ) {
+                        Text(
+                            text = "${notifications.size} pendente${if (notifications.size > 1) "s" else ""}",
+                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                color = Color(0xFFFCA5A5),
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 10.sp
+                            )
+                        )
+                    }
+                }
             }
         },
         text = {
             if (notifications.isEmpty()) {
                 Column(
-                    modifier = Modifier.fillMaxWidth().padding(16.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 20.dp, horizontal = 8.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.CheckCircle,
-                        contentDescription = null,
-                        tint = Color(0xFF10B981),
-                        modifier = Modifier.size(48.dp)
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
+                    Box(
+                        modifier = Modifier
+                            .size(44.dp)
+                            .clip(CircleShape)
+                            .background(Color(0xFF10B981).copy(alpha = 0.15f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.CheckCircle,
+                            contentDescription = null,
+                            tint = Color(0xFF10B981),
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(10.dp))
                     Text(
-                        text = "Nenhum alerta pendente!",
-                        style = MaterialTheme.typography.bodyMedium.copy(color = Color.White, fontWeight = FontWeight.Bold)
+                        text = "Tudo em ordem!",
+                        style = MaterialTheme.typography.bodyMedium.copy(color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.5.sp)
                     )
+                    Spacer(modifier = Modifier.height(2.dp))
                     Text(
-                        text = "Sua licença está ativa e seu robô EA está operando normalmente.",
+                        text = "Nenhum alerta ou erro pendente.",
                         style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8), fontSize = 11.sp),
                         textAlign = TextAlign.Center
                     )
                 }
             } else {
-                LazyColumn(
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    items(notifications) { notif ->
-                        val borderColor = when (notif.severity) {
-                            NotificationSeverity.CRITICAL -> Color(0xFFEF4444)
-                            NotificationSeverity.WARNING -> Color(0xFFF59E0B)
-                            NotificationSeverity.INFO -> Color(0xFF0EA5E9)
-                        }
-
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    // Header action: Mark all as viewed
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 6.dp),
+                        horizontalArrangement = Arrangement.End
+                    ) {
                         Surface(
-                            modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(12.dp),
-                            color = Color(0xFF1E293B),
-                            border = BorderStroke(1.dp, borderColor.copy(alpha = 0.5f))
+                            onClick = onMarkAllAsViewed,
+                            color = Color(0xFF1E293B).copy(alpha = 0.6f),
+                            shape = RoundedCornerShape(6.dp)
                         ) {
-                            Column(modifier = Modifier.padding(12.dp)) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(
-                                        imageVector = notif.icon,
-                                        contentDescription = null,
-                                        tint = borderColor,
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text(
-                                        text = notif.title,
-                                        style = MaterialTheme.typography.labelMedium.copy(
-                                            color = borderColor,
-                                            fontWeight = FontWeight.Bold
-                                        )
-                                    )
-                                }
-                                Spacer(modifier = Modifier.height(4.dp))
+                            Row(
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.DoneAll,
+                                    contentDescription = null,
+                                    tint = Color(0xFF38BDF8),
+                                    modifier = Modifier.size(12.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
                                 Text(
-                                    text = notif.message,
-                                    style = MaterialTheme.typography.bodySmall.copy(
-                                        color = Color(0xFFCBD5E1),
-                                        fontSize = 11.5.sp
+                                    text = "Marcar todas como lidas",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        color = Color(0xFF38BDF8),
+                                        fontWeight = FontWeight.SemiBold,
+                                        fontSize = 10.sp
                                     )
                                 )
-                                if (notif.targetTab != null) {
-                                    Spacer(modifier = Modifier.height(8.dp))
-                                    TextButton(
-                                        onClick = {
-                                            onNavigateToTab(notif.targetTab)
-                                        },
-                                        modifier = Modifier.align(Alignment.End)
+                            }
+                        }
+                    }
+
+                    LazyColumn(
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        items(notifications, key = { it.gid }) { notif ->
+                            val currentlyReadingKey by PortalEventQueueManager.currentlyReadingKey.collectAsStateWithLifecycle()
+                            val isItemReading = notif.targetEventGid != null && notif.targetEventGid == currentlyReadingKey
+
+                            val borderColor = when {
+                                isItemReading -> Color(0xFF38BDF8)
+                                notif.severity == NotificationSeverity.CRITICAL -> Color(0xFFEF4444)
+                                notif.severity == NotificationSeverity.WARNING -> Color(0xFFF59E0B)
+                                else -> Color(0xFF0EA5E9)
+                            }
+
+                            val cardBg = when {
+                                isItemReading -> Color(0xFF0C2438)
+                                notif.severity == NotificationSeverity.CRITICAL -> Color(0xFF221115)
+                                notif.severity == NotificationSeverity.WARNING -> Color(0xFF1F180A)
+                                else -> Color(0xFF0F192C)
+                            }
+
+                            // Small, Compact Alert Card
+                            Surface(
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(10.dp),
+                                color = cardBg,
+                                border = BorderStroke(if (isItemReading) 1.5.dp else 1.dp, borderColor.copy(alpha = if (isItemReading) 0.9f else 0.45f))
+                            ) {
+                                Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.fillMaxWidth()
                                     ) {
-                                        Text(
-                                            text = "Resolver na aba ${notif.targetTab.label} →",
-                                            style = MaterialTheme.typography.labelSmall.copy(
-                                                color = Color(0xFF38BDF8),
-                                                fontWeight = FontWeight.Bold
+                                        Box(
+                                            modifier = Modifier
+                                                .size(22.dp)
+                                                .clip(CircleShape)
+                                                .background(borderColor.copy(alpha = 0.2f)),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Icon(
+                                                imageVector = if (isItemReading) Icons.Default.VolumeUp else notif.icon,
+                                                contentDescription = null,
+                                                tint = borderColor,
+                                                modifier = Modifier.size(13.dp)
                                             )
+                                        }
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(
+                                            text = notif.title,
+                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                color = borderColor,
+                                                fontWeight = FontWeight.Bold,
+                                                fontSize = 11.sp
+                                            ),
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f)
                                         )
+
+                                        if (isItemReading) {
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Surface(
+                                                color = Color(0xFF0284C7).copy(alpha = 0.3f),
+                                                shape = RoundedCornerShape(6.dp),
+                                                border = BorderStroke(0.5.dp, Color(0xFF38BDF8))
+                                            ) {
+                                                Row(
+                                                    modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp),
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    horizontalArrangement = Arrangement.spacedBy(3.dp)
+                                                ) {
+                                                    VoiceAudioWaveBars(
+                                                        barColor = Color(0xFF38BDF8),
+                                                        barCount = 3,
+                                                        maxHeight = 8.dp
+                                                    )
+                                                    Text(
+                                                        text = "Lendo...",
+                                                        style = MaterialTheme.typography.labelSmall.copy(
+                                                            color = Color(0xFF38BDF8),
+                                                            fontWeight = FontWeight.Bold,
+                                                            fontSize = 9.sp
+                                                        )
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    Spacer(modifier = Modifier.height(3.dp))
+
+                                    Text(
+                                        text = notif.message,
+                                        style = MaterialTheme.typography.bodySmall.copy(
+                                            color = Color(0xFFE2E8F0),
+                                            fontSize = 10.5.sp,
+                                            lineHeight = 14.sp
+                                        ),
+                                        maxLines = 3,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+
+                                    Spacer(modifier = Modifier.height(6.dp))
+
+                                    // Compact Action Buttons
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.End,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Surface(
+                                            onClick = { onMarkAsViewed(notif) },
+                                            shape = RoundedCornerShape(6.dp),
+                                            color = Color(0xFF1E293B),
+                                            border = BorderStroke(0.5.dp, Color(0xFF475569))
+                                        ) {
+                                            Row(
+                                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.Done,
+                                                    contentDescription = null,
+                                                    tint = Color(0xFF94A3B8),
+                                                    modifier = Modifier.size(10.dp)
+                                                )
+                                                Spacer(modifier = Modifier.width(3.dp))
+                                                Text(
+                                                    text = "Lido",
+                                                    style = MaterialTheme.typography.labelSmall.copy(
+                                                        color = Color(0xFF94A3B8),
+                                                        fontSize = 9.5.sp
+                                                    )
+                                                )
+                                            }
+                                        }
+
+                                        Spacer(modifier = Modifier.width(6.dp))
+
+                                        Surface(
+                                            onClick = { onResolveNotification(notif) },
+                                            shape = RoundedCornerShape(6.dp),
+                                            color = if (notif.severity == NotificationSeverity.CRITICAL) Color(0xFFDC2626) else Color(0xFF0284C7)
+                                        ) {
+                                            Row(
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.CheckCircle,
+                                                    contentDescription = null,
+                                                    tint = Color.White,
+                                                    modifier = Modifier.size(10.dp)
+                                                )
+                                                Spacer(modifier = Modifier.width(3.dp))
+                                                Text(
+                                                    text = if (notif.targetEventGid != null) "Resolver 🎯" else "Resolver →",
+                                                    style = MaterialTheme.typography.labelSmall.copy(
+                                                        color = Color.White,
+                                                        fontWeight = FontWeight.Bold,
+                                                        fontSize = 9.5.sp
+                                                    )
+                                                )
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -414,8 +740,16 @@ fun SystemNotificationsDialog(
             }
         },
         confirmButton = {
-            TextButton(onClick = onDismiss) {
-                Text("Fechar", color = Color(0xFF38BDF8), fontWeight = FontWeight.Bold)
+            TextButton(
+                onClick = onDismiss,
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+            ) {
+                Text(
+                    text = "Fechar",
+                    color = Color(0xFF38BDF8),
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 12.sp
+                )
             }
         }
     )
@@ -444,18 +778,37 @@ fun PortalApp(viewModel: PortalViewModel) {
     var showAdminConfig by remember { mutableStateOf(false) }
     var showSupportDialog by remember { mutableStateOf(false) }
     var showNotificationsDialog by remember { mutableStateOf(false) }
+    var showVipRoomDialog by remember { mutableStateOf(false) }
+
+    val userPlanConfig by viewModel.userEffectivePlanConfig.collectAsStateWithLifecycle()
+    val globalLicenseConfig by viewModel.globalLicenseConfig.collectAsStateWithLifecycle()
+    val userTier = remember(loggedUser) { loggedUser.effectiveLicenseTier }
 
     val eaRobotStatus by viewModel.eaRobotStatus.collectAsStateWithLifecycle()
     val eaConfig by viewModel.eaConfig.collectAsStateWithLifecycle()
     val eaRobotEvents by viewModel.eaRobotEvents.collectAsStateWithLifecycle()
+    val syncMetadata by viewModel.syncMetadata.collectAsStateWithLifecycle()
+    val isSyncing by viewModel.isSyncing.collectAsStateWithLifecycle()
     val chartScreenshot by viewModel.chartScreenshot.collectAsStateWithLifecycle()
 
     val financialTimeframe by viewModel.financialTimeframe.collectAsStateWithLifecycle()
     val financialCandles by viewModel.financialCandles.collectAsStateWithLifecycle()
     val financialTransactions by viewModel.financialTransactions.collectAsStateWithLifecycle()
 
-    val systemNotifications = remember(loggedUser, eaRobotStatus, eaConfig, eaRobotEvents) {
-        calculateSystemNotifications(loggedUser, eaRobotStatus, eaConfig, eaRobotEvents)
+    val viewedGids by com.example.data.NotificationStateManager.viewedGids.collectAsStateWithLifecycle()
+    val focusedEventGid by com.example.data.NotificationStateManager.focusedEventGid.collectAsStateWithLifecycle()
+    val currentlyReadingKey by PortalEventQueueManager.currentlyReadingKey.collectAsStateWithLifecycle()
+    val isTtsSpeaking by AppTtsManager.isSpeaking.collectAsStateWithLifecycle()
+    val isVoiceActive = currentlyReadingKey != null || isTtsSpeaking
+
+    val systemNotifications = remember(loggedUser, eaRobotStatus, eaConfig, eaRobotEvents, viewedGids) {
+        calculateSystemNotifications(loggedUser, eaRobotStatus, eaConfig, eaRobotEvents, viewedGids)
+    }
+
+    LaunchedEffect(focusedEventGid) {
+        if (!focusedEventGid.isNullOrBlank()) {
+            currentTab = PortalTab.EA_EVENTS
+        }
     }
 
     val prefs = remember(context) { context.getSharedPreferences("fimaster_prefs", android.content.Context.MODE_PRIVATE) }
@@ -507,7 +860,13 @@ fun PortalApp(viewModel: PortalViewModel) {
             onOpenAdminConfig = { showAdminConfig = true }
         )
     } else {
-        Scaffold(
+        val userTier = loggedUser?.effectiveLicenseTier ?: LicenseTier.TRIAL
+        CompositionLocalProvider(
+            LocalLicenseTier provides userTier,
+            LocalLicensePlanConfig provides userPlanConfig,
+            LocalGlobalLicenseConfig provides globalLicenseConfig
+        ) {
+            Scaffold(
             topBar = {
                 CenterAlignedTopAppBar(
                     title = {
@@ -539,26 +898,86 @@ fun PortalApp(viewModel: PortalViewModel) {
                     },
                     actions = {
                         IconButton(onClick = { showNotificationsDialog = true }) {
-                            BadgedBox(
-                                badge = {
-                                    if (systemNotifications.isNotEmpty()) {
-                                        Badge(
-                                            containerColor = if (systemNotifications.any { it.severity == NotificationSeverity.CRITICAL }) Color(0xFFEF4444) else Color(0xFFF59E0B)
+                            Box(contentAlignment = Alignment.Center) {
+                                if (isVoiceActive) {
+                                    VoicePulsingWaveHalo(
+                                        modifier = Modifier.size(36.dp),
+                                        color = Color(0xFF38BDF8)
+                                    )
+                                }
+
+                                Box(contentAlignment = Alignment.Center) {
+                                    if (isVoiceActive) {
+                                        VoicePulsingWaveHalo(
+                                            color = Color(0xFF38BDF8),
+                                            modifier = Modifier.size(38.dp)
+                                        )
+                                    }
+                                    IconButton(
+                                        onClick = { showNotificationsDialog = true },
+                                        modifier = Modifier.testTag("system_notifications_button")
+                                    ) {
+                                        BadgedBox(
+                                            badge = {
+                                                if (isVoiceActive) {
+                                                    Badge(
+                                                        containerColor = Color(0xFF0284C7),
+                                                        contentColor = Color.White
+                                                    ) {
+                                                        VoiceAudioWaveBars(
+                                                            barColor = Color.White,
+                                                            barCount = 3,
+                                                            maxHeight = 7.dp,
+                                                            modifier = Modifier.padding(horizontal = 2.dp, vertical = 1.dp)
+                                                        )
+                                                    }
+                                                } else if (systemNotifications.isNotEmpty()) {
+                                                    Badge(
+                                                        containerColor = if (systemNotifications.any { it.severity == NotificationSeverity.CRITICAL }) Color(0xFFEF4444) else Color(0xFFF59E0B)
+                                                    ) {
+                                                        Text(
+                                                            text = systemNotifications.size.toString(),
+                                                            color = Color.White,
+                                                            fontWeight = FontWeight.Bold,
+                                                            fontSize = 10.sp
+                                                        )
+                                                    }
+                                                }
+                                            }
                                         ) {
-                                            Text(
-                                                text = systemNotifications.size.toString(),
-                                                color = Color.White,
-                                                fontWeight = FontWeight.Bold,
-                                                fontSize = 10.sp
+                                            Icon(
+                                                imageVector = if (isVoiceActive) Icons.Default.VolumeUp else Icons.Default.Notifications,
+                                                contentDescription = "Notificações",
+                                                tint = if (isVoiceActive) Color(0xFF38BDF8) else if (systemNotifications.isNotEmpty()) Color(0xFFF59E0B) else Color(0xFF94A3B8)
                                             )
                                         }
                                     }
                                 }
+                            }
+                        }
+
+                        IconButton(
+                            onClick = { showVipRoomDialog = true },
+                            modifier = Modifier.testTag("vip_room_button")
+                        ) {
+                            BadgedBox(
+                                badge = {
+                                    Badge(
+                                        containerColor = if (userPlanConfig.sala) Color(0xFFA855F7) else Color(0xFF64748B),
+                                        contentColor = Color.White
+                                    ) {
+                                        Text(
+                                            text = if (userPlanConfig.sala) "VIP" else "LOCK",
+                                            fontWeight = FontWeight.Black,
+                                            fontSize = 9.sp
+                                        )
+                                    }
+                                }
                             ) {
                                 Icon(
-                                    imageVector = Icons.Default.Notifications,
-                                    contentDescription = "Notificações",
-                                    tint = if (systemNotifications.isNotEmpty()) Color(0xFFF59E0B) else Color(0xFF94A3B8)
+                                    imageVector = if (userPlanConfig.sala) Icons.Default.Stars else Icons.Default.Lock,
+                                    contentDescription = "Sala VIP de Sinais",
+                                    tint = if (userPlanConfig.sala) Color(0xFFA855F7) else Color(0xFF94A3B8)
                                 )
                             }
                         }
@@ -783,9 +1202,20 @@ fun PortalApp(viewModel: PortalViewModel) {
                             onRequestScreenshot = { viewModel.requestChartScreenshot() },
                             onSaveMt5Id = { viewModel.updateMt5IdServerless(it) },
                             onStartTour = { showEaTourDialog = true },
-                            onTriggerSimulation = { viewModel.triggerSimulation() },
                             systemNotifications = systemNotifications,
                             onNavigateToTab = { currentTab = it },
+                            onResolveNotification = { notif ->
+                                com.example.data.NotificationStateManager.markAsResolved(context, notif.gid, notif.targetEventGid)
+                                if (notif.targetEventGid != null) {
+                                    com.example.data.NotificationStateManager.setFocusedEventGid(notif.targetEventGid)
+                                    currentTab = PortalTab.EA_EVENTS
+                                } else if (notif.targetTab != null) {
+                                    currentTab = notif.targetTab
+                                }
+                            },
+                            onMarkAsViewed = { notif ->
+                                com.example.data.NotificationStateManager.markAsViewed(context, notif.gid, notif.targetEventGid)
+                            },
                             onSaveEaConfig = { viewModel.saveEaConfig(it) },
                             onFetchExchangeRate = { code, cb -> viewModel.fetchExchangeRate(code, cb) }
                         )
@@ -799,6 +1229,11 @@ fun PortalApp(viewModel: PortalViewModel) {
                         PortalTab.EA_EVENTS -> EaRobotEventsScreen(
                             events = eaRobotEvents,
                             mt5AccountId = loggedUser?.mt5IdConta ?: "",
+                            focusedEventGid = focusedEventGid,
+                            syncMetadata = syncMetadata,
+                            isSyncing = isSyncing,
+                            onTriggerSync = { forceFull -> viewModel.triggerSmartSync(forceFull) },
+                            onClearFocus = { com.example.data.NotificationStateManager.clearFocusedEventGid() },
                             onClearEvents = { viewModel.clearEvents() }
                         )
                         PortalTab.EA_CONFIG -> EaConfigScreen(viewModel = viewModel)
@@ -811,6 +1246,7 @@ fun PortalApp(viewModel: PortalViewModel) {
                 }
             }
         }
+        }
     }
 
     if (showNotificationsDialog) {
@@ -819,6 +1255,24 @@ fun PortalApp(viewModel: PortalViewModel) {
             onNavigateToTab = { tab ->
                 currentTab = tab
                 showNotificationsDialog = false
+            },
+            onResolveNotification = { notif ->
+                showNotificationsDialog = false
+                com.example.data.NotificationStateManager.markAsResolved(context, notif.gid, notif.targetEventGid)
+                if (notif.targetEventGid != null) {
+                    com.example.data.NotificationStateManager.setFocusedEventGid(notif.targetEventGid)
+                    currentTab = PortalTab.EA_EVENTS
+                } else if (notif.targetTab != null) {
+                    currentTab = notif.targetTab
+                }
+            },
+            onMarkAsViewed = { notif ->
+                com.example.data.NotificationStateManager.markAsViewed(context, notif.gid, notif.targetEventGid)
+            },
+            onMarkAllAsViewed = {
+                val notifGids = systemNotifications.map { it.gid }
+                val eventGids = systemNotifications.mapNotNull { it.targetEventGid }
+                com.example.data.NotificationStateManager.markAllAsViewed(context, notifGids, eventGids)
             },
             onDismiss = { showNotificationsDialog = false }
         )
@@ -855,6 +1309,716 @@ fun PortalApp(viewModel: PortalViewModel) {
                 showSupportDialog = false
             }
         )
+    }
+
+    if (showVipRoomDialog) {
+        VipSignalRoomDialog(
+            planConfig = userPlanConfig,
+            currentTier = userTier,
+            onDismiss = { showVipRoomDialog = false },
+            onNavigateToPlans = {
+                currentTab = PortalTab.CLIENT_LICENSE
+                showVipRoomDialog = false
+            }
+        )
+    }
+}
+
+// Helper function to open Telegram
+fun openTelegramLink(context: android.content.Context, link: String = "https://t.me/FiMasterVipOficial") {
+    try {
+        val trimmed = link.trim()
+        val cleanUrl = when {
+            trimmed.startsWith("http://") || trimmed.startsWith("https://") || trimmed.startsWith("tg://") -> trimmed
+            trimmed.startsWith("@") -> "https://t.me/" + trimmed.substring(1)
+            trimmed.startsWith("t.me/") -> "https://$trimmed"
+            else -> "https://t.me/$trimmed"
+        }
+        val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(cleanUrl)).apply {
+            addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
+        android.widget.Toast.makeText(context, "Abrindo Telegram...", android.widget.Toast.LENGTH_SHORT).show()
+    } catch (e: Exception) {
+        val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+        val clip = android.content.ClipData.newPlainText("Telegram Link", link)
+        clipboard?.setPrimaryClip(clip)
+        android.widget.Toast.makeText(context, "Link copiado: $link", android.widget.Toast.LENGTH_SHORT).show()
+    }
+}
+
+// Helper function to open WhatsApp for customer support and payment confirmation
+fun openWhatsAppLink(
+    context: android.content.Context,
+    linkOrNumber: String = "https://wa.me/258840000000",
+    message: String = "Olá, gostaria de falar sobre as licenças FiMaster."
+) {
+    try {
+        val trimmed = linkOrNumber.trim()
+        val cleanUrl = when {
+            trimmed.startsWith("http://") || trimmed.startsWith("https://") -> {
+                if (trimmed.contains("text=")) trimmed
+                else if (trimmed.contains("?")) "$trimmed&text=" + java.net.URLEncoder.encode(message, "UTF-8")
+                else "$trimmed?text=" + java.net.URLEncoder.encode(message, "UTF-8")
+            }
+            trimmed.startsWith("wa.me/") -> {
+                "https://$trimmed" + (if (trimmed.contains("?")) "&text=" else "?text=") + java.net.URLEncoder.encode(message, "UTF-8")
+            }
+            else -> {
+                val cleanDigits = trimmed.replace(Regex("[^0-9]"), "")
+                if (cleanDigits.isNotEmpty()) "https://wa.me/$cleanDigits?text=" + java.net.URLEncoder.encode(message, "UTF-8")
+                else "https://wa.me/?text=" + java.net.URLEncoder.encode(message, "UTF-8")
+            }
+        }
+        val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(cleanUrl)).apply {
+            addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
+        android.widget.Toast.makeText(context, "Abrindo WhatsApp...", android.widget.Toast.LENGTH_SHORT).show()
+    } catch (e: Exception) {
+        val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+        val clip = android.content.ClipData.newPlainText("WhatsApp Link", linkOrNumber)
+        clipboard?.setPrimaryClip(clip)
+        android.widget.Toast.makeText(context, "Link de atendimento copiado!", android.widget.Toast.LENGTH_SHORT).show()
+    }
+}
+
+// Decodes Base64 string bytes into an Android ImageBitmap
+fun decodeBase64ToImageBitmap(base64Str: String?): androidx.compose.ui.graphics.ImageBitmap? {
+    if (base64Str.isNullOrBlank()) return null
+    return try {
+        val clean = if (base64Str.contains(",")) base64Str.substringAfter(",") else base64Str
+        val bytes = android.util.Base64.decode(clean.trim(), android.util.Base64.DEFAULT)
+        val bitmap = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        bitmap?.asImageBitmap()
+    } catch (e: Exception) {
+        null
+    }
+}
+
+// Composable to visualize the QR Code either from Base64 decoded bytes or procedural canvas representation
+@Composable
+fun QrCodeVisualizer(
+    base64Image: String?,
+    qrCodeLink: String,
+    modifier: Modifier = Modifier,
+    contentDescription: String = "QR Code de Pagamento"
+) {
+    val bitmap = remember(base64Image) { decodeBase64ToImageBitmap(base64Image) }
+
+    Surface(
+        color = Color.White,
+        shape = RoundedCornerShape(16.dp),
+        shadowElevation = 8.dp,
+        border = BorderStroke(2.dp, Color(0xFF38BDF8)),
+        modifier = modifier
+    ) {
+        Box(
+            modifier = Modifier
+                .padding(12.dp)
+                .size(160.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            if (bitmap != null) {
+                Image(
+                    bitmap = bitmap,
+                    contentDescription = contentDescription,
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Fit
+                )
+            } else {
+                ProceduralQrCodeCanvas(data = qrCodeLink, modifier = Modifier.fillMaxSize())
+            }
+        }
+    }
+}
+
+// Renders a high-tech QR Code pattern for the given data
+@Composable
+fun ProceduralQrCodeCanvas(data: String, modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier) {
+        val sizePx = size.minDimension
+        val gridSize = 21
+        val cellSize = sizePx / gridSize
+        val blackColor = Color(0xFF0F172A)
+        val hash = (data.ifBlank { "https://fimaster.vip/pay" }).hashCode()
+        val random = java.util.Random(hash.toLong())
+
+        drawRect(Color.White)
+
+        fun drawFinderPattern(startX: Int, startY: Int) {
+            drawRect(
+                color = blackColor,
+                topLeft = androidx.compose.ui.geometry.Offset(startX * cellSize, startY * cellSize),
+                size = androidx.compose.ui.geometry.Size(7 * cellSize, 7 * cellSize)
+            )
+            drawRect(
+                color = Color.White,
+                topLeft = androidx.compose.ui.geometry.Offset((startX + 1) * cellSize, (startY + 1) * cellSize),
+                size = androidx.compose.ui.geometry.Size(5 * cellSize, 5 * cellSize)
+            )
+            drawRect(
+                color = blackColor,
+                topLeft = androidx.compose.ui.geometry.Offset((startX + 2) * cellSize, (startY + 2) * cellSize),
+                size = androidx.compose.ui.geometry.Size(3 * cellSize, 3 * cellSize)
+            )
+        }
+
+        drawFinderPattern(0, 0)
+        drawFinderPattern(gridSize - 7, 0)
+        drawFinderPattern(0, gridSize - 7)
+
+        for (i in 8 until (gridSize - 8)) {
+            if (i % 2 == 0) {
+                drawRect(
+                    color = blackColor,
+                    topLeft = androidx.compose.ui.geometry.Offset(6 * cellSize, i * cellSize),
+                    size = androidx.compose.ui.geometry.Size(cellSize, cellSize)
+                )
+                drawRect(
+                    color = blackColor,
+                    topLeft = androidx.compose.ui.geometry.Offset(i * cellSize, 6 * cellSize),
+                    size = androidx.compose.ui.geometry.Size(cellSize, cellSize)
+                )
+            }
+        }
+
+        for (row in 0 until gridSize) {
+            for (col in 0 until gridSize) {
+                val isFinder = (row < 8 && col < 8) ||
+                               (row < 8 && col >= gridSize - 8) ||
+                               (row >= gridSize - 8 && col < 8) ||
+                               (row == 6 || col == 6)
+                if (!isFinder) {
+                    val bit = ((row * 31 + col * 17 + hash) % 3 == 0) || random.nextBoolean()
+                    if (bit) {
+                        drawRect(
+                            color = blackColor,
+                            topLeft = androidx.compose.ui.geometry.Offset(col * cellSize, row * cellSize),
+                            size = androidx.compose.ui.geometry.Size(cellSize, cellSize)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+data class VipSignalItem(
+    val symbol: String,
+    val type: String,
+    val entry: String,
+    val tp: String,
+    val sl: String,
+    val strategy: String,
+    val status: String,
+    val isBuy: Boolean
+)
+
+@Composable
+fun VipSignalRoomDialog(
+    planConfig: LicensePlanConfig,
+    currentTier: LicenseTier,
+    onDismiss: () -> Unit,
+    onNavigateToPlans: () -> Unit
+) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val prefs = remember { context.getSharedPreferences("fimaster_vip_prefs", android.content.Context.MODE_PRIVATE) }
+    var telegramLink by remember { 
+        mutableStateOf(prefs.getString("custom_telegram_vip_url", "https://t.me/FiMasterVipOficial") ?: "https://t.me/FiMasterVipOficial") 
+    }
+    var isEditingTelegramLink by remember { mutableStateOf(false) }
+    var editLinkInput by remember { mutableStateOf(telegramLink) }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth(0.95f)
+                .heightIn(max = 720.dp)
+                .border(1.5.dp, if (planConfig.sala) Color(0xFF229ED9).copy(alpha = 0.8f) else Color(0xFFEF4444).copy(alpha = 0.6f), RoundedCornerShape(24.dp)),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF0F172A)),
+            shape = RoundedCornerShape(24.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                // Header
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(42.dp)
+                                .background(
+                                    if (planConfig.sala) Color(0xFF229ED9).copy(alpha = 0.2f) else Color(0xFFEF4444).copy(alpha = 0.2f),
+                                    CircleShape
+                                )
+                                .border(1.dp, if (planConfig.sala) Color(0xFF229ED9) else Color(0xFFEF4444), CircleShape),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = if (planConfig.sala) Icons.Default.Send else Icons.Default.Lock,
+                                contentDescription = null,
+                                tint = if (planConfig.sala) Color(0xFF229ED9) else Color(0xFFEF4444),
+                                modifier = Modifier.size(22.dp)
+                            )
+                        }
+                        Column {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text(
+                                    text = "SALA VIP TELEGRAM",
+                                    style = MaterialTheme.typography.titleMedium.copy(
+                                        fontWeight = FontWeight.Black,
+                                        color = Color.White,
+                                        letterSpacing = 1.sp
+                                    )
+                                )
+                                Surface(
+                                    color = if (planConfig.sala) Color(0xFF229ED9).copy(alpha = 0.2f) else Color(0xFFEF4444).copy(alpha = 0.2f),
+                                    shape = RoundedCornerShape(4.dp),
+                                    border = BorderStroke(1.dp, if (planConfig.sala) Color(0xFF229ED9) else Color(0xFFEF4444))
+                                ) {
+                                    Text(
+                                        text = if (planConfig.sala) "ONLINE" else "BLOQUEADO",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            color = if (planConfig.sala) Color(0xFF38BDF8) else Color(0xFFEF4444),
+                                            fontSize = 9.sp,
+                                            fontWeight = FontWeight.Bold
+                                        ),
+                                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                                    )
+                                }
+                            }
+                            Text(
+                                text = if (planConfig.sala) "Sinais, Lives & Transmissões no Telegram 📲" else "Recurso Restrito ao Plano Master VIP",
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    color = if (planConfig.sala) Color(0xFF38BDF8) else Color(0xFFEF4444),
+                                    fontSize = 11.sp
+                                )
+                            )
+                        }
+                    }
+
+                    IconButton(onClick = onDismiss) {
+                        Icon(imageVector = Icons.Default.Close, contentDescription = "Fechar", tint = Color(0xFF94A3B8))
+                    }
+                }
+
+                HorizontalDivider(color = Color(0xFF334155).copy(alpha = 0.5f))
+
+                if (planConfig.sala) {
+                    // VIP Room Content (Allowed)
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(14.dp)
+                    ) {
+                        // Main Telegram Action Hero Banner
+                        Surface(
+                            color = Color(0xFF0369A1).copy(alpha = 0.25f),
+                            shape = RoundedCornerShape(16.dp),
+                            border = BorderStroke(1.5.dp, Color(0xFF229ED9).copy(alpha = 0.7f)),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(16.dp),
+                                verticalArrangement = Arrangement.spacedBy(12.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(10.dp)
+                                                .background(Color(0xFF10B981), CircleShape)
+                                        )
+                                        Text(
+                                            text = "TRANSMISSÃO TELEGRAM ATIVA",
+                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                fontWeight = FontWeight.Black,
+                                                color = Color(0xFF38BDF8),
+                                                letterSpacing = 0.5.sp
+                                            )
+                                        )
+                                    }
+
+                                    IconButton(
+                                        onClick = {
+                                            editLinkInput = telegramLink
+                                            isEditingTelegramLink = !isEditingTelegramLink
+                                        },
+                                        modifier = Modifier.size(28.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Edit,
+                                            contentDescription = "Editar Link",
+                                            tint = Color(0xFF94A3B8),
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                    }
+                                }
+
+                                Text(
+                                    text = "Conecte-se agora à Sala VIP Oficial no Telegram para receber análises, calls de entrada e acompanhamento ao vivo dos analistas da Fimathe.",
+                                    style = MaterialTheme.typography.bodySmall.copy(
+                                        color = Color(0xFFE2E8F0),
+                                        fontSize = 12.sp,
+                                        lineHeight = 17.sp
+                                    )
+                                )
+
+                                if (isEditingTelegramLink) {
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .background(Color(0xFF0F172A), RoundedCornerShape(10.dp))
+                                            .padding(10.dp),
+                                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        Text(
+                                            text = "Link / Canal do Telegram:",
+                                            style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF94A3B8), fontSize = 10.sp)
+                                        )
+                                        OutlinedTextField(
+                                            value = editLinkInput,
+                                            onValueChange = { editLinkInput = it },
+                                            modifier = Modifier.fillMaxWidth(),
+                                            textStyle = MaterialTheme.typography.bodySmall.copy(color = Color.White),
+                                            singleLine = true,
+                                            colors = OutlinedTextFieldDefaults.colors(
+                                                focusedBorderColor = Color(0xFF229ED9),
+                                                unfocusedBorderColor = Color(0xFF475569)
+                                            )
+                                        )
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.End,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            TextButton(onClick = { isEditingTelegramLink = false }) {
+                                                Text("Cancelar", color = Color(0xFF94A3B8), fontSize = 11.sp)
+                                            }
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Button(
+                                                onClick = {
+                                                    val saved = if (editLinkInput.isNotBlank()) editLinkInput.trim() else "https://t.me/FiMasterVipOficial"
+                                                    telegramLink = saved
+                                                    prefs.edit().putString("custom_telegram_vip_url", saved).apply()
+                                                    isEditingTelegramLink = false
+                                                    android.widget.Toast.makeText(context, "Link do Telegram atualizado!", android.widget.Toast.LENGTH_SHORT).show()
+                                                },
+                                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
+                                                shape = RoundedCornerShape(6.dp)
+                                            ) {
+                                                Text("Salvar Link", color = Color.White, fontSize = 11.sp)
+                                            }
+                                        }
+                                    }
+                                }
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    // Primary Button: Direct Push to Telegram
+                                    Button(
+                                        onClick = {
+                                            openTelegramLink(context, telegramLink)
+                                        },
+                                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF229ED9)),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.weight(1f),
+                                        contentPadding = PaddingValues(vertical = 12.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Send,
+                                            contentDescription = null,
+                                            tint = Color.White,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(
+                                            text = "ABRIR NO TELEGRAM",
+                                            style = MaterialTheme.typography.labelMedium.copy(
+                                                color = Color.White,
+                                                fontWeight = FontWeight.Black
+                                            )
+                                        )
+                                    }
+
+                                    // Secondary Button: Copy Link
+                                    IconButton(
+                                        onClick = {
+                                            val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+                                            val clip = android.content.ClipData.newPlainText("Telegram VIP Link", telegramLink)
+                                            clipboard?.setPrimaryClip(clip)
+                                            android.widget.Toast.makeText(context, "Link copiado: $telegramLink", android.widget.Toast.LENGTH_SHORT).show()
+                                        },
+                                        modifier = Modifier
+                                            .size(46.dp)
+                                            .background(Color(0xFF1E293B), RoundedCornerShape(12.dp))
+                                            .border(1.dp, Color(0xFF475569), RoundedCornerShape(12.dp))
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.ContentCopy,
+                                            contentDescription = "Copiar Link",
+                                            tint = Color(0xFF38BDF8),
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        Text(
+                            text = "SETUPS & SINAIS TRANSMITIDOS (AO VIVO)",
+                            style = MaterialTheme.typography.labelMedium.copy(
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFF94A3B8),
+                                letterSpacing = 1.sp
+                            )
+                        )
+
+                        // Sample VIP Signals Live Stream
+                        val liveSignals = listOf(
+                            VipSignalItem(
+                                symbol = "XAUUSD (Ouro)",
+                                type = "COMPRA / BUY",
+                                entry = "2714.50",
+                                tp = "2728.00 (Canal 100%)",
+                                sl = "2708.20 (Subciclo)",
+                                strategy = "Rompimento de Canal Fimathe M15",
+                                status = "EM ANDAMENTO ⚡",
+                                isBuy = true
+                            ),
+                            VipSignalItem(
+                                symbol = "EURUSD",
+                                type = "VENDA / SELL",
+                                entry = "1.08450",
+                                tp = "1.08050",
+                                sl = "1.08720",
+                                strategy = "Tendência Primária D1 / H1",
+                                status = "ALVO 1 ATINGIDO (+40 pips) 🎯",
+                                isBuy = false
+                            ),
+                            VipSignalItem(
+                                symbol = "US30 (Dow Jones)",
+                                type = "COMPRA / BUY",
+                                entry = "43820",
+                                tp = "44150",
+                                sl = "43650",
+                                strategy = "Sessão Nova York Reversão 50%",
+                                status = "AGUARDANDO GATILHO ⏳",
+                                isBuy = true
+                            )
+                        )
+
+                        liveSignals.forEach { sig ->
+                            Surface(
+                                color = Color(0xFF1E293B).copy(alpha = 0.8f),
+                                shape = RoundedCornerShape(14.dp),
+                                border = BorderStroke(1.dp, if (sig.isBuy) Color(0xFF10B981).copy(alpha = 0.4f) else Color(0xFFEF4444).copy(alpha = 0.4f)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(14.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = sig.symbol,
+                                            style = MaterialTheme.typography.titleSmall.copy(
+                                                fontWeight = FontWeight.Black,
+                                                color = Color.White
+                                            )
+                                        )
+                                        Surface(
+                                            color = if (sig.isBuy) Color(0xFF10B981).copy(alpha = 0.2f) else Color(0xFFEF4444).copy(alpha = 0.2f),
+                                            shape = RoundedCornerShape(6.dp),
+                                            border = BorderStroke(1.dp, if (sig.isBuy) Color(0xFF10B981) else Color(0xFFEF4444))
+                                        ) {
+                                            Text(
+                                                text = sig.type,
+                                                style = MaterialTheme.typography.labelSmall.copy(
+                                                    fontWeight = FontWeight.Black,
+                                                    color = if (sig.isBuy) Color(0xFF34D399) else Color(0xFFF87171),
+                                                    fontSize = 10.sp
+                                                ),
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                            )
+                                        }
+                                    }
+
+                                    Text(
+                                        text = sig.strategy,
+                                        style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF38BDF8), fontSize = 11.sp)
+                                    )
+
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .background(Color(0xFF0F172A), RoundedCornerShape(8.dp))
+                                            .padding(8.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Column {
+                                            Text("ENTRADA", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF64748B), fontSize = 9.sp))
+                                            Text(sig.entry, style = MaterialTheme.typography.bodySmall.copy(color = Color.White, fontWeight = FontWeight.Bold))
+                                        }
+                                        Column {
+                                            Text("TAKE PROFIT", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF64748B), fontSize = 9.sp))
+                                            Text(sig.tp, style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF10B981), fontWeight = FontWeight.Bold))
+                                        }
+                                        Column(horizontalAlignment = Alignment.End) {
+                                            Text("STOP LOSS", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF64748B), fontSize = 9.sp))
+                                            Text(sig.sl, style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFFEF4444), fontWeight = FontWeight.Bold))
+                                        }
+                                    }
+
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = "Status: ${sig.status}",
+                                            style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFFC084FC), fontWeight = FontWeight.SemiBold)
+                                        )
+
+                                        TextButton(
+                                            onClick = { openTelegramLink(context, telegramLink) },
+                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Send,
+                                                contentDescription = null,
+                                                tint = Color(0xFF229ED9),
+                                                modifier = Modifier.size(14.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Text(
+                                                text = "Ver no Telegram",
+                                                style = MaterialTheme.typography.labelSmall.copy(
+                                                    color = Color(0xFF229ED9),
+                                                    fontWeight = FontWeight.Bold,
+                                                    fontSize = 10.sp
+                                                )
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // VIP Room Locked
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .verticalScroll(rememberScrollState()),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center
+                    ) {
+                        Surface(
+                            color = Color(0xFFEF4444).copy(alpha = 0.15f),
+                            shape = CircleShape,
+                            modifier = Modifier.size(70.dp),
+                            border = BorderStroke(2.dp, Color(0xFFEF4444).copy(alpha = 0.5f))
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    imageVector = Icons.Default.Lock,
+                                    contentDescription = "Acesso Bloqueado",
+                                    tint = Color(0xFFEF4444),
+                                    modifier = Modifier.size(36.dp)
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(16.dp))
+
+                        Text(
+                            text = "ACESSO BLOQUEADO PELO PLANO",
+                            style = MaterialTheme.typography.titleMedium.copy(
+                                fontWeight = FontWeight.Black,
+                                color = Color(0xFFEF4444),
+                                letterSpacing = 1.sp
+                            ),
+                            textAlign = TextAlign.Center
+                        )
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        Text(
+                            text = "A transmissão ao vivo de sinais, análises diárias da Fimathe e calls de mercado no Telegram são exclusivas para assinantes com o parâmetro 'sala: true' (Plano Master VIP).\n\nO seu plano atual (${currentTier.displayName}) não inclui acesso ao Canal VIP do Telegram.",
+                            style = MaterialTheme.typography.bodyMedium.copy(
+                                color = Color(0xFFCBD5E1),
+                                lineHeight = 20.sp
+                            ),
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.padding(horizontal = 12.dp)
+                        )
+
+                        Spacer(modifier = Modifier.height(20.dp))
+
+                        Surface(
+                            color = Color(0xFF1E293B),
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(1.dp, Color(0xFF229ED9).copy(alpha = 0.4f)),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text(
+                                    text = "📲 BENEFÍCIOS DA SALA VIP TELEGRAM:",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold, color = Color(0xFF38BDF8))
+                                )
+                                Text("• Sinais em tempo real para XAUUSD, Forex e Índices no Telegram", style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFFE2E8F0)))
+                                Text("• Lives de abertura de mercado (Londres e Nova York)", style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFFE2E8F0)))
+                                Text("• Setups e projeções de canais Fimathe detalhados", style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFFE2E8F0)))
+                                Text("• Suporte VIP Direto 24/7", style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFFE2E8F0)))
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(20.dp))
+
+                        Button(
+                            onClick = onNavigateToPlans,
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFA855F7)),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = "Fazer Upgrade para Master VIP 👑",
+                                style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold, color = Color.White)
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1211,8 +2375,7 @@ fun OrderResultsAccumulatorCard(
     financialCandles: List<com.example.ui.FinancialCandle> = emptyList(),
     financialTransactions: List<com.example.ui.FinancialTransaction> = emptyList(),
     cambio: Double = 64.0,
-    currencySymbol: String = "MT",
-    onTriggerSimulation: () -> Unit = {}
+    currencySymbol: String = "MT"
 ) {
     val closedTrades = remember(financialTransactions) {
         financialTransactions.filter { it.type == com.example.ui.TransactionType.CLOSED_POSITION }
@@ -1310,26 +2473,6 @@ fun OrderResultsAccumulatorCard(
                         Text(
                             text = "Resultados e Projeção de Ordens MT5",
                             style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8))
-                        )
-                    }
-                }
-
-                Button(
-                    onClick = onTriggerSimulation,
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8B5CF6)),
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                    shape = RoundedCornerShape(12.dp)
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(imageVector = Icons.Default.PlayArrow, contentDescription = "Disparar Simulação", tint = Color.White, modifier = Modifier.size(14.dp))
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            text = "SIMULAR TUDO",
-                            style = MaterialTheme.typography.labelSmall.copy(
-                                color = Color.White,
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 10.sp
-                            )
                         )
                     }
                 }
@@ -1463,9 +2606,10 @@ fun DashboardScreen(
     onRequestScreenshot: () -> Unit = {},
     onSaveMt5Id: (String) -> Unit,
     onStartTour: () -> Unit = {},
-    onTriggerSimulation: () -> Unit = {},
     systemNotifications: List<SystemNotification> = emptyList(),
     onNavigateToTab: (PortalTab) -> Unit = {},
+    onResolveNotification: ((SystemNotification) -> Unit)? = null,
+    onMarkAsViewed: ((SystemNotification) -> Unit)? = null,
     onSaveEaConfig: (com.example.data.EaConfigEntity) -> Unit = {},
     onFetchExchangeRate: (String, (Double?) -> Unit) -> Unit = { _, _ -> }
 ) {
@@ -1512,100 +2656,6 @@ fun DashboardScreen(
                         letterSpacing = 2.sp
                     )
                 )
-
-                Surface(
-                    onClick = onTriggerSimulation,
-                    shape = RoundedCornerShape(12.dp),
-                    color = Color(0xFF8B5CF6).copy(alpha = 0.2f),
-                    border = BorderStroke(1.dp, Color(0xFFC084FC).copy(alpha = 0.6f))
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.AutoMode,
-                            contentDescription = "Simulação",
-                            tint = Color(0xFFC084FC),
-                            modifier = Modifier.size(14.dp)
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            text = "SIMULAR TUDO",
-                            style = MaterialTheme.typography.labelSmall.copy(
-                                color = Color(0xFFC084FC),
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 10.sp
-                            )
-                        )
-                    }
-                }
-            }
-        }
-
-        if (systemNotifications.isNotEmpty()) {
-            item {
-                SystemNotificationsBannerCard(
-                    notifications = systemNotifications,
-                    onNavigateToTab = onNavigateToTab
-                )
-            }
-        }
-
-        item {
-            // Simulation Quick Bar Card
-            Card(
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1B4B).copy(alpha = 0.95f)),
-                shape = RoundedCornerShape(16.dp),
-                border = BorderStroke(1.dp, Color(0xFF8B5CF6).copy(alpha = 0.5f)),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(14.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                imageVector = Icons.Default.FlashOn,
-                                contentDescription = "Simular Eventos",
-                                tint = Color(0xFFF59E0B),
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = "SIMULADOR INTEGRAL DE EVENTOS & STATUS",
-                                style = MaterialTheme.typography.labelSmall.copy(
-                                    color = Color(0xFFC084FC),
-                                    fontWeight = FontWeight.Black,
-                                    letterSpacing = 0.5.sp
-                                )
-                            )
-                        }
-                        Spacer(modifier = Modifier.height(2.dp))
-                        Text(
-                            text = "Gere dados de pré-visualização para Relatórios, Ordens, Posição, Sessão e Filtros do Robô EA.",
-                            style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8), fontSize = 11.sp)
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.width(8.dp))
-
-                    Button(
-                        onClick = onTriggerSimulation,
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8B5CF6)),
-                        shape = RoundedCornerShape(12.dp),
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                    ) {
-                        Text(
-                            text = "DISPARAR",
-                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold, color = Color.White)
-                        )
-                    }
-                }
             }
         }
 
@@ -1654,8 +2704,7 @@ fun DashboardScreen(
                 financialCandles = financialCandles,
                 financialTransactions = financialTransactions,
                 cambio = currentCambio,
-                currencySymbol = currencySymbol,
-                onTriggerSimulation = onTriggerSimulation
+                currencySymbol = currencySymbol
             )
         }
 
@@ -1765,15 +2814,6 @@ fun ClientLicenseScreen(
             )
         }
 
-        if (systemNotifications.isNotEmpty()) {
-            item {
-                SystemNotificationsBannerCard(
-                    notifications = systemNotifications,
-                    onNavigateToTab = onNavigateToTab
-                )
-            }
-        }
-
         item {
             WelcomeHeader(loggedUser.nome, loggedUser.mt5IdConta)
         }
@@ -1786,7 +2826,16 @@ fun ClientLicenseScreen(
             LicenseStatusCard(
                 status = if (loggedUser.licencaAtiva) "ATIVA" else "EXPIRADA",
                 expiryDate = loggedUser.licencaValidade,
-                creditoGuardado = loggedUser.creditoGuardado
+                creditoGuardado = loggedUser.creditoGuardado,
+                tier = loggedUser.effectiveLicenseTier,
+                mt5AccountId = loggedUser.mt5IdConta
+            )
+        }
+
+        item {
+            PlanTiersShowcaseCard(
+                currentTier = loggedUser.effectiveLicenseTier,
+                loggedUser = loggedUser
             )
         }
 
@@ -1890,10 +2939,16 @@ fun ClientLicenseScreen(
 fun EaRobotEventsScreen(
     events: List<com.example.data.EaRobotEvent>,
     mt5AccountId: String,
+    focusedEventGid: String? = null,
+    syncMetadata: com.example.data.SyncMetadataEntity? = null,
+    isSyncing: Boolean = false,
+    onTriggerSync: (Boolean) -> Unit = {},
+    onClearFocus: () -> Unit = {},
     onClearEvents: () -> Unit = {}
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val readKeys by PortalEventQueueManager.readEventKeys.collectAsStateWithLifecycle()
+    val listState = rememberLazyListState()
 
     val visibleEvents = remember(events) {
         events.filterNot { evt ->
@@ -1907,7 +2962,20 @@ fun EaRobotEventsScreen(
     }
     val unreadCount = visibleEvents.size - readCount
 
+    // Smooth scroll to targeted event if focused via GID
+    LaunchedEffect(focusedEventGid, visibleEvents) {
+        if (!focusedEventGid.isNullOrBlank()) {
+            val targetIdx = visibleEvents.indexOfFirst {
+                it.getResolvedGid() == focusedEventGid || it.gid == focusedEventGid || it.id == focusedEventGid
+            }
+            if (targetIdx >= 0) {
+                listState.animateScrollToItem(index = targetIdx + 1)
+            }
+        }
+    }
+
     LazyColumn(
+        state = listState,
         modifier = Modifier
             .fillMaxSize()
             .padding(horizontal = 16.dp),
@@ -1994,12 +3062,51 @@ fun EaRobotEventsScreen(
                     }
 
                     // Action buttons row
-                    if (visibleEvents.isNotEmpty()) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        // Smart Sync Button
+                        Surface(
+                            onClick = { onTriggerSync(false) },
+                            enabled = !isSyncing,
+                            color = Color(0xFF0284C7).copy(alpha = 0.15f),
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, Color(0xFF38BDF8).copy(alpha = 0.4f)),
+                            modifier = Modifier.weight(1.2f)
                         ) {
+                            Row(
+                                modifier = Modifier.padding(vertical = 8.dp, horizontal = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.Center
+                            ) {
+                                if (isSyncing) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(14.dp),
+                                        color = Color(0xFF38BDF8),
+                                        strokeWidth = 2.dp
+                                    )
+                                } else {
+                                    Icon(
+                                        imageVector = Icons.Default.Sync,
+                                        contentDescription = "Sincronização Inteligente",
+                                        tint = Color(0xFF38BDF8),
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                }
+                                Spacer(modifier = Modifier.width(5.dp))
+                                Text(
+                                    text = if (isSyncing) "Sincronizando..." else "Smart Sync",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        color = Color(0xFF38BDF8),
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                )
+                            }
+                        }
+
+                        if (visibleEvents.isNotEmpty()) {
                             Surface(
                                 onClick = {
                                     PortalEventQueueManager.markAllAsRead(visibleEvents)
@@ -2011,7 +3118,7 @@ fun EaRobotEventsScreen(
                                 modifier = Modifier.weight(1f)
                             ) {
                                 Row(
-                                    modifier = Modifier.padding(vertical = 8.dp, horizontal = 10.dp),
+                                    modifier = Modifier.padding(vertical = 8.dp, horizontal = 8.dp),
                                     verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = Arrangement.Center
                                 ) {
@@ -2021,7 +3128,7 @@ fun EaRobotEventsScreen(
                                         tint = Color(0xFF34D399),
                                         modifier = Modifier.size(14.dp)
                                     )
-                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
                                     Text(
                                         text = "Marcar Lidos",
                                         style = MaterialTheme.typography.labelSmall.copy(
@@ -2040,10 +3147,10 @@ fun EaRobotEventsScreen(
                                 color = Color(0xFFEF4444).copy(alpha = 0.15f),
                                 shape = RoundedCornerShape(10.dp),
                                 border = BorderStroke(1.dp, Color(0xFFEF4444).copy(alpha = 0.4f)),
-                                modifier = Modifier.weight(1f)
+                                modifier = Modifier.weight(0.9f)
                             ) {
                                 Row(
-                                    modifier = Modifier.padding(vertical = 8.dp, horizontal = 10.dp),
+                                    modifier = Modifier.padding(vertical = 8.dp, horizontal = 8.dp),
                                     verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = Arrangement.Center
                                 ) {
@@ -2053,7 +3160,7 @@ fun EaRobotEventsScreen(
                                         tint = Color(0xFFF87171),
                                         modifier = Modifier.size(14.dp)
                                     )
-                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
                                     Text(
                                         text = "Limpar",
                                         style = MaterialTheme.typography.labelSmall.copy(
@@ -2063,6 +3170,131 @@ fun EaRobotEventsScreen(
                                     )
                                 }
                             }
+                        }
+                    }
+
+                    // Smart Sync Status Info Banner
+                    if (syncMetadata != null && syncMetadata.lastSyncTime > 0L) {
+                        val syncTimeFormatted = remember(syncMetadata.lastSyncTime) {
+                            java.text.SimpleDateFormat("dd/MM HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date(syncMetadata.lastSyncTime))
+                        }
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            color = Color(0xFF0F2238),
+                            shape = RoundedCornerShape(8.dp),
+                            border = BorderStroke(1.dp, Color(0xFF0284C7).copy(alpha = 0.3f))
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.CheckCircle,
+                                        contentDescription = null,
+                                        tint = Color(0xFF38BDF8),
+                                        modifier = Modifier.size(12.dp)
+                                    )
+                                    val statusDetail = if (syncMetadata.totalEventsCount == 0 && syncMetadata.lastEventTimestamp > 0L) {
+                                        "Limpo (Cursor salvo • Apenas novos)"
+                                    } else {
+                                        "${syncMetadata.totalEventsCount} locais"
+                                    }
+                                    Text(
+                                        text = "Smart Sync: $syncTimeFormatted • $statusDetail",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            color = Color(0xFFBAE6FD),
+                                            fontSize = 10.sp
+                                        ),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+
+                                TextButton(
+                                    onClick = { onTriggerSync(true) },
+                                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                                    modifier = Modifier.height(24.dp)
+                                ) {
+                                    Text(
+                                        text = "Forçar Completa",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            color = Color(0xFF38BDF8),
+                                            fontSize = 9.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Focused GID Banner
+        if (!focusedEventGid.isNullOrBlank()) {
+            item {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    color = Color(0xFF082F49),
+                    border = BorderStroke(1.5.dp, Color(0xFF38BDF8))
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.GpsFixed,
+                                contentDescription = null,
+                                tint = Color(0xFF38BDF8),
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Column {
+                                Text(
+                                    text = "🎯 Evento Focado via Notificação",
+                                    style = MaterialTheme.typography.labelMedium.copy(
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                )
+                                Text(
+                                    text = "Visualizando o alerta selecionado",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        color = Color(0xFF7DD3FC),
+                                        fontSize = 11.sp
+                                    ),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+
+                        TextButton(
+                            onClick = onClearFocus,
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                        ) {
+                            Text(
+                                text = "Limpar Foco ✕",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = Color(0xFF38BDF8),
+                                    fontWeight = FontWeight.Bold
+                                )
+                            )
                         }
                     }
                 }
@@ -2109,8 +3341,10 @@ fun EaRobotEventsScreen(
                 }
             }
         } else {
-            items(visibleEvents) { event ->
-                EaEventItemCard(event = event)
+            items(visibleEvents, key = { it.getResolvedGid() }) { event ->
+                val isFocused = !focusedEventGid.isNullOrBlank() &&
+                    (event.getResolvedGid() == focusedEventGid || event.gid == focusedEventGid || event.id == focusedEventGid)
+                EaEventItemCard(event = event, isFocused = isFocused)
             }
         }
 
@@ -2287,6 +3521,9 @@ object AppTtsManager {
     @Volatile private var currentSessionId: Long = 0L
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
 
+    private val _isSpeaking = kotlinx.coroutines.flow.MutableStateFlow(false)
+    val isSpeaking: kotlinx.coroutines.flow.StateFlow<Boolean> get() = _isSpeaking
+
     fun selectMalePtPtVoice(voices: Collection<android.speech.tts.Voice>): android.speech.tts.Voice? {
         // Priority 1: European Portuguese (pt-PT) explicitly male tagged (ptm, male, man, ptd, pt-pt-x-ptm)
         val malePtPtExplicit = voices.firstOrNull { v ->
@@ -2400,6 +3637,7 @@ object AppTtsManager {
 
         fun safeOnStart() {
             if (thisSessionId != currentSessionId) return
+            _isSpeaking.value = true
             mainHandler.post {
                 if (thisSessionId == currentSessionId) {
                     onStart()
@@ -2409,6 +3647,7 @@ object AppTtsManager {
 
         fun safeOnDone() {
             if (hasCompleted.compareAndSet(false, true)) {
+                _isSpeaking.value = false
                 mainHandler.post {
                     if (thisSessionId == currentSessionId) {
                         onDone()
@@ -2419,6 +3658,7 @@ object AppTtsManager {
 
         fun safeOnError(msg: String) {
             if (hasCompleted.compareAndSet(false, true)) {
+                _isSpeaking.value = false
                 mainHandler.post {
                     if (thisSessionId == currentSessionId) {
                         onError(msg)
@@ -2638,6 +3878,7 @@ object AppTtsManager {
     @Synchronized
     fun stopAll() {
         currentSessionId++
+        _isSpeaking.value = false
         mainHandler.removeCallbacksAndMessages(null)
         try {
             tts?.stop()
@@ -2672,11 +3913,7 @@ object PortalEventQueueManager {
     @Volatile private var isProcessing = false
 
     fun getEventUniqueKey(event: com.example.data.EaRobotEvent): String {
-        return if (event.id.isNotBlank() && event.id != "0") {
-            "id_${event.id}_ts_${event.timestamp}_evt_${event.event}"
-        } else {
-            "login_${event.login}_ts_${event.timestamp}_evt_${event.event}_sys_${event.sistema}_new_${event.novo}_msg_${event.msg.hashCode()}"
-        }
+        return event.getResolvedGid()
     }
 
     fun getReadState(event: com.example.data.EaRobotEvent): EventReadState {
@@ -2830,6 +4067,83 @@ object PortalEventQueueManager {
 }
 
 @Composable
+fun VoicePulsingWaveHalo(
+    modifier: Modifier = Modifier,
+    color: Color = Color(0xFF38BDF8)
+) {
+    val infiniteTransition = rememberInfiniteTransition(label = "VoicePulseHalo")
+    val scale by infiniteTransition.animateFloat(
+        initialValue = 0.85f,
+        targetValue = 1.75f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1200, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "HaloScale"
+    )
+    val alpha by infiniteTransition.animateFloat(
+        initialValue = 0.75f,
+        targetValue = 0.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1200, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "HaloAlpha"
+    )
+
+    Box(
+        modifier = modifier
+            .scale(scale)
+            .border(1.5.dp, color.copy(alpha = alpha), CircleShape)
+            .background(color.copy(alpha = alpha * 0.25f), CircleShape)
+    )
+}
+
+@Composable
+fun VoiceAudioWaveBars(
+    modifier: Modifier = Modifier,
+    barColor: Color = Color(0xFF38BDF8),
+    barCount: Int = 4,
+    maxHeight: androidx.compose.ui.unit.Dp = 12.dp
+) {
+    val infiniteTransition = rememberInfiniteTransition(label = "VoiceWaveBars")
+
+    val delays = listOf(0, 140, 280, 420, 180, 320)
+    val animatedScales = (0 until barCount).map { index ->
+        val delay = delays.getOrElse(index) { index * 120 }
+        infiniteTransition.animateFloat(
+            initialValue = 0.22f,
+            targetValue = 1.0f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(
+                    durationMillis = 380 + (index * 70),
+                    delayMillis = delay,
+                    easing = FastOutSlowInEasing
+                ),
+                repeatMode = RepeatMode.Reverse
+            ),
+            label = "BarScale_$index"
+        )
+    }
+
+    Row(
+        modifier = modifier,
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        animatedScales.forEach { scaleState ->
+            Box(
+                modifier = Modifier
+                    .width(2.5.dp)
+                    .height(maxHeight * scaleState.value)
+                    .clip(RoundedCornerShape(2.dp))
+                    .background(barColor)
+            )
+        }
+    }
+}
+
+@Composable
 fun EventReadSignalBadge(
     readState: EventReadState,
     modifier: Modifier = Modifier
@@ -2879,11 +4193,19 @@ fun EventReadSignalBadge(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(4.dp)
         ) {
-            Box(
-                modifier = Modifier
-                    .size(6.dp)
-                    .background(dotColor, CircleShape)
-            )
+            if (readState == EventReadState.READING) {
+                VoiceAudioWaveBars(
+                    barColor = Color(0xFF38BDF8),
+                    barCount = 3,
+                    maxHeight = 9.dp
+                )
+            } else {
+                Box(
+                    modifier = Modifier
+                        .size(6.dp)
+                        .background(dotColor, CircleShape)
+                )
+            }
             Text(
                 text = statusText,
                 style = MaterialTheme.typography.labelSmall.copy(
@@ -2999,7 +4321,10 @@ fun decodeBase64ToBitmap(base64Str: String): android.graphics.Bitmap? {
 }
 
 @Composable
-fun ClassicEventCard(event: com.example.data.EaRobotEvent) {
+fun ClassicEventCard(
+    event: com.example.data.EaRobotEvent,
+    isFocused: Boolean = false
+) {
     val context = androidx.compose.ui.platform.LocalContext.current
 
     val readKeys by PortalEventQueueManager.readEventKeys.collectAsStateWithLifecycle()
@@ -3148,15 +4473,69 @@ fun ClassicEventCard(event: com.example.data.EaRobotEvent) {
         } else "N/A"
     }
 
+    val infiniteCardTransition = rememberInfiniteTransition(label = "CardReadingPulse")
+    val pulseGlowAlpha by infiniteCardTransition.animateFloat(
+        initialValue = 0.4f,
+        targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(750, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "glowAlpha"
+    )
+
+    val cardBorder = when {
+        readState == EventReadState.READING -> BorderStroke(2.dp, Color(0xFF38BDF8).copy(alpha = pulseGlowAlpha))
+        isFocused -> BorderStroke(2.dp, Color(0xFF22D3EE))
+        else -> BorderStroke(1.dp, badgeColor.copy(alpha = 0.35f))
+    }
+    val cardContainerColor = when {
+        readState == EventReadState.READING -> Color(0xFF0C243B)
+        isFocused -> Color(0xFF0C2438)
+        else -> Color(0xFF0F172A)
+    }
+
     Card(
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 3.dp),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF0F172A)),
+        colors = CardDefaults.cardColors(containerColor = cardContainerColor),
         shape = RoundedCornerShape(14.dp),
-        border = BorderStroke(1.dp, badgeColor.copy(alpha = 0.35f))
+        border = cardBorder
     ) {
         Column(modifier = Modifier.padding(10.dp)) {
+            if (isFocused) {
+                Surface(
+                    color = Color(0xFF22D3EE).copy(alpha = 0.2f),
+                    shape = RoundedCornerShape(8.dp),
+                    border = BorderStroke(1.dp, Color(0xFF22D3EE)),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 6.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.GpsFixed,
+                            contentDescription = null,
+                            tint = Color(0xFF22D3EE),
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "🎯 EVENTO LOCALIZADO (RESOLVER)",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                color = Color(0xFF22D3EE),
+                                fontWeight = FontWeight.Black,
+                                fontSize = 10.5.sp
+                            )
+                        )
+                    }
+                }
+            }
+
             // Header Row: Badge + Title + Signal Badge + Audio Button
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -3195,36 +4574,79 @@ fun ClassicEventCard(event: com.example.data.EaRobotEvent) {
 
                 Spacer(modifier = Modifier.width(6.dp))
 
-                // Signal Indicator Badge (Cinza = Não lido / Verde = Lido)
+                // Signal Indicator Badge (Cinza = Não lido / Verde = Lido / Wave = Lendo)
                 EventReadSignalBadge(readState = readState)
 
                 Spacer(modifier = Modifier.width(6.dp))
 
-                // Audio Button
+                val planConfig = LocalLicensePlanConfig.current
+                val isAudioAllowed = planConfig.audio
+
+                // Audio Button with Wave Animation when Reading
                 Surface(
-                    onClick = { PortalEventQueueManager.speakSingleEvent(context, event) },
-                    color = if (readState == EventReadState.READING) Color(0xFF0284C7).copy(alpha = 0.25f) else badgeColor.copy(alpha = 0.15f),
+                    onClick = {
+                        if (!isAudioAllowed) {
+                            android.widget.Toast.makeText(context, "🔒 Alertas de áudio bloqueados no seu plano.", android.widget.Toast.LENGTH_SHORT).show()
+                            return@Surface
+                        }
+                        PortalEventQueueManager.speakSingleEvent(context, event)
+                    },
+                    color = if (!isAudioAllowed) Color(0xFF334155).copy(alpha = 0.4f) else if (readState == EventReadState.READING) Color(0xFF0284C7).copy(alpha = 0.3f) else badgeColor.copy(alpha = 0.15f),
                     shape = RoundedCornerShape(10.dp),
-                    border = BorderStroke(1.dp, if (readState == EventReadState.READING) Color(0xFF38BDF8) else badgeColor.copy(alpha = 0.5f))
+                    border = BorderStroke(1.dp, if (!isAudioAllowed) Color(0xFF475569) else if (readState == EventReadState.READING) Color(0xFF38BDF8) else badgeColor.copy(alpha = 0.5f))
                 ) {
                     Row(
                         modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(
-                            imageVector = if (readState == EventReadState.READING) Icons.Default.VolumeUp else Icons.Default.VolumeMute,
-                            contentDescription = "Ouvir em Áudio",
-                            tint = if (readState == EventReadState.READING) Color(0xFF38BDF8) else badgeColor,
-                            modifier = Modifier.size(13.dp)
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            text = if (readState == EventReadState.READING) "Lendo..." else "Áudio 🔊",
-                            style = MaterialTheme.typography.labelSmall.copy(
-                                color = if (readState == EventReadState.READING) Color(0xFF38BDF8) else badgeColor,
-                                fontWeight = FontWeight.Bold
+                        if (!isAudioAllowed) {
+                            Icon(
+                                imageVector = Icons.Default.Lock,
+                                contentDescription = "Áudio Bloqueado",
+                                tint = Color(0xFF94A3B8),
+                                modifier = Modifier.size(12.dp)
                             )
-                        )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "Áudio 🔒",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = Color(0xFF94A3B8),
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 10.sp
+                                )
+                            )
+                        } else if (readState == EventReadState.READING) {
+                            VoiceAudioWaveBars(
+                                barColor = Color(0xFF38BDF8),
+                                barCount = 3,
+                                maxHeight = 11.dp
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "Lendo",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = Color(0xFF38BDF8),
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 10.sp
+                                )
+                            )
+                        } else {
+                            Icon(
+                                imageVector = if (readState == EventReadState.READ) Icons.Default.VolumeUp else Icons.Default.VolumeMute,
+                                contentDescription = "Ouvir em Áudio",
+                                tint = badgeColor,
+                                modifier = Modifier.size(13.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "Áudio 🔊",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = badgeColor,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 10.sp
+                                )
+                            )
+                        }
                     }
                 }
             }
@@ -3234,7 +4656,10 @@ fun ClassicEventCard(event: com.example.data.EaRobotEvent) {
             // Specific Card Body Layouts based on event type
             when {
                 isCapturaTela -> {
-                    // Captura de Tela Exclusive Layout
+                    // Captura de Tela Exclusive Layout (Com Blur de Segurança para Licença TRIAL)
+                    val licenseTier = LocalLicenseTier.current
+                    val isTrial = (licenseTier == LicenseTier.TRIAL)
+
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -3245,15 +4670,72 @@ fun ClassicEventCard(event: com.example.data.EaRobotEvent) {
                         if (event.imageBase64.isNotBlank()) {
                             val bitmap = remember(event.imageBase64) { decodeBase64ToBitmap(event.imageBase64) }
                             if (bitmap != null) {
-                                Image(
-                                    bitmap = bitmap.asImageBitmap(),
-                                    contentDescription = "Captura de Tela do Gráfico MT5",
+                                Box(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .heightIn(max = 240.dp)
                                         .clip(RoundedCornerShape(8.dp)),
-                                    contentScale = ContentScale.Fit
-                                )
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Image(
+                                        bitmap = bitmap.asImageBitmap(),
+                                        contentDescription = "Captura de Tela do Gráfico MT5",
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .then(if (isTrial) Modifier.blur(16.dp) else Modifier),
+                                        contentScale = ContentScale.Fit
+                                    )
+
+                                    if (isTrial) {
+                                        // 🔒 Overlay de Bloqueio com Vidro Fosco Cyber-Trading Dark
+                                        Surface(
+                                            color = Color(0xFF0F172A).copy(alpha = 0.88f),
+                                            shape = RoundedCornerShape(12.dp),
+                                            border = BorderStroke(1.dp, Color(0xFFF59E0B).copy(alpha = 0.6f)),
+                                            modifier = Modifier
+                                                .fillMaxWidth(0.92f)
+                                                .padding(8.dp)
+                                        ) {
+                                            Column(
+                                                modifier = Modifier.padding(12.dp),
+                                                horizontalAlignment = Alignment.CenterHorizontally,
+                                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                                            ) {
+                                                Box(
+                                                    modifier = Modifier
+                                                        .size(32.dp)
+                                                        .background(Color(0xFFF59E0B).copy(alpha = 0.2f), CircleShape),
+                                                    contentAlignment = Alignment.Center
+                                                ) {
+                                                    Icon(
+                                                        imageVector = Icons.Default.Lock,
+                                                        contentDescription = "Bloqueado",
+                                                        tint = Color(0xFFF59E0B),
+                                                        modifier = Modifier.size(18.dp)
+                                                    )
+                                                }
+                                                Text(
+                                                    text = "CAPTURA DESFOCADA (PLANO TRIAL)",
+                                                    style = MaterialTheme.typography.labelSmall.copy(
+                                                        color = Color(0xFFF59E0B),
+                                                        fontWeight = FontWeight.Black,
+                                                        letterSpacing = 0.5.sp
+                                                    ),
+                                                    textAlign = TextAlign.Center
+                                                )
+                                                Text(
+                                                    text = "Imagens nítidas do gráfico MT5 e relatórios com objetos visuais são exclusivos dos planos Starter, Pro e Master.",
+                                                    style = MaterialTheme.typography.bodySmall.copy(
+                                                        color = Color(0xFFE2E8F0),
+                                                        fontSize = 11.sp,
+                                                        lineHeight = 15.sp
+                                                    ),
+                                                    textAlign = TextAlign.Center
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
 
@@ -3279,13 +4761,16 @@ fun ClassicEventCard(event: com.example.data.EaRobotEvent) {
                                 }
                             }
                             Surface(
-                                color = Color(0xFF38BDF8).copy(alpha = 0.2f),
+                                color = if (isTrial) Color(0xFFF59E0B).copy(alpha = 0.2f) else Color(0xFF38BDF8).copy(alpha = 0.2f),
                                 shape = RoundedCornerShape(6.dp),
-                                border = BorderStroke(1.dp, Color(0xFF38BDF8).copy(alpha = 0.5f))
+                                border = BorderStroke(1.dp, if (isTrial) Color(0xFFF59E0B).copy(alpha = 0.5f) else Color(0xFF38BDF8).copy(alpha = 0.5f))
                             ) {
                                 Text(
-                                    text = "CONCLUÍDO",
-                                    style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF38BDF8), fontWeight = FontWeight.Bold),
+                                    text = if (isTrial) "TRIAL RESTRITO" else "CONCLUÍDO",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        color = if (isTrial) Color(0xFFF59E0B) else Color(0xFF38BDF8),
+                                        fontWeight = FontWeight.Bold
+                                    ),
                                     modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
                                 )
                             }
@@ -3302,6 +4787,38 @@ fun ClassicEventCard(event: com.example.data.EaRobotEvent) {
                                 text = sanitizeText(capMsg),
                                 style = MaterialTheme.typography.bodySmall.copy(color = Color.White, lineHeight = 18.sp),
                                 modifier = Modifier.padding(8.dp)
+                            )
+                        }
+
+                        Button(
+                            onClick = {
+                                if (isTrial) {
+                                    android.widget.Toast.makeText(context, "🔒 Upgrade necessário para exportar capturas do MT5", android.widget.Toast.LENGTH_SHORT).show()
+                                } else {
+                                    shareEventScreenshot(context, event)
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (isTrial) Color(0xFF334155) else Color(0xFF0284C7).copy(alpha = 0.35f)
+                            ),
+                            border = BorderStroke(1.dp, if (isTrial) Color(0xFF64748B) else Color(0xFF38BDF8).copy(alpha = 0.6f)),
+                            shape = RoundedCornerShape(8.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                            modifier = Modifier.fillMaxWidth().height(36.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (isTrial) Icons.Default.Lock else Icons.Default.Share,
+                                contentDescription = "Compartilhar Captura",
+                                tint = if (isTrial) Color(0xFFF59E0B) else Color(0xFF38BDF8),
+                                modifier = Modifier.size(15.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = if (isTrial) "EXPORTAR DISPONÍVEL NO PLANO STARTER" else "COMPARTILHAR CAPTURA",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = Color.White,
+                                    fontWeight = FontWeight.Bold
+                                )
                             )
                         }
                     }
@@ -4018,13 +5535,19 @@ fun ClassicEventCard(event: com.example.data.EaRobotEvent) {
 }
 
 @Composable
-fun EaEventItemCard(event: com.example.data.EaRobotEvent) {
-    ClassicEventCard(event = event)
+fun EaEventItemCard(
+    event: com.example.data.EaRobotEvent,
+    isFocused: Boolean = false
+) {
+    ClassicEventCard(event = event, isFocused = isFocused)
 }
 
 @Composable
-fun ClassicStateChangeCard(event: com.example.data.EaRobotEvent) {
-    ClassicEventCard(event = event)
+fun ClassicStateChangeCard(
+    event: com.example.data.EaRobotEvent,
+    isFocused: Boolean = false
+) {
+    ClassicEventCard(event = event, isFocused = isFocused)
 }
 
 @Composable
@@ -4034,6 +5557,7 @@ fun Mt5AccountQuickManageCard(
 ) {
     var isEditing by remember { mutableStateOf(false) }
     var inputId by remember(mt5AccountId) { mutableStateOf(mt5AccountId) }
+    val planConfig = LocalLicensePlanConfig.current
 
     Card(
         colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B).copy(alpha = 0.85f)),
@@ -4056,14 +5580,24 @@ fun Mt5AccountQuickManageCard(
                         modifier = Modifier.size(20.dp)
                     )
                     Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = "CONTA DE NEGOCIAÇÃO MT5",
-                        style = MaterialTheme.typography.labelMedium.copy(
-                            fontWeight = FontWeight.Bold,
-                            color = Color(0xFF94A3B8),
-                            letterSpacing = 1.sp
+                    Column {
+                        Text(
+                            text = "CONTA DE NEGOCIAÇÃO MT5",
+                            style = MaterialTheme.typography.labelMedium.copy(
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFF94A3B8),
+                                letterSpacing = 1.sp
+                            )
                         )
-                    )
+                        Text(
+                            text = "Limite do plano: ${planConfig.vincularConta} conta(s)",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                color = Color(0xFF22D3EE),
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        )
+                    }
                 }
 
                 IconButton(onClick = { isEditing = !isEditing }) {
@@ -4709,9 +6243,15 @@ fun UserUidCompactDialog(
 }
 
 @Composable
-fun LicenseStatusCard(status: String, expiryDate: String, creditoGuardado: Double = 0.0) {
+fun LicenseStatusCard(
+    status: String,
+    expiryDate: String,
+    creditoGuardado: Double = 0.0,
+    tier: LicenseTier = LicenseTier.TRIAL,
+    mt5AccountId: String = ""
+) {
     val displayStatusColor = if (status.equals("Ativa", ignoreCase = true)) {
-        Color(0xFF22D3EE) // Bright Cyan 400
+        tier.accentColor
     } else if (status.equals("Pendente", ignoreCase = true)) {
         Color(0xFFF59E0B) // Warning Orange
     } else {
@@ -4731,8 +6271,8 @@ fun LicenseStatusCard(status: String, expiryDate: String, creditoGuardado: Doubl
                 )
             )
             .border(
-                1.dp,
-                Color(0xFF334155).copy(alpha = 0.5f), // Border-slate-700/50
+                1.5.dp,
+                tier.accentColor.copy(alpha = 0.6f),
                 RoundedCornerShape(24.dp)
             )
             .padding(20.dp)
@@ -4745,7 +6285,7 @@ fun LicenseStatusCard(status: String, expiryDate: String, creditoGuardado: Doubl
             ) {
                 Column {
                     Text(
-                        text = "LICENÇA ATUAL",
+                        text = "PLANO & LICENÇA ATUAL",
                         style = MaterialTheme.typography.labelSmall.copy(
                             color = Color(0xFF94A3B8), // Slate 400
                             fontWeight = FontWeight.Bold,
@@ -4756,15 +6296,15 @@ fun LicenseStatusCard(status: String, expiryDate: String, creditoGuardado: Doubl
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Box(
                             modifier = Modifier
-                                .size(8.dp)
+                                .size(10.dp)
                                 .clip(CircleShape)
                                 .background(displayStatusColor)
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "EA PRO MAX v4.2",
+                            text = tier.displayName,
                             style = MaterialTheme.typography.titleMedium.copy(
-                                fontWeight = FontWeight.Bold,
+                                fontWeight = FontWeight.Black,
                                 color = Color.White
                             )
                         )
@@ -4776,7 +6316,7 @@ fun LicenseStatusCard(status: String, expiryDate: String, creditoGuardado: Doubl
                     modifier = Modifier
                         .clip(RoundedCornerShape(50.dp))
                         .background(displayStatusColor.copy(alpha = 0.15f))
-                        .border(1.dp, displayStatusColor.copy(alpha = 0.3f), RoundedCornerShape(50.dp))
+                        .border(1.dp, displayStatusColor.copy(alpha = 0.5f), RoundedCornerShape(50.dp))
                         .padding(horizontal = 12.dp, vertical = 4.dp)
                 ) {
                     Text(
@@ -4810,7 +6350,7 @@ fun LicenseStatusCard(status: String, expiryDate: String, creditoGuardado: Doubl
                     )
                     Spacer(modifier = Modifier.height(2.dp))
                     Text(
-                        text = "ID: 88429105",
+                        text = if (mt5AccountId.isNotBlank()) "ID: $mt5AccountId" else "Não vinculada",
                         style = MaterialTheme.typography.bodyMedium.copy(
                             color = Color(0xFFCFFAFE), // Cyan 100
                             fontWeight = FontWeight.Bold
@@ -4848,12 +6388,645 @@ fun LicenseStatusCard(status: String, expiryDate: String, creditoGuardado: Doubl
                     )
                     Spacer(modifier = Modifier.height(2.dp))
                     Text(
-                        text = expiryDate,
+                        text = if (tier == LicenseTier.MASTER) "VITALÍCIO" else expiryDate.ifBlank { "N/A" },
                         style = MaterialTheme.typography.bodyMedium.copy(
                             color = Color.White,
                             fontWeight = FontWeight.Bold
                         )
                     )
+                }
+            }
+
+            val planConfig = LocalLicensePlanConfig.current
+            Spacer(modifier = Modifier.height(14.dp))
+            HorizontalDivider(color = Color(0xFF334155).copy(alpha = 0.4f))
+            Spacer(modifier = Modifier.height(12.dp))
+
+            Text(
+                text = "RECURSOS & PERMISSÕES DO SEU PLANO",
+                style = MaterialTheme.typography.labelSmall.copy(
+                    color = Color(0xFF94A3B8),
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 1.sp
+                )
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                PlanFeatureBadge(label = "Templates EA", isEnabled = planConfig.templates)
+                PlanFeatureBadge(label = "Captura Gráfica", isEnabled = planConfig.capturaDeTela)
+                PlanFeatureBadge(label = "Gráfico Equity", isEnabled = planConfig.graficoDePatrimonio)
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                PlanFeatureBadge(label = "Alertas de Áudio", isEnabled = planConfig.audio)
+                PlanFeatureBadge(label = "Contas MT5", isEnabled = true, customValue = "${planConfig.vincularConta} conta(s)")
+                PlanFeatureBadge(label = "Sala VIP Sinais", isEnabled = planConfig.sala)
+            }
+        }
+    }
+}
+
+@Composable
+fun PlanFeatureBadge(
+    label: String,
+    isEnabled: Boolean,
+    customValue: String? = null
+) {
+    Surface(
+        color = if (isEnabled) Color(0xFF10B981).copy(alpha = 0.12f) else Color(0xFFEF4444).copy(alpha = 0.12f),
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(0.8.dp, if (isEnabled) Color(0xFF10B981).copy(alpha = 0.35f) else Color(0xFFEF4444).copy(alpha = 0.35f))
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Icon(
+                imageVector = if (isEnabled) Icons.Default.CheckCircle else Icons.Default.Lock,
+                contentDescription = null,
+                tint = if (isEnabled) Color(0xFF34D399) else Color(0xFFF87171),
+                modifier = Modifier.size(11.dp)
+            )
+            Text(
+                text = customValue ?: if (isEnabled) label else "$label 🔒",
+                style = MaterialTheme.typography.labelSmall.copy(
+                    color = if (isEnabled) Color(0xFFE2E8F0) else Color(0xFF94A3B8),
+                    fontSize = 9.5.sp,
+                    fontWeight = FontWeight.Medium
+                )
+            )
+        }
+    }
+}
+
+@Composable
+fun PlanTiersShowcaseCard(
+    currentTier: LicenseTier,
+    loggedUser: com.example.data.GithubUser
+) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val clipboardManager = androidx.compose.ui.platform.LocalClipboardManager.current
+    val globalLicenseConfig = LocalGlobalLicenseConfig.current
+    var showUpgradeDialog by remember { mutableStateOf(false) }
+    var selectedTierForUpgrade by remember { mutableStateOf<LicenseTier?>(null) }
+
+    Card(
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF0F172A).copy(alpha = 0.95f)),
+        shape = RoundedCornerShape(24.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(1.dp, Color(0xFF1E293B), RoundedCornerShape(24.dp))
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text(
+                        text = "PLANOS & UPGRADES DISPONÍVEIS",
+                        style = MaterialTheme.typography.labelMedium.copy(
+                            fontWeight = FontWeight.Black,
+                            color = Color(0xFF38BDF8),
+                            letterSpacing = 1.sp
+                        )
+                    )
+                    Text(
+                        text = "Compare os recursos e desbloqueie o potencial máximo do Robô EA",
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            color = Color(0xFF94A3B8),
+                            fontSize = 11.5.sp
+                        )
+                    )
+                }
+            }
+
+            // Cards for all 4 tiers
+            val allTiers = listOf(LicenseTier.TRIAL, LicenseTier.STARTER, LicenseTier.PRO, LicenseTier.MASTER)
+
+            allTiers.forEach { tier ->
+                val isCurrent = (tier == currentTier)
+                val cardBorderColor = if (isCurrent) tier.accentColor else Color(0xFF334155).copy(alpha = 0.6f)
+                val cardBg = if (isCurrent) Color(0xFF1E293B).copy(alpha = 0.9f) else Color(0xFF131D31)
+                val tierPlanConfig = globalLicenseConfig.getConfigForTier(tier)
+                val dynamicFeatures = tier.buildDynamicFeatures(tierPlanConfig)
+
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(18.dp)),
+                    color = cardBg,
+                    border = BorderStroke(if (isCurrent) 2.dp else 1.dp, cardBorderColor)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(12.dp)
+                                        .background(tier.accentColor, CircleShape)
+                                )
+                                Column {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            text = tier.displayName,
+                                            style = MaterialTheme.typography.titleMedium.copy(
+                                                fontWeight = FontWeight.Black,
+                                                color = Color.White
+                                            )
+                                        )
+                                        if (isCurrent) {
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            Surface(
+                                                color = tier.accentColor.copy(alpha = 0.2f),
+                                                shape = RoundedCornerShape(6.dp),
+                                                border = BorderStroke(1.dp, tier.accentColor)
+                                            ) {
+                                                Text(
+                                                    text = "SEU PLANO ATUAL",
+                                                    style = MaterialTheme.typography.labelSmall.copy(
+                                                        color = tier.accentColor,
+                                                        fontWeight = FontWeight.Black,
+                                                        fontSize = 9.sp
+                                                    ),
+                                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                                )
+                                            }
+                                        }
+                                    }
+                                    Text(
+                                        text = tier.subtitle,
+                                        style = MaterialTheme.typography.bodySmall.copy(
+                                            color = Color(0xFF94A3B8),
+                                            fontSize = 11.sp
+                                        )
+                                    )
+                                }
+                            }
+
+                            Surface(
+                                color = tier.accentColor.copy(alpha = 0.15f),
+                                shape = RoundedCornerShape(20.dp),
+                                border = BorderStroke(1.dp, tier.accentColor.copy(alpha = 0.4f))
+                            ) {
+                                Text(
+                                    text = tier.badgeLabel,
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        color = tier.accentColor,
+                                        fontWeight = FontWeight.Black,
+                                        fontSize = 10.sp
+                                    ),
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                                )
+                            }
+                        }
+
+                        // Pricing & specs row
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(Color(0xFF0F172A).copy(alpha = 0.7f), RoundedCornerShape(12.dp))
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column {
+                                Text(
+                                    text = "PREÇO / VALIDADE",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        color = Color(0xFF64748B),
+                                        fontSize = 9.5.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                )
+                                val priceText = if (tier.priceMt == 0.0) "GRÁTIS" else String.format(Locale.US, "%,.0f MT (~$%,.0f USD)", tier.priceMt, tier.priceUsd)
+                                Text(
+                                    text = "$priceText • ${tier.durationLabel}",
+                                    style = MaterialTheme.typography.bodySmall.copy(
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 11.5.sp
+                                    )
+                                )
+                            }
+
+                            Column(horizontalAlignment = Alignment.End) {
+                                Text(
+                                    text = "LOTE OPERACIONAL",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        color = Color(0xFF64748B),
+                                        fontSize = 9.5.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                )
+                                Text(
+                                    text = "ILIMITADO",
+                                    style = MaterialTheme.typography.bodySmall.copy(
+                                        color = Color(0xFF10B981),
+                                        fontWeight = FontWeight.Black,
+                                        fontSize = 12.sp
+                                    )
+                                )
+                            }
+                        }
+
+                        // Dynamic Features list from JSON
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            dynamicFeatures.forEach { feat ->
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = if (feat.isIncluded) Icons.Default.CheckCircle else if (feat.isTrialLocked) Icons.Default.Lock else Icons.Default.Cancel,
+                                        contentDescription = null,
+                                        tint = if (feat.isIncluded) Color(0xFF10B981) else if (feat.isTrialLocked) Color(0xFFF59E0B) else Color(0xFF64748B),
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                    Text(
+                                        text = feat.title,
+                                        style = MaterialTheme.typography.bodySmall.copy(
+                                            color = if (feat.isIncluded) Color(0xFFE2E8F0) else Color(0xFF94A3B8),
+                                            fontSize = 11.sp
+                                        )
+                                    )
+                                }
+                            }
+                        }
+
+                        // Upgrade CTA
+                        if (!isCurrent) {
+                            Button(
+                                onClick = {
+                                    selectedTierForUpgrade = tier
+                                    showUpgradeDialog = true
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = tier.accentColor),
+                                shape = RoundedCornerShape(10.dp),
+                                modifier = Modifier.fillMaxWidth(),
+                                contentPadding = PaddingValues(vertical = 8.dp)
+                            ) {
+                                Text(
+                                    text = "Adquirir / Fazer Upgrade para ${tier.displayName} 🚀",
+                                    style = MaterialTheme.typography.labelMedium.copy(
+                                        color = if (tier == LicenseTier.STARTER) Color(0xFF0F172A) else Color.White,
+                                        fontWeight = FontWeight.Black,
+                                        fontSize = 12.sp
+                                    )
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (showUpgradeDialog && selectedTierForUpgrade != null) {
+        val targetTier = selectedTierForUpgrade!!
+        val targetPlanConfig = globalLicenseConfig.getConfigForTier(targetTier)
+        val upgradeMessage = "Olá Suporte FiMaster! Gostaria de ativar/fazer upgrade para a licença *${targetTier.displayName}* (${targetTier.badgeLabel}) para a minha conta MT5 *${loggedUser.mt5IdConta.ifBlank { "A Definir" }}* (Cliente: ${loggedUser.nome}). Segue o comprovativo de pagamento."
+
+        Dialog(
+            onDismissRequest = { showUpgradeDialog = false },
+            properties = DialogProperties(usePlatformDefaultWidth = false)
+        ) {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth(0.95f)
+                    .heightIn(max = 740.dp)
+                    .border(1.5.dp, targetTier.accentColor.copy(alpha = 0.8f), RoundedCornerShape(24.dp)),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF0F172A)),
+                shape = RoundedCornerShape(24.dp)
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(20.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    // Header
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .background(targetTier.accentColor.copy(alpha = 0.2f), CircleShape)
+                                    .border(1.dp, targetTier.accentColor, CircleShape),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Diamond,
+                                    contentDescription = null,
+                                    tint = targetTier.accentColor,
+                                    modifier = Modifier.size(22.dp)
+                                )
+                            }
+                            Column {
+                                Text(
+                                    text = "ADQUIRIR ${targetTier.displayName.uppercase()}",
+                                    style = MaterialTheme.typography.titleMedium.copy(
+                                        fontWeight = FontWeight.Black,
+                                        color = Color.White,
+                                        letterSpacing = 0.5.sp
+                                    )
+                                )
+                                Text(
+                                    text = if (targetPlanConfig.priceMt > 0.0) 
+                                        "${String.format(Locale.US, "%,.0f", targetPlanConfig.priceMt)} MT (~$${String.format(Locale.US, "%,.0f", targetPlanConfig.priceUsd)} USD) • ${targetPlanConfig.durationDays} Dias"
+                                    else "Plano Gratuito de Teste • ${targetPlanConfig.durationDays} Dias",
+                                    style = MaterialTheme.typography.bodySmall.copy(
+                                        color = targetTier.accentColor,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 11.5.sp
+                                    )
+                                )
+                            }
+                        }
+
+                        IconButton(onClick = { showUpgradeDialog = false }) {
+                            Icon(imageVector = Icons.Default.Close, contentDescription = "Fechar", tint = Color(0xFF94A3B8))
+                        }
+                    }
+
+                    HorizontalDivider(color = Color(0xFF334155).copy(alpha = 0.5f))
+
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(14.dp)
+                    ) {
+                        // QR Code Visualizer Section
+                        Surface(
+                            color = Color(0xFF1E293B).copy(alpha = 0.7f),
+                            shape = RoundedCornerShape(16.dp),
+                            border = BorderStroke(1.dp, Color(0xFF38BDF8).copy(alpha = 0.4f)),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(16.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.QrCode2,
+                                        contentDescription = "QR Code",
+                                        tint = Color(0xFF38BDF8),
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Text(
+                                        text = "QR CODE DE PAGAMENTO",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            color = Color(0xFF38BDF8),
+                                            fontWeight = FontWeight.Black,
+                                            letterSpacing = 1.sp
+                                        )
+                                    )
+                                }
+
+                                // Visualized QR Code (Base64 converted bytes or procedural canvas)
+                                QrCodeVisualizer(
+                                    base64Image = targetPlanConfig.qrCodeBase64,
+                                    qrCodeLink = targetPlanConfig.qrCodeLink,
+                                    modifier = Modifier.padding(vertical = 4.dp)
+                                )
+
+                                Text(
+                                    text = "Escaneie o QR Code acima com seu aplicativo bancário ou carteira digital.",
+                                    style = MaterialTheme.typography.bodySmall.copy(
+                                        color = Color(0xFFCBD5E1),
+                                        fontSize = 11.sp,
+                                        textAlign = TextAlign.Center
+                                    )
+                                )
+                            }
+                        }
+
+                        // QR Code Link / Key Section
+                        Surface(
+                            color = Color(0xFF1E293B),
+                            shape = RoundedCornerShape(14.dp),
+                            border = BorderStroke(1.dp, Color(0xFF334155)),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(14.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = "CHAVE / LINK DO QR CODE:",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            color = Color(0xFF64748B),
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    )
+
+                                    IconButton(
+                                        onClick = {
+                                            val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+                                            val clip = android.content.ClipData.newPlainText("QR Code Link", targetPlanConfig.qrCodeLink)
+                                            clipboard?.setPrimaryClip(clip)
+                                            android.widget.Toast.makeText(context, "Link do QR Code copiado!", android.widget.Toast.LENGTH_SHORT).show()
+                                        },
+                                        modifier = Modifier.size(24.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.ContentCopy,
+                                            contentDescription = "Copiar Link",
+                                            tint = Color(0xFF38BDF8),
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                    }
+                                }
+
+                                Text(
+                                    text = targetPlanConfig.qrCodeLink.ifBlank { "https://fimaster.vip/checkout" },
+                                    style = MaterialTheme.typography.bodySmall.copy(
+                                        color = Color(0xFF38BDF8),
+                                        fontSize = 11.5.sp,
+                                        fontFamily = FontFamily.Monospace
+                                    ),
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    OutlinedButton(
+                                        onClick = {
+                                            val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+                                            val clip = android.content.ClipData.newPlainText("QR Code Link", targetPlanConfig.qrCodeLink)
+                                            clipboard?.setPrimaryClip(clip)
+                                            android.widget.Toast.makeText(context, "Chave / Link copiado!", android.widget.Toast.LENGTH_SHORT).show()
+                                        },
+                                        shape = RoundedCornerShape(8.dp),
+                                        modifier = Modifier.weight(1f),
+                                        border = BorderStroke(1.dp, Color(0xFF38BDF8)),
+                                        contentPadding = PaddingValues(vertical = 6.dp)
+                                    ) {
+                                        Icon(imageVector = Icons.Default.ContentCopy, contentDescription = null, tint = Color(0xFF38BDF8), modifier = Modifier.size(14.dp))
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text("Copiar Chave", color = Color(0xFF38BDF8), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                    }
+
+                                    if (targetPlanConfig.qrCodeLink.startsWith("http://") || targetPlanConfig.qrCodeLink.startsWith("https://")) {
+                                        Button(
+                                            onClick = {
+                                                try {
+                                                    val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(targetPlanConfig.qrCodeLink)).apply {
+                                                        addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                                                    }
+                                                    context.startActivity(intent)
+                                                } catch (_: Exception) {}
+                                            },
+                                            shape = RoundedCornerShape(8.dp),
+                                            modifier = Modifier.weight(1f),
+                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
+                                            contentPadding = PaddingValues(vertical = 6.dp)
+                                        ) {
+                                            Icon(imageVector = Icons.Default.OpenInBrowser, contentDescription = null, tint = Color.White, modifier = Modifier.size(14.dp))
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Text("Abrir Link", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // WhatsApp Atendimento Direct Button (WhatsApp é para atendimentos)
+                        Surface(
+                            color = Color(0xFF064E3B).copy(alpha = 0.35f),
+                            shape = RoundedCornerShape(14.dp),
+                            border = BorderStroke(1.dp, Color(0xFF10B981).copy(alpha = 0.6f)),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(14.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Icon(imageVector = Icons.Default.Chat, contentDescription = null, tint = Color(0xFF10B981), modifier = Modifier.size(16.dp))
+                                    Text(
+                                        text = "ATENDIMENTO WHATSAPP (SUPORTE & COMPROVATIVO)",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            color = Color(0xFF10B981),
+                                            fontWeight = FontWeight.Black,
+                                            fontSize = 9.5.sp
+                                        )
+                                    )
+                                }
+
+                                Text(
+                                    text = "Envie o comprovativo e confirme a ativação imediata pelo WhatsApp oficial:",
+                                    style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFFE2E8F0), fontSize = 11.sp)
+                                )
+
+                                Button(
+                                    onClick = {
+                                        openWhatsAppLink(context, targetPlanConfig.whatsappLink, upgradeMessage)
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981)),
+                                    shape = RoundedCornerShape(10.dp),
+                                    modifier = Modifier.fillMaxWidth(),
+                                    contentPadding = PaddingValues(vertical = 10.dp)
+                                ) {
+                                    Icon(imageVector = Icons.Default.Send, contentDescription = null, tint = Color.White, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Enviar no WhatsApp 📲", color = Color.White, fontWeight = FontWeight.Black, fontSize = 12.sp)
+                                }
+                            }
+                        }
+
+                        // Telegram Channel Direct Button
+                        Surface(
+                            color = Color(0xFF0C4A6E).copy(alpha = 0.35f),
+                            shape = RoundedCornerShape(14.dp),
+                            border = BorderStroke(1.dp, Color(0xFF229ED9).copy(alpha = 0.6f)),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(14.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "CANAL DO TELEGRAM",
+                                        style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF38BDF8), fontWeight = FontWeight.Bold)
+                                    )
+                                    Text(
+                                        text = "Acompanhe atualizações e novidades",
+                                        style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8), fontSize = 11.sp)
+                                    )
+                                }
+
+                                Button(
+                                    onClick = {
+                                        openTelegramLink(context, targetPlanConfig.telegramLink)
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF229ED9)),
+                                    shape = RoundedCornerShape(8.dp),
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                                ) {
+                                    Text("Telegram 🚀", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                    }
+
+                    // Bottom Dismiss Button
+                    OutlinedButton(
+                        onClick = { showUpgradeDialog = false },
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                        border = BorderStroke(1.dp, Color(0xFF475569))
+                    ) {
+                        Text("Fechar", color = Color(0xFF94A3B8), fontWeight = FontWeight.Medium)
+                    }
                 }
             }
         }
@@ -5840,11 +8013,8 @@ fun RefundRequestDialog(
                             .padding(horizontal = 8.dp)
                     ) {
                         Text(
-                            text = "Enviar Solicitação",
-                            style = MaterialTheme.typography.labelLarge.copy(
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.onPrimary
-                            )
+                            text = "Confirmar",
+                            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold)
                         )
                     }
                 }
@@ -5867,63 +8037,91 @@ fun SupportTicketDialog(
     onDismiss: () -> Unit,
     onSubmit: (categoria: String, assunto: String, mensagem: String, contato: String) -> Unit
 ) {
-    var activeSupportTab by remember { mutableIntStateOf(0) } // 0: FAQ, 1: Abrir Ticket
+    var activeSupportTab by remember { mutableIntStateOf(0) } // 0: FAQ, 1: Canais Oficiais, 2: Abrir Ticket, 3: Diagnóstico
     var searchQuery by remember { mutableStateOf("") }
+    var selectedFaqCategory by remember { mutableStateOf("Todas") }
     var expandedFaqIndex by remember { mutableIntStateOf(-1) }
+    val clipboardManager = LocalClipboardManager.current
+    val context = androidx.compose.ui.platform.LocalContext.current
+
+    val faqCategories = listOf("Todas", "MT5 & Conexão", "Risco & Lote", "Licença", "Alertas & Voz", "Smart Sync")
 
     val faqList = remember {
         listOf(
             FaqItem(
                 id = 1,
                 question = "Como vincular minha conta do MT5 ao Portal?",
-                answer = "Acesse a aba 'Conta EA' no menu inferior do aplicativo, digite o número exato da sua conta de negociação no MT5 (ex: 8841209) e clique em 'Salvar Número MT5'. Quando o robô estiver em execução no MetaTrader 5 com esse mesmo ID, o Portal exibirá o status ONLINE em tempo real.",
-                category = "MT5",
+                answer = "Acesse a aba 'Conta EA' no menu inferior do aplicativo, digite o número exato da sua conta de negociação no MT5 (ex: 8841209) e clique em 'Salvar Número MT5'. Quando o robô estiver em execução no MetaTrader 5 com esse mesmo ID, o Portal exibirá o status ONLINE em tempo real com luz verde pulsante.",
+                category = "MT5 & Conexão",
                 icon = Icons.Default.AccountBalance
             ),
             FaqItem(
                 id = 2,
                 question = "Por que os Templates Oficiais do Admin vêm com Lote 0.00?",
-                answer = "Por medida de segurança e gestão de risco! A exposição recomendada é de 0.5% por operação em relação ao saldo total da sua conta. O Admin publica os parâmetros com lote 0.00 para que você defina o lote apropriado na aba 'Config EA' de acordo com a margem da sua banca antes de sincronizar.",
-                category = "Risco",
+                answer = "Por estrita medida de segurança e gestão de risco! A regra de ouro da mesa proprietária é uma exposição máxima de 0.5% por operação em relação ao saldo total da sua conta. O Admin publica os parâmetros com lote 0.00 para que você defina o lote apropriado na aba 'Config EA' de acordo com o tamanho exato da sua banca antes de sincronizar.",
+                category = "Risco & Lote",
                 icon = Icons.Default.Shield
             ),
             FaqItem(
                 id = 3,
                 question = "Como carregar e aplicar um Template do Admin?",
-                answer = "Na aba 'Config EA', abra a seção 'Templates & Presets do Admin'. Escolha o preset desejado (ex: Gold Conservador, Surfada D1), verifique as tags de paridade (XAUUSD, EURUSD) e pontos do canal, clique em 'Carregar' ou 'Aplicar'. Os campos do formulário serão preenchidos. Ajuste o lote para 0.5% de exposição e clique em 'Salvar e Sincronizar'.",
-                category = "Templates",
+                answer = "Na aba 'Config EA', abra a seção 'Templates & Presets do Admin'. Escolha o preset desejado (ex: Gold Conservador, Surfada D1, Scalper Asiático), confira o par (XAUUSD, EURUSD) e pontos do canal, clique em 'Carregar' ou 'Aplicar'. Os campos do formulário serão preenchidos. Ajuste o lote para 0.5% de exposição e clique em 'Salvar e Sincronizar'.",
+                category = "Risco & Lote",
                 icon = Icons.Default.CloudDownload
             ),
             FaqItem(
                 id = 4,
                 question = "O que fazer se o Robô no MT5 aparecer como OFFLINE?",
-                answer = "1. Certifique-se de que o botão 'AlgoTrading' ou 'AutoTrading' está ativo no topo do MT5.\n2. Verifique se o número da conta MT5 cadastrado na aba 'Conta EA' é idêntico à conta logada no MetaTrader.\n3. Confirme se as URLs do servidor estão autorizadas em Ferramentas > Opções > Expert Advisors no MT5.",
-                category = "MT5",
+                answer = "1. Certifique-se de que o botão 'AlgoTrading' ou 'AutoTrading' está ativo (ícone verde) no topo do MetaTrader 5.\n2. Verifique se o número da conta MT5 cadastrado na aba 'Conta EA' é exatamente o mesmo da conta logada no MetaTrader.\n3. Confirme se as URLs do servidor Firebase estão autorizadas em Ferramentas > Opções > Expert Advisors no MT5.\n4. Verifique se o indicador ou EA está anexado ao gráfico com o 'Permitir WebRequest' marcado.",
+                category = "MT5 & Conexão",
                 icon = Icons.Default.Warning
             ),
             FaqItem(
                 id = 5,
                 question = "Como verificar o status e validade da minha Licença?",
-                answer = "Acesse a aba 'Licença' no menu inferior. Lá você poderá visualizar se sua licença está ativa ('LICENÇA ATIVA'), conferir a data de expiração e o identificador do dispositivo (UID). Se precisar renovar, entre em contato com o suporte.",
+                answer = "Acesse a aba 'Licença' no menu inferior. Lá você poderá visualizar se sua licença está ativa ('LICENÇA ATIVA' em verde esmeralda), conferir a data de expiração exata, os dias restantes e o identificador seguro do dispositivo (UID). Quando faltar 7 dias ou menos para o término, o app exibirá alertas no painel superior.",
                 category = "Licença",
                 icon = Icons.Default.Verified
             ),
             FaqItem(
                 id = 6,
                 question = "Como funcionam os Alertas em Áudio (TTS) no Portal?",
-                answer = "Na aba 'Eventos EA', o Portal Fimaster transmite notificações de ordens e canais do robô em tempo real. Cada evento possui um botão com ícone de áudio para voz sintetizada em português.",
-                category = "Eventos",
-                icon = Icons.Default.Notifications
+                answer = "Na aba 'Eventos EA', o Portal Fimaster processa notificações de ordens e canais do robô em tempo real. Cada evento possui um botão com ícone de alto-falante para reproduzir a voz sintetizada em português (BR/PT). Você também pode ativar a reprodução contínua no topo para ouvir cada nova operação sem olhar a tela.",
+                category = "Alertas & Voz",
+                icon = Icons.Default.VolumeUp
+            ),
+            FaqItem(
+                id = 7,
+                question = "Como funciona o Smart Sync e a limpeza de eventos?",
+                answer = "O Smart Sync armazena todos os eventos no banco de dados SQLite local (Room) do seu celular. No primeiro login ele baixa o histórico completo; nos acessos seguintes, só transfere novidades, economizando seus dados móveis. Ao clicar em 'Limpar', o app esvazia o visor local mas guarda o cursor de data/hora, garantindo que eventos antigos apagados não voltem a poluir a tela no próximo sync, a menos que você clique em 'Forçar Completa'.",
+                category = "Smart Sync",
+                icon = Icons.Default.Sync
+            ),
+            FaqItem(
+                id = 8,
+                question = "Qual é o benefício de não ficar na frente da tela do gráfico?",
+                answer = "O maior inimigo do trader é o cansaço psicológico e a ansiedade de tela. Ficar horas acompanhando cada oscilação gera impulsos prejudiciais como fechar ordens antes da hora ou aumentar lotes para recuperar perdas (revenge trading). Com o robô EA e o Portal Fimaster, a estratégia roda no VPS com precisão matemática, e você mantém a clareza mental acompanhando métricas e ouvindo notificações de qualquer lugar.",
+                category = "Risco & Lote",
+                icon = Icons.Default.Psychology
+            ),
+            FaqItem(
+                id = 9,
+                question = "Como solicitar captura de tela (Screenshot) do gráfico?",
+                answer = "No painel da aba 'Conta EA', localize o botão 'Capturar Gráfico'. O comando é despachado em tempo real para o EA no MT5, que tira um print em alta resolução da tela do ativo e envia de volta para o aplicativo para você conferir a montagem gráfica instantaneamente.",
+                category = "MT5 & Conexão",
+                icon = Icons.Default.Screenshot
             )
         )
     }
 
-    val filteredFaq = remember(searchQuery, faqList) {
-        if (searchQuery.isBlank()) faqList
-        else faqList.filter {
-            it.question.contains(searchQuery, ignoreCase = true) ||
-            it.answer.contains(searchQuery, ignoreCase = true) ||
-            it.category.contains(searchQuery, ignoreCase = true)
+    val filteredFaq = remember(searchQuery, selectedFaqCategory, faqList) {
+        faqList.filter { item ->
+            val matchCategory = selectedFaqCategory == "Todas" || item.category == selectedFaqCategory
+            val matchQuery = searchQuery.isBlank() ||
+                    item.question.contains(searchQuery, ignoreCase = true) ||
+                    item.answer.contains(searchQuery, ignoreCase = true) ||
+                    item.category.contains(searchQuery, ignoreCase = true)
+            matchCategory && matchQuery
         }
     }
 
@@ -5931,9 +8129,12 @@ fun SupportTicketDialog(
         "Problema no MT5",
         "Licença & Expiração",
         "Configuração do EA",
+        "Gestão de Risco & Lote",
         "Outros Assuntos"
     )
+    val urgencias = listOf("Normal", "Alta", "Urgente")
     var selectedCategory by remember { mutableStateOf(categorias[0]) }
+    var selectedUrgencia by remember { mutableStateOf(urgencias[0]) }
     var assuntoText by remember { mutableStateOf("") }
     var mensagemText by remember { mutableStateOf("") }
     var contatoText by remember { mutableStateOf(userProfile?.numero ?: "") }
@@ -5945,7 +8146,7 @@ fun SupportTicketDialog(
     ) {
         Card(
             modifier = Modifier
-                .fillMaxWidth(0.94f)
+                .fillMaxWidth(0.95f)
                 .padding(vertical = 16.dp)
                 .border(
                     1.dp,
@@ -5957,7 +8158,7 @@ fun SupportTicketDialog(
         ) {
             Column(
                 modifier = Modifier
-                    .padding(18.dp)
+                    .padding(16.dp)
                     .fillMaxWidth()
             ) {
                 // Header
@@ -5974,7 +8175,12 @@ fun SupportTicketDialog(
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
-                            imageVector = if (activeSupportTab == 0) Icons.Default.Help else Icons.Default.SupportAgent,
+                            imageVector = when (activeSupportTab) {
+                                0 -> Icons.Default.Help
+                                1 -> Icons.Default.Forum
+                                2 -> Icons.Default.SupportAgent
+                                else -> Icons.Default.Build
+                            },
                             contentDescription = "Suporte",
                             tint = Color(0xFF38BDF8),
                             modifier = Modifier.size(22.dp)
@@ -5983,12 +8189,22 @@ fun SupportTicketDialog(
                     Spacer(modifier = Modifier.width(12.dp))
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = if (activeSupportTab == 0) "Perguntas Frequentes (FAQ)" else "Suporte Técnico & Ajuda",
+                            text = when (activeSupportTab) {
+                                0 -> "Central de Dúvidas (FAQ)"
+                                1 -> "Canais Oficiais Fimaster"
+                                2 -> "Abrir Chamado / Ticket"
+                                else -> "Diagnóstico & Conexão"
+                            },
                             style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
                             color = Color.White
                         )
                         Text(
-                            text = if (activeSupportTab == 0) "Respostas rápidas para as dúvidas mais comuns" else "Envie um ticket diretamente para a equipe técnica",
+                            text = when (activeSupportTab) {
+                                0 -> "Respostas completas para operar com máxima confiança"
+                                1 -> "Atendimento VIP direto com a equipe de especialistas"
+                                2 -> "Envie sua dúvida técnica com resposta garantida"
+                                else -> "Status da infraestrutura e parâmetros do dispositivo"
+                            },
                             style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8), fontSize = 11.sp)
                         )
                     }
@@ -6004,395 +8220,761 @@ fun SupportTicketDialog(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(14.dp))
+                Spacer(modifier = Modifier.height(12.dp))
 
-                // Top Tab Selector (FAQ vs Abrir Ticket)
+                // Top Tab Selector (4 Abas: FAQ, Canais, Ticket, Diagnóstico)
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .background(Color(0xFF1E293B), RoundedCornerShape(12.dp))
-                        .padding(4.dp),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        .padding(3.dp),
+                    horizontalArrangement = Arrangement.spacedBy(2.dp)
                 ) {
-                    Surface(
-                        modifier = Modifier
-                            .weight(1f)
-                            .clickable { activeSupportTab = 0 },
-                        shape = RoundedCornerShape(10.dp),
-                        color = if (activeSupportTab == 0) Color(0xFF0EA5E9) else Color.Transparent
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(vertical = 8.dp),
-                            horizontalArrangement = Arrangement.Center,
-                            verticalAlignment = Alignment.CenterVertically
+                    val tabs = listOf(
+                        Triple(0, "FAQ", Icons.Default.QuestionAnswer),
+                        Triple(1, "Canais", Icons.Default.Forum),
+                        Triple(2, "Ticket", Icons.Default.Send),
+                        Triple(3, "Info", Icons.Default.Info)
+                    )
+                    tabs.forEach { (index, label, icon) ->
+                        val isSelected = activeSupportTab == index
+                        Surface(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable { activeSupportTab = index },
+                            shape = RoundedCornerShape(9.dp),
+                            color = if (isSelected) Color(0xFF0EA5E9) else Color.Transparent
                         ) {
-                            Icon(
-                                imageVector = Icons.Default.QuestionAnswer,
-                                contentDescription = null,
-                                tint = if (activeSupportTab == 0) Color.White else Color(0xFF94A3B8),
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = "FAQ / Dúvidas",
-                                style = MaterialTheme.typography.labelSmall.copy(
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 11.5.sp
-                                ),
-                                color = if (activeSupportTab == 0) Color.White else Color(0xFF94A3B8)
-                            )
-                        }
-                    }
-
-                    Surface(
-                        modifier = Modifier
-                            .weight(1f)
-                            .clickable { activeSupportTab = 1 },
-                        shape = RoundedCornerShape(10.dp),
-                        color = if (activeSupportTab == 1) Color(0xFF0EA5E9) else Color.Transparent
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(vertical = 8.dp),
-                            horizontalArrangement = Arrangement.Center,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Send,
-                                contentDescription = null,
-                                tint = if (activeSupportTab == 1) Color.White else Color(0xFF94A3B8),
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = "Abrir Ticket",
-                                style = MaterialTheme.typography.labelSmall.copy(
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 11.5.sp
-                                ),
-                                color = if (activeSupportTab == 1) Color.White else Color(0xFF94A3B8)
-                            )
+                            Row(
+                                modifier = Modifier.padding(vertical = 7.dp, horizontal = 2.dp),
+                                horizontalArrangement = Arrangement.Center,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = icon,
+                                    contentDescription = null,
+                                    tint = if (isSelected) Color.White else Color(0xFF94A3B8),
+                                    modifier = Modifier.size(13.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = label,
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                        fontSize = 11.sp
+                                    ),
+                                    color = if (isSelected) Color.White else Color(0xFF94A3B8)
+                                )
+                            }
                         }
                     }
                 }
 
-                Spacer(modifier = Modifier.height(14.dp))
+                Spacer(modifier = Modifier.height(12.dp))
 
-                if (activeSupportTab == 0) {
-                    // TAB FAQ (Perguntas Frequentes)
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(max = 420.dp)
-                            .verticalScroll(rememberScrollState())
-                    ) {
-                        // Search bar
-                        OutlinedTextField(
-                            value = searchQuery,
-                            onValueChange = { searchQuery = it },
-                            placeholder = { Text("Pesquisar dúvida ex: lote, MT5, licença...", fontSize = 12.sp) },
-                            leadingIcon = {
-                                Icon(
-                                    imageVector = Icons.Default.Search,
-                                    contentDescription = null,
-                                    tint = Color(0xFF0EA5E9),
-                                    modifier = Modifier.size(18.dp)
-                                )
-                            },
-                            trailingIcon = {
-                                if (searchQuery.isNotBlank()) {
-                                    IconButton(onClick = { searchQuery = "" }) {
-                                        Icon(
-                                            imageVector = Icons.Default.Close,
-                                            contentDescription = "Limpar",
-                                            tint = Color(0xFF64748B),
-                                            modifier = Modifier.size(16.dp)
+                when (activeSupportTab) {
+                    0 -> {
+                        // TAB 0: FAQ (Perguntas Frequentes)
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 440.dp)
+                                .verticalScroll(rememberScrollState())
+                        ) {
+                            // Search bar
+                            OutlinedTextField(
+                                value = searchQuery,
+                                onValueChange = { searchQuery = it },
+                                placeholder = { Text("Pesquisar dúvida (ex: lote, VPS, áudio, MT5)...", fontSize = 11.5.sp) },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = Icons.Default.Search,
+                                        contentDescription = null,
+                                        tint = Color(0xFF0EA5E9),
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                },
+                                trailingIcon = {
+                                    if (searchQuery.isNotBlank()) {
+                                        IconButton(onClick = { searchQuery = "" }) {
+                                            Icon(
+                                                imageVector = Icons.Default.Close,
+                                                contentDescription = "Limpar",
+                                                tint = Color(0xFF64748B),
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                        }
+                                    }
+                                },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = Color(0xFF0EA5E9),
+                                    unfocusedBorderColor = Color(0xFF334155),
+                                    focusedTextColor = Color.White,
+                                    unfocusedTextColor = Color.White
+                                ),
+                                shape = RoundedCornerShape(10.dp)
+                            )
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            // Category Chips
+                            LazyRow(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                items(faqCategories) { cat ->
+                                    val isSelected = cat == selectedFaqCategory
+                                    Surface(
+                                        onClick = { selectedFaqCategory = cat },
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = if (isSelected) Color(0xFF0284C7) else Color(0xFF1E293B),
+                                        border = BorderStroke(1.dp, if (isSelected) Color(0xFF38BDF8) else Color(0xFF334155))
+                                    ) {
+                                        Text(
+                                            text = cat,
+                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                color = if (isSelected) Color.White else Color(0xFF94A3B8),
+                                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                                fontSize = 10.5.sp
+                                            ),
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
                                         )
                                     }
                                 }
-                            },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth(),
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedBorderColor = Color(0xFF0EA5E9),
-                                unfocusedBorderColor = Color(0xFF334155),
-                                focusedTextColor = Color.White,
-                                unfocusedTextColor = Color.White
-                            ),
-                            shape = RoundedCornerShape(10.dp)
-                        )
-
-                        Spacer(modifier = Modifier.height(12.dp))
-
-                        if (filteredFaq.isEmpty()) {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(24.dp),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text(
-                                    text = "Nenhuma dúvida encontrada para '${searchQuery}'",
-                                    style = MaterialTheme.typography.bodyMedium.copy(color = Color(0xFF94A3B8))
-                                )
                             }
-                        } else {
-                            filteredFaq.forEachIndexed { index, item ->
-                                val isExpanded = expandedFaqIndex == index
-                                Card(
+
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            if (filteredFaq.isEmpty()) {
+                                Box(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .padding(vertical = 4.dp)
-                                        .clickable {
-                                            expandedFaqIndex = if (isExpanded) -1 else index
-                                        },
-                                    colors = CardDefaults.cardColors(
-                                        containerColor = if (isExpanded) Color(0xFF1E293B) else Color(0xFF0F172A)
-                                    ),
-                                    shape = RoundedCornerShape(12.dp),
-                                    border = BorderStroke(
-                                        1.dp,
-                                        if (isExpanded) Color(0xFF0EA5E9) else Color(0xFF334155)
-                                    )
+                                        .padding(24.dp),
+                                    contentAlignment = Alignment.Center
                                 ) {
-                                    Column(modifier = Modifier.padding(12.dp)) {
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            Box(
-                                                modifier = Modifier
-                                                    .size(30.dp)
-                                                    .clip(CircleShape)
-                                                    .background(Color(0xFF0EA5E9).copy(alpha = 0.15f)),
-                                                contentAlignment = Alignment.Center
+                                    Text(
+                                        text = "Nenhuma dúvida encontrada para '${searchQuery}'",
+                                        style = MaterialTheme.typography.bodyMedium.copy(color = Color(0xFF94A3B8))
+                                    )
+                                }
+                            } else {
+                                filteredFaq.forEachIndexed { index, item ->
+                                    val isExpanded = expandedFaqIndex == index
+                                    Card(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(vertical = 3.dp)
+                                            .clickable {
+                                                expandedFaqIndex = if (isExpanded) -1 else index
+                                            },
+                                        colors = CardDefaults.cardColors(
+                                            containerColor = if (isExpanded) Color(0xFF1E293B) else Color(0xFF0F172A)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        border = BorderStroke(
+                                            1.dp,
+                                            if (isExpanded) Color(0xFF0EA5E9) else Color(0xFF334155)
+                                        )
+                                    ) {
+                                        Column(modifier = Modifier.padding(12.dp)) {
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                verticalAlignment = Alignment.CenterVertically
                                             ) {
+                                                Box(
+                                                    modifier = Modifier
+                                                        .size(28.dp)
+                                                        .clip(CircleShape)
+                                                        .background(Color(0xFF0EA5E9).copy(alpha = 0.15f)),
+                                                    contentAlignment = Alignment.Center
+                                                ) {
+                                                    Icon(
+                                                        imageVector = item.icon,
+                                                        contentDescription = null,
+                                                        tint = Color(0xFF38BDF8),
+                                                        modifier = Modifier.size(15.dp)
+                                                    )
+                                                }
+                                                Spacer(modifier = Modifier.width(10.dp))
+                                                Text(
+                                                    text = item.question,
+                                                    style = MaterialTheme.typography.bodySmall.copy(
+                                                        fontWeight = FontWeight.Bold,
+                                                        color = Color.White,
+                                                        fontSize = 12.sp
+                                                    ),
+                                                    modifier = Modifier.weight(1f)
+                                                )
                                                 Icon(
-                                                    imageVector = item.icon,
+                                                    imageVector = if (isExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
                                                     contentDescription = null,
                                                     tint = Color(0xFF38BDF8),
-                                                    modifier = Modifier.size(16.dp)
+                                                    modifier = Modifier.size(18.dp)
                                                 )
                                             }
-                                            Spacer(modifier = Modifier.width(10.dp))
-                                            Text(
-                                                text = item.question,
-                                                style = MaterialTheme.typography.bodySmall.copy(
-                                                    fontWeight = FontWeight.Bold,
-                                                    color = Color.White,
-                                                    fontSize = 12.sp
-                                                ),
-                                                modifier = Modifier.weight(1f)
-                                            )
-                                            Icon(
-                                                imageVector = if (isExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
-                                                contentDescription = null,
-                                                tint = Color(0xFF38BDF8),
-                                                modifier = Modifier.size(20.dp)
-                                            )
-                                        }
 
-                                        if (isExpanded) {
-                                            Spacer(modifier = Modifier.height(8.dp))
-                                            HorizontalDivider(color = Color(0xFF334155))
-                                            Spacer(modifier = Modifier.height(8.dp))
-                                            Text(
-                                                text = item.answer,
-                                                style = MaterialTheme.typography.bodySmall.copy(
-                                                    color = Color(0xFFCBD5E1),
-                                                    fontSize = 11.5.sp,
-                                                    lineHeight = 16.sp
+                                            if (isExpanded) {
+                                                Spacer(modifier = Modifier.height(8.dp))
+                                                HorizontalDivider(color = Color(0xFF334155))
+                                                Spacer(modifier = Modifier.height(8.dp))
+                                                Text(
+                                                    text = item.answer,
+                                                    style = MaterialTheme.typography.bodySmall.copy(
+                                                        color = Color(0xFFCBD5E1),
+                                                        fontSize = 11.5.sp,
+                                                        lineHeight = 17.sp
+                                                    )
                                                 )
-                                            )
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
 
-                        Spacer(modifier = Modifier.height(14.dp))
+                            Spacer(modifier = Modifier.height(12.dp))
 
-                        // Call to action button to open ticket
-                        Surface(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { activeSupportTab = 1 },
-                            color = Color(0xFF0EA5E9).copy(alpha = 0.12f),
-                            shape = RoundedCornerShape(12.dp),
-                            border = BorderStroke(1.dp, Color(0xFF0EA5E9).copy(alpha = 0.4f))
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(12.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.Center
+                            // Call to action button to open ticket
+                            Surface(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { activeSupportTab = 2 },
+                                color = Color(0xFF0EA5E9).copy(alpha = 0.12f),
+                                shape = RoundedCornerShape(12.dp),
+                                border = BorderStroke(1.dp, Color(0xFF0EA5E9).copy(alpha = 0.4f))
                             ) {
-                                Icon(
-                                    imageVector = Icons.Default.HeadsetMic,
-                                    contentDescription = null,
-                                    tint = Color(0xFF38BDF8),
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = "Sua dúvida não foi resolvida? Clique aqui para abrir um Ticket",
-                                    style = MaterialTheme.typography.labelSmall.copy(
-                                        color = Color(0xFF38BDF8),
-                                        fontWeight = FontWeight.Bold,
-                                        fontSize = 11.sp
+                                Row(
+                                    modifier = Modifier.padding(10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.Center
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.HeadsetMic,
+                                        contentDescription = null,
+                                        tint = Color(0xFF38BDF8),
+                                        modifier = Modifier.size(16.dp)
                                     )
-                                )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "Não encontrou sua dúvida? Abra um Ticket com 1 clique",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            color = Color(0xFF38BDF8),
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 11.sp
+                                        )
+                                    )
+                                }
                             }
                         }
                     }
-                } else {
-                    // TAB TICKET FORM
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(max = 420.dp)
-                            .verticalScroll(rememberScrollState())
-                    ) {
-                        // Categoria selector
-                        Text(
-                            text = "Tipo de Solicitação",
-                            style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF94A3B8), fontWeight = FontWeight.Bold)
-                        )
-                        Spacer(modifier = Modifier.height(6.dp))
-                        LazyRow(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+
+                    1 -> {
+                        // TAB 1: CANAIS OFICIAIS DE CONTATO
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 440.dp)
+                                .verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
-                            items(categorias) { cat ->
-                                val isSelected = cat == selectedCategory
-                                Surface(
-                                    modifier = Modifier.clickable { selectedCategory = cat },
-                                    shape = RoundedCornerShape(10.dp),
-                                    color = if (isSelected) Color(0xFF0EA5E9) else Color(0xFF1E293B),
-                                    border = BorderStroke(
-                                        1.dp,
-                                        if (isSelected) Color(0xFF38BDF8) else Color(0xFF334155)
-                                    )
+                            Text(
+                                text = "Atendimento Direto & Comunidade",
+                                style = MaterialTheme.typography.labelMedium.copy(
+                                    color = Color(0xFF38BDF8),
+                                    fontWeight = FontWeight.Bold
+                                )
+                            )
+
+                            // WhatsApp Suporte VIP
+                            Card(
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFF064E3B).copy(alpha = 0.35f)),
+                                shape = RoundedCornerShape(12.dp),
+                                border = BorderStroke(1.dp, Color(0xFF10B981).copy(alpha = 0.4f)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(12.dp),
+                                    verticalAlignment = Alignment.CenterVertically
                                 ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(38.dp)
+                                            .clip(CircleShape)
+                                            .background(Color(0xFF10B981).copy(alpha = 0.2f)),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Chat,
+                                            contentDescription = null,
+                                            tint = Color(0xFF34D399),
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.width(10.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "WhatsApp Suporte VIP",
+                                            style = MaterialTheme.typography.bodyMedium.copy(
+                                                fontWeight = FontWeight.Bold,
+                                                color = Color.White
+                                            )
+                                        )
+                                        Text(
+                                            text = "Atendimento prioritário com engenheiro de suporte",
+                                            style = MaterialTheme.typography.bodySmall.copy(
+                                                color = Color(0xFFA7F3D0),
+                                                fontSize = 11.sp
+                                            )
+                                        )
+                                    }
+                                    IconButton(
+                                        onClick = {
+                                            clipboardManager.setText(AnnotatedString("+5511999999999"))
+                                            android.widget.Toast.makeText(context, "Contato de Suporte copiado!", android.widget.Toast.LENGTH_SHORT).show()
+                                        }
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.ContentCopy,
+                                            contentDescription = "Copiar contato",
+                                            tint = Color(0xFF34D399),
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                }
+                            }
+
+                            // Telegram Comunidade Oficial
+                            Card(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        openTelegramLink(context, "https://t.me/FiMasterVipOficial")
+                                    },
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFF0369A1).copy(alpha = 0.25f)),
+                                shape = RoundedCornerShape(12.dp),
+                                border = BorderStroke(1.dp, Color(0xFF0284C7).copy(alpha = 0.4f))
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(12.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(38.dp)
+                                            .clip(CircleShape)
+                                            .background(Color(0xFF0284C7).copy(alpha = 0.2f)),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Send,
+                                            contentDescription = null,
+                                            tint = Color(0xFF38BDF8),
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.width(10.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "Comunidade VIP Telegram",
+                                            style = MaterialTheme.typography.bodyMedium.copy(
+                                                fontWeight = FontWeight.Bold,
+                                                color = Color.White
+                                            )
+                                        )
+                                        Text(
+                                            text = "Avisos de mercado, presets e networking entre traders",
+                                            style = MaterialTheme.typography.bodySmall.copy(
+                                                color = Color(0xFFBAE6FD),
+                                                fontSize = 11.sp
+                                            )
+                                        )
+                                    }
+                                }
+                            }
+
+                            // E-mail Técnico
+                            Card(
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
+                                shape = RoundedCornerShape(12.dp),
+                                border = BorderStroke(1.dp, Color(0xFF475569)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(12.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(38.dp)
+                                            .clip(CircleShape)
+                                            .background(Color(0xFF64748B).copy(alpha = 0.2f)),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Email,
+                                            contentDescription = null,
+                                            tint = Color(0xFFCBD5E1),
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.width(10.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "E-mail de Suporte Técnico",
+                                            style = MaterialTheme.typography.bodyMedium.copy(
+                                                fontWeight = FontWeight.Bold,
+                                                color = Color.White
+                                            )
+                                        )
+                                        Text(
+                                            text = "suporte@fimaster.com • Resposta em até 2 horas úteis",
+                                            style = MaterialTheme.typography.bodySmall.copy(
+                                                color = Color(0xFF94A3B8),
+                                                fontSize = 11.sp
+                                            )
+                                        )
+                                    }
+                                }
+                            }
+
+                            // Horário de Atendimento
+                            Surface(
+                                color = Color(0xFF1E293B).copy(alpha = 0.6f),
+                                shape = RoundedCornerShape(10.dp),
+                                border = BorderStroke(1.dp, Color(0xFF334155)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(10.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.AccessTime,
+                                        contentDescription = null,
+                                        tint = Color(0xFFF59E0B),
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
                                     Text(
-                                        text = cat,
-                                        style = MaterialTheme.typography.labelSmall.copy(
-                                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
-                                            fontSize = 11.sp
-                                        ),
-                                        color = if (isSelected) Color.White else Color(0xFFCBD5E1),
-                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                        text = "Plantão Operacional: Segunda a Sexta, das 07:00 às 22:00 (Horário de Brasília/Maputo)",
+                                        style = MaterialTheme.typography.bodySmall.copy(
+                                            color = Color(0xFFFDE68A),
+                                            fontSize = 10.5.sp
+                                        )
                                     )
                                 }
                             }
                         }
+                    }
 
-                        Spacer(modifier = Modifier.height(14.dp))
-
-                        // Assunto
-                        OutlinedTextField(
-                            value = assuntoText,
-                            onValueChange = {
-                                assuntoText = it
-                                errorMessage = null
-                            },
-                            label = { Text("Assunto / Título da Dúvida") },
-                            placeholder = { Text("Ex: Erro de conexão com o MT5") },
-                            modifier = Modifier.fillMaxWidth(),
-                            singleLine = true,
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedBorderColor = Color(0xFF0EA5E9),
-                                unfocusedBorderColor = Color(0xFF334155),
-                                focusedLabelColor = Color(0xFF38BDF8),
-                                unfocusedLabelColor = Color(0xFF64748B),
-                                focusedTextColor = Color.White,
-                                unfocusedTextColor = Color.White
-                            ),
-                            shape = RoundedCornerShape(10.dp)
-                        )
-
-                        Spacer(modifier = Modifier.height(10.dp))
-
-                        // Mensagem / Descrição
-                        OutlinedTextField(
-                            value = mensagemText,
-                            onValueChange = {
-                                mensagemText = it
-                                errorMessage = null
-                            },
-                            label = { Text("Descrição Detalhada") },
-                            placeholder = { Text("Descreva o problema ou dúvida técnica...") },
-                            modifier = Modifier.fillMaxWidth(),
-                            minLines = 3,
-                            maxLines = 5,
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedBorderColor = Color(0xFF0EA5E9),
-                                unfocusedBorderColor = Color(0xFF334155),
-                                focusedLabelColor = Color(0xFF38BDF8),
-                                unfocusedLabelColor = Color(0xFF64748B),
-                                focusedTextColor = Color.White,
-                                unfocusedTextColor = Color.White
-                            ),
-                            shape = RoundedCornerShape(10.dp)
-                        )
-
-                        Spacer(modifier = Modifier.height(10.dp))
-
-                        // Contato (WhatsApp/E-mail)
-                        OutlinedTextField(
-                            value = contatoText,
-                            onValueChange = { contatoText = it },
-                            label = { Text("Contato para Resposta (WhatsApp / E-mail)") },
-                            modifier = Modifier.fillMaxWidth(),
-                            singleLine = true,
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedBorderColor = Color(0xFF0EA5E9),
-                                unfocusedBorderColor = Color(0xFF334155),
-                                focusedLabelColor = Color(0xFF38BDF8),
-                                unfocusedLabelColor = Color(0xFF64748B),
-                                focusedTextColor = Color.White,
-                                unfocusedTextColor = Color.White
-                            ),
-                            shape = RoundedCornerShape(10.dp)
-                        )
-
-                        if (errorMessage != null) {
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(
-                                text = errorMessage!!,
-                                color = Color(0xFFEF4444),
-                                style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp)
-                            )
-                        }
-
-                        Spacer(modifier = Modifier.height(18.dp))
-
-                        // Buttons
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.End,
-                            verticalAlignment = Alignment.CenterVertically
+                    2 -> {
+                        // TAB 2: ABRIR TICKET
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 440.dp)
+                                .verticalScroll(rememberScrollState())
                         ) {
-                            TextButton(onClick = onDismiss) {
-                                Text("Cancelar", color = Color(0xFF94A3B8))
-                            }
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Button(
-                                onClick = {
-                                    if (assuntoText.isBlank() || mensagemText.isBlank()) {
-                                        errorMessage = "Por favor, preencha o assunto e a descrição."
-                                    } else {
-                                        onSubmit(selectedCategory, assuntoText.trim(), mensagemText.trim(), contatoText.trim())
-                                    }
-                                },
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0EA5E9)),
-                                shape = RoundedCornerShape(10.dp)
+                            Text(
+                                text = "Tipo de Solicitação",
+                                style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF94A3B8), fontWeight = FontWeight.Bold)
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            LazyRow(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
-                                Icon(
-                                    imageVector = Icons.Default.Send,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(16.dp),
-                                    tint = Color.White
+                                items(categorias) { cat ->
+                                    val isSelected = cat == selectedCategory
+                                    Surface(
+                                        modifier = Modifier.clickable { selectedCategory = cat },
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = if (isSelected) Color(0xFF0EA5E9) else Color(0xFF1E293B),
+                                        border = BorderStroke(
+                                            1.dp,
+                                            if (isSelected) Color(0xFF38BDF8) else Color(0xFF334155)
+                                        )
+                                    ) {
+                                        Text(
+                                            text = cat,
+                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                                fontSize = 11.sp
+                                            ),
+                                            color = if (isSelected) Color.White else Color(0xFFCBD5E1),
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
+                                        )
+                                    }
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            Text(
+                                text = "Nível de Urgência",
+                                style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF94A3B8), fontWeight = FontWeight.Bold)
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                urgencias.forEach { urg ->
+                                    val isSelected = urg == selectedUrgencia
+                                    val tagColor = when (urg) {
+                                        "Urgente" -> Color(0xFFEF4444)
+                                        "Alta" -> Color(0xFFF59E0B)
+                                        else -> Color(0xFF10B981)
+                                    }
+                                    Surface(
+                                        onClick = { selectedUrgencia = urg },
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = if (isSelected) tagColor.copy(alpha = 0.25f) else Color(0xFF1E293B),
+                                        border = BorderStroke(1.dp, if (isSelected) tagColor else Color(0xFF334155))
+                                    ) {
+                                        Text(
+                                            text = urg,
+                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                color = if (isSelected) tagColor else Color(0xFF94A3B8),
+                                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                                fontSize = 11.sp
+                                            ),
+                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                                        )
+                                    }
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            // Assunto
+                            OutlinedTextField(
+                                value = assuntoText,
+                                onValueChange = {
+                                    assuntoText = it
+                                    errorMessage = null
+                                },
+                                label = { Text("Assunto / Título do Chamado") },
+                                placeholder = { Text("Ex: Dúvida sobre Trava Diária e Sessões") },
+                                modifier = Modifier.fillMaxWidth(),
+                                singleLine = true,
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = Color(0xFF0EA5E9),
+                                    unfocusedBorderColor = Color(0xFF334155),
+                                    focusedLabelColor = Color(0xFF38BDF8),
+                                    unfocusedLabelColor = Color(0xFF64748B),
+                                    focusedTextColor = Color.White,
+                                    unfocusedTextColor = Color.White
+                                ),
+                                shape = RoundedCornerShape(10.dp)
+                            )
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            // Mensagem / Descrição
+                            OutlinedTextField(
+                                value = mensagemText,
+                                onValueChange = {
+                                    mensagemText = it
+                                    errorMessage = null
+                                },
+                                label = { Text("Descrição Detalhada do Problema") },
+                                placeholder = { Text("Descreva com detalhes o que está acontecendo...") },
+                                modifier = Modifier.fillMaxWidth(),
+                                minLines = 3,
+                                maxLines = 5,
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = Color(0xFF0EA5E9),
+                                    unfocusedBorderColor = Color(0xFF334155),
+                                    focusedLabelColor = Color(0xFF38BDF8),
+                                    unfocusedLabelColor = Color(0xFF64748B),
+                                    focusedTextColor = Color.White,
+                                    unfocusedTextColor = Color.White
+                                ),
+                                shape = RoundedCornerShape(10.dp)
+                            )
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            // Contato (WhatsApp/E-mail)
+                            OutlinedTextField(
+                                value = contatoText,
+                                onValueChange = { contatoText = it },
+                                label = { Text("Contato para Retorno (WhatsApp / E-mail)") },
+                                modifier = Modifier.fillMaxWidth(),
+                                singleLine = true,
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = Color(0xFF0EA5E9),
+                                    unfocusedBorderColor = Color(0xFF334155),
+                                    focusedLabelColor = Color(0xFF38BDF8),
+                                    unfocusedLabelColor = Color(0xFF64748B),
+                                    focusedTextColor = Color.White,
+                                    unfocusedTextColor = Color.White
+                                ),
+                                shape = RoundedCornerShape(10.dp)
+                            )
+
+                            if (errorMessage != null) {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Text(
+                                    text = errorMessage!!,
+                                    color = Color(0xFFEF4444),
+                                    style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp)
                                 )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text("Enviar Ticket", fontWeight = FontWeight.Bold, color = Color.White)
+                            }
+
+                            Spacer(modifier = Modifier.height(14.dp))
+
+                            // Buttons
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.End,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                TextButton(onClick = onDismiss) {
+                                    Text("Cancelar", color = Color(0xFF94A3B8))
+                                }
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Button(
+                                    onClick = {
+                                        if (assuntoText.isBlank() || mensagemText.isBlank()) {
+                                            errorMessage = "Por favor, preencha o assunto e a descrição."
+                                        } else {
+                                            val fullSubject = "[$selectedUrgencia] $assuntoText"
+                                            onSubmit(selectedCategory, fullSubject, mensagemText.trim(), contatoText.trim())
+                                        }
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0EA5E9)),
+                                    shape = RoundedCornerShape(10.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Send,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(15.dp),
+                                        tint = Color.White
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Enviar Ticket", fontWeight = FontWeight.Bold, color = Color.White)
+                                }
+                            }
+                        }
+                    }
+
+                    else -> {
+                        // TAB 3: DIAGNÓSTICO & INFORMAÇÕES DO SISTEMA
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 440.dp)
+                                .verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                text = "Diagnóstico do Aplicativo & Conexões",
+                                style = MaterialTheme.typography.labelMedium.copy(
+                                    color = Color(0xFF38BDF8),
+                                    fontWeight = FontWeight.Bold
+                                )
+                            )
+
+                            // Card de Conta MT5 & Licença
+                            Card(
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
+                                shape = RoundedCornerShape(10.dp),
+                                border = BorderStroke(1.dp, Color(0xFF334155)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Text("Conta MT5 Vinculada:", style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8)))
+                                        Text(
+                                            text = userProfile?.mt5IdConta?.ifBlank { "859423" } ?: "859423",
+                                            style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF38BDF8), fontWeight = FontWeight.Bold)
+                                        )
+                                    }
+                                    HorizontalDivider(color = Color(0xFF334155).copy(alpha = 0.5f))
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Text("Status da Licença:", style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8)))
+                                        Text(
+                                            text = if (userProfile?.licencaAtiva == true) "LICENÇA ATIVA" else "AGUARDANDO ATIVAÇÃO",
+                                            style = MaterialTheme.typography.bodySmall.copy(
+                                                color = if (userProfile?.licencaAtiva == true) Color(0xFF34D399) else Color(0xFFF59E0B),
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        )
+                                    }
+                                    HorizontalDivider(color = Color(0xFF334155).copy(alpha = 0.5f))
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Text("Banco Local (SQLite Room):", style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8)))
+                                        Text("ONLINE / Sincronizado", style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF34D399), fontWeight = FontWeight.Bold))
+                                    }
+                                    HorizontalDivider(color = Color(0xFF334155).copy(alpha = 0.5f))
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Text("Síntese de Voz (TTS):", style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8)))
+                                        Text("Português (BR/PT) Ativo", style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF38BDF8), fontWeight = FontWeight.Bold))
+                                    }
+                                    HorizontalDivider(color = Color(0xFF334155).copy(alpha = 0.5f))
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Text("Versão do Portal:", style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8)))
+                                        Text("v4.5.0 Pro Cloud", style = MaterialTheme.typography.bodySmall.copy(color = Color.White, fontWeight = FontWeight.Bold))
+                                    }
+                                }
+                            }
+
+                            // Dispositivo UID
+                            val deviceUid = userProfile?.auditoriaUltimoDispositivo.orEmpty().ifBlank {
+                                com.example.data.security.DeviceIdentityManager(context).getSilentDeviceUid()
+                            }
+                            Surface(
+                                color = Color(0xFF0F172A),
+                                shape = RoundedCornerShape(10.dp),
+                                border = BorderStroke(1.dp, Color(0xFF0284C7).copy(alpha = 0.3f)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "ID Seguro do Dispositivo (UID)",
+                                            style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF94A3B8))
+                                        )
+                                        Text(
+                                            text = deviceUid.take(24) + "...",
+                                            style = MaterialTheme.typography.bodySmall.copy(
+                                                fontFamily = FontFamily.Monospace,
+                                                color = Color(0xFF38BDF8),
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        )
+                                    }
+                                    IconButton(
+                                        onClick = {
+                                            clipboardManager.setText(AnnotatedString(deviceUid))
+                                            android.widget.Toast.makeText(context, "UID copiado para a área de transferência!", android.widget.Toast.LENGTH_SHORT).show()
+                                        }
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.ContentCopy,
+                                            contentDescription = "Copiar UID",
+                                            tint = Color(0xFF38BDF8),
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
@@ -6745,7 +9327,46 @@ fun EaConfigScreen(viewModel: PortalViewModel) {
                 isExpanded = expTemplates,
                 onToggle = { expTemplates = !expTemplates }
             ) {
+                val userPlanConfig = LocalLicensePlanConfig.current
                 Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    if (!userPlanConfig.templates) {
+                        Surface(
+                            color = Color(0xFFEF4444).copy(alpha = 0.15f),
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(1.dp, Color(0xFFEF4444).copy(alpha = 0.5f)),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Lock,
+                                    contentDescription = "Templates Bloqueados",
+                                    tint = Color(0xFFEF4444),
+                                    modifier = Modifier.size(20.dp)
+                                )
+                                Column {
+                                    Text(
+                                        text = "🔒 RECURSO BLOQUEADO PELO SEU PLANO",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            fontWeight = FontWeight.Black,
+                                            color = Color(0xFFEF4444)
+                                        )
+                                    )
+                                    Text(
+                                        text = "O carregamento de templates e presets está restrito (templates: false). Faça upgrade para Starter, Pro ou Master VIP para liberar presets pré-configurados.",
+                                        style = MaterialTheme.typography.bodySmall.copy(
+                                            color = Color(0xFFE2E8F0),
+                                            fontSize = 11.sp
+                                        )
+                                    )
+                                }
+                            }
+                        }
+                    }
+
                     // 1. ADMIN PUBLISHED TEMPLATES SECTION
                     if (showAdminInstructionsDialog) {
                         InstrucoesAdminTemplatesDialog(onDismiss = { showAdminInstructionsDialog = false })
@@ -7016,34 +9637,38 @@ fun EaConfigScreen(viewModel: PortalViewModel) {
                                             val isThisActive = activeTemplateId == tpl.id
                                             val isLoaded = isThisActive && activeTemplateAction == "LOADED"
                                             val isApplied = isThisActive && activeTemplateAction == "APPLIED"
+                                            val canUseTemplate = isValid && userPlanConfig.templates
 
                                             OutlinedButton(
                                                 onClick = {
-                                                    if (!isValid) return@OutlinedButton
+                                                    if (!canUseTemplate) {
+                                                        templateMessage = "Recurso bloqueado: seu plano não permite carregar templates."
+                                                        return@OutlinedButton
+                                                    }
                                                     localConfig = tpl.config
                                                     activeTemplateId = tpl.id
                                                     activeTemplateAction = "LOADED"
                                                     templateMessage = "Template '${tpl.titulo}' carregado nos campos para revisão!"
                                                 },
-                                                enabled = isValid,
+                                                enabled = canUseTemplate,
                                                 shape = RoundedCornerShape(8.dp),
-                                                border = BorderStroke(1.dp, if (!isValid) Color(0xFF475569) else if (isLoaded) Color(0xFF10B981) else Color(0xFF38BDF8)),
+                                                border = BorderStroke(1.dp, if (!canUseTemplate) Color(0xFF475569) else if (isLoaded) Color(0xFF10B981) else Color(0xFF38BDF8)),
                                                 colors = ButtonDefaults.outlinedButtonColors(
                                                     disabledContentColor = Color(0xFF64748B)
                                                 ),
                                                 contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
                                             ) {
                                                 Icon(
-                                                    imageVector = if (isLoaded) Icons.Default.CheckCircle else Icons.Default.Download,
+                                                    imageVector = if (!userPlanConfig.templates) Icons.Default.Lock else if (isLoaded) Icons.Default.CheckCircle else Icons.Default.Download,
                                                     contentDescription = null,
-                                                    tint = if (!isValid) Color(0xFF64748B) else if (isLoaded) Color(0xFF10B981) else Color(0xFF38BDF8),
+                                                    tint = if (!canUseTemplate) Color(0xFF64748B) else if (isLoaded) Color(0xFF10B981) else Color(0xFF38BDF8),
                                                     modifier = Modifier.size(14.dp)
                                                 )
                                                 Spacer(modifier = Modifier.width(4.dp))
                                                 Text(
-                                                    text = if (isLoaded) "✓ Carregado" else "Carregar",
+                                                    text = if (!userPlanConfig.templates) "Bloqueado" else if (isLoaded) "✓ Carregado" else "Carregar",
                                                     style = MaterialTheme.typography.labelSmall.copy(
-                                                        color = if (!isValid) Color(0xFF64748B) else if (isLoaded) Color(0xFF10B981) else Color(0xFF38BDF8),
+                                                        color = if (!canUseTemplate) Color(0xFF64748B) else if (isLoaded) Color(0xFF10B981) else Color(0xFF38BDF8),
                                                         fontWeight = if (isLoaded) FontWeight.Bold else FontWeight.Normal
                                                     )
                                                 )
@@ -7053,13 +9678,16 @@ fun EaConfigScreen(viewModel: PortalViewModel) {
 
                                             Button(
                                                 onClick = {
-                                                    if (!isValid) return@Button
+                                                    if (!canUseTemplate) {
+                                                        templateMessage = "Recurso bloqueado: seu plano não permite aplicar templates."
+                                                        return@Button
+                                                    }
                                                     localConfig = tpl.config
                                                     activeTemplateId = tpl.id
                                                     activeTemplateAction = "APPLIED"
                                                     templateMessage = "Template '${tpl.titulo}' aplicado nos campos! Clique em 'Salvar e Sincronizar' para enviar ao banco."
                                                 },
-                                                enabled = isValid,
+                                                enabled = canUseTemplate,
                                                 colors = ButtonDefaults.buttonColors(
                                                     containerColor = if (isApplied) Color(0xFF10B981) else Color(0xFF0284C7),
                                                     disabledContainerColor = Color(0xFF334155),
@@ -7069,16 +9697,16 @@ fun EaConfigScreen(viewModel: PortalViewModel) {
                                                 contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
                                             ) {
                                                 Icon(
-                                                    imageVector = Icons.Default.CheckCircle,
+                                                    imageVector = if (!userPlanConfig.templates) Icons.Default.Lock else Icons.Default.CheckCircle,
                                                     contentDescription = null,
-                                                    tint = if (isValid) Color.White else Color(0xFF64748B),
+                                                    tint = if (canUseTemplate) Color.White else Color(0xFF64748B),
                                                     modifier = Modifier.size(14.dp)
                                                 )
                                                 Spacer(modifier = Modifier.width(4.dp))
                                                 Text(
-                                                    text = if (isApplied) "✓ Aplicado" else "Aplicar",
+                                                    text = if (!userPlanConfig.templates) "Bloqueado" else if (isApplied) "✓ Aplicado" else "Aplicar",
                                                     style = MaterialTheme.typography.labelSmall.copy(
-                                                        color = if (isValid) Color.White else Color(0xFF64748B),
+                                                        color = if (canUseTemplate) Color.White else Color(0xFF64748B),
                                                         fontWeight = FontWeight.Bold
                                                     )
                                                 )
@@ -7163,18 +9791,25 @@ fun EaConfigScreen(viewModel: PortalViewModel) {
                                         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                             Button(
                                                 onClick = {
+                                                    if (!userPlanConfig.templates) {
+                                                        templateMessage = "Recurso bloqueado: seu plano não permite carregar templates."
+                                                        return@Button
+                                                    }
                                                     localConfig = customCfg
                                                     activeTemplateId = customId
                                                     activeTemplateAction = "LOADED"
                                                     templateMessage = "Template '$name' aplicado!"
                                                 },
+                                                enabled = userPlanConfig.templates,
                                                 colors = ButtonDefaults.buttonColors(
-                                                    containerColor = if (isCustomLoaded) Color(0xFF10B981) else Color(0xFF0284C7)
+                                                    containerColor = if (isCustomLoaded) Color(0xFF10B981) else Color(0xFF0284C7),
+                                                    disabledContainerColor = Color(0xFF334155),
+                                                    disabledContentColor = Color(0xFF64748B)
                                                 ),
                                                 shape = RoundedCornerShape(8.dp)
                                             ) {
                                                 Text(
-                                                    text = if (isCustomLoaded) "✓ Aplicado" else "📥 Usar",
+                                                    text = if (!userPlanConfig.templates) "🔒 Bloqueado" else if (isCustomLoaded) "✓ Aplicado" else "📥 Usar",
                                                     style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
                                                 )
                                             }
@@ -8513,7 +11148,99 @@ fun LoginScreen(
                 )
             )
 
-            Spacer(modifier = Modifier.height(32.dp))
+            Spacer(modifier = Modifier.height(20.dp))
+
+            val currentContext = LocalContext.current
+            val deviceUid = remember {
+                com.example.data.security.DeviceIdentityManager(currentContext).getSilentDeviceUid()
+            }
+
+            Surface(
+                color = Color(0xFF0369A1).copy(alpha = 0.25f),
+                shape = RoundedCornerShape(16.dp),
+                border = BorderStroke(1.dp, Color(0xFF0EA5E9).copy(alpha = 0.6f)),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Fingerprint,
+                                contentDescription = "Device Auth",
+                                tint = Color(0xFF38BDF8),
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Text(
+                                text = "AUTENTICAÇÃO POR DISPOSITIVO",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontWeight = FontWeight.Black,
+                                    color = Color(0xFF38BDF8),
+                                    letterSpacing = 1.sp
+                                )
+                            )
+                        }
+                        Surface(
+                            color = Color(0xFF10B981).copy(alpha = 0.2f),
+                            shape = RoundedCornerShape(6.dp),
+                            border = BorderStroke(1.dp, Color(0xFF10B981).copy(alpha = 0.5f))
+                        ) {
+                            Text(
+                                text = "SEGURO",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = Color(0xFF10B981),
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 9.sp
+                                ),
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+
+                    Text(
+                        text = "UID: " + deviceUid.take(24) + "...",
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            color = Color(0xFF94A3B8),
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.sp
+                        )
+                    )
+
+                    Button(
+                        onClick = { viewModel.autoAuthenticateAndRegisterDevice() },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = !loginLoading
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Bolt,
+                            contentDescription = null,
+                            tint = Color.White,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "Entrar com este Dispositivo ⚡",
+                            style = MaterialTheme.typography.labelMedium.copy(
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White
+                            )
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
 
             Card(
                 colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B).copy(alpha = 0.6f)),
@@ -8528,7 +11255,7 @@ fun LoginScreen(
                     verticalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
                     Text(
-                        text = "Acesse sua Conta",
+                        text = "Ou Acesse com Telefone / MT5",
                         style = MaterialTheme.typography.titleMedium.copy(
                             fontWeight = FontWeight.Bold,
                             color = Color.White
@@ -9970,6 +12697,8 @@ fun EaOnboardingTourDialog(
     onDismiss: () -> Unit,
     onNavigateTab: (PortalTab) -> Unit
 ) {
+    var activeGuideSection by remember { mutableIntStateOf(0) } // 0: Sobre o App, 1: Tour Passo a Passo, 2: Estratégias & Regras, 3: Checklist Diário
+
     val steps = remember {
         listOf(
             EaTourStep(
@@ -10063,6 +12792,13 @@ fun EaOnboardingTourDialog(
     var currentStepIndex by remember { mutableIntStateOf(0) }
     val currentStep = steps[currentStepIndex]
 
+    // Checklist state
+    var checkVps by remember { mutableStateOf(true) }
+    var checkMt5 by remember { mutableStateOf(true) }
+    var checkLicenca by remember { mutableStateOf(true) }
+    var checkLoteRisco by remember { mutableStateOf(false) }
+    var checkVozTts by remember { mutableStateOf(false) }
+
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false)
@@ -10071,8 +12807,8 @@ fun EaOnboardingTourDialog(
             colors = CardDefaults.cardColors(containerColor = Color(0xFF0F172A)),
             shape = RoundedCornerShape(20.dp),
             modifier = Modifier
-                .fillMaxWidth(0.92f)
-                .padding(vertical = 24.dp)
+                .fillMaxWidth(0.95f)
+                .padding(vertical = 20.dp)
                 .border(
                     width = 1.dp,
                     brush = Brush.verticalGradient(
@@ -10084,7 +12820,7 @@ fun EaOnboardingTourDialog(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(20.dp)
+                    .padding(16.dp)
             ) {
                 // Top header bar
                 Row(
@@ -10092,28 +12828,54 @@ fun EaOnboardingTourDialog(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Column {
-                        Text(
-                            text = "TOUR GUIADO EA MT5",
-                            style = MaterialTheme.typography.labelMedium.copy(
-                                fontWeight = FontWeight.Black,
-                                color = Color(0xFF22D3EE),
-                                letterSpacing = 1.5.sp
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier
+                                .size(36.dp)
+                                .clip(CircleShape)
+                                .background(Color(0xFF22D3EE).copy(alpha = 0.15f))
+                                .border(1.dp, Color(0xFF22D3EE).copy(alpha = 0.4f), CircleShape),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = when (activeGuideSection) {
+                                    0 -> Icons.Default.AutoAwesome
+                                    1 -> Icons.Default.Explore
+                                    2 -> Icons.Default.TrendingUp
+                                    else -> Icons.Default.Checklist
+                                },
+                                contentDescription = null,
+                                tint = Color(0xFF22D3EE),
+                                modifier = Modifier.size(20.dp)
                             )
-                        )
-                        Text(
-                            text = "Passo ${currentStep.stepIndex} de ${steps.size}",
-                            style = MaterialTheme.typography.bodySmall.copy(
-                                color = Color(0xFF94A3B8),
-                                fontWeight = FontWeight.SemiBold
+                        }
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column {
+                            Text(
+                                text = "GUIA & SOBRE O APP",
+                                style = MaterialTheme.typography.labelMedium.copy(
+                                    fontWeight = FontWeight.Black,
+                                    color = Color(0xFF22D3EE),
+                                    letterSpacing = 1.2.sp
+                                )
                             )
-                        )
+                            Text(
+                                text = "Portal Fimaster • Automação Inteligente MT5",
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    color = Color(0xFF94A3B8),
+                                    fontSize = 11.sp
+                                )
+                            )
+                        }
                     }
 
-                    IconButton(onClick = onDismiss) {
+                    IconButton(
+                        onClick = onDismiss,
+                        modifier = Modifier.size(32.dp)
+                    ) {
                         Icon(
                             imageVector = Icons.Default.Close,
-                            contentDescription = "Fechar Tour",
+                            contentDescription = "Fechar Guia",
                             tint = Color(0xFF94A3B8)
                         )
                     }
@@ -10121,229 +12883,798 @@ fun EaOnboardingTourDialog(
 
                 Spacer(modifier = Modifier.height(12.dp))
 
-                // Linear Progress bar
-                LinearProgressIndicator(
-                    progress = { (currentStepIndex + 1).toFloat() / steps.size.toFloat() },
+                // Navigation Tabs (Sobre, Tour, Estratégias, Checklist)
+                Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(6.dp)
-                        .clip(RoundedCornerShape(3.dp)),
-                    color = Color(0xFF22D3EE),
-                    trackColor = Color(0xFF1E293B)
-                )
-
-                Spacer(modifier = Modifier.height(16.dp))
-
-                // Scrollable Content for Current Step
-                Column(
-                    modifier = Modifier
-                        .weight(1f, fill = false)
-                        .verticalScroll(rememberScrollState())
+                        .background(Color(0xFF1E293B), RoundedCornerShape(12.dp))
+                        .padding(3.dp),
+                    horizontalArrangement = Arrangement.spacedBy(2.dp)
                 ) {
-                    // Step Card Title Banner
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(Color(0xFF1E293B), RoundedCornerShape(12.dp))
-                            .padding(14.dp)
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(44.dp)
-                                .clip(CircleShape)
-                                .background(Color(0xFF0284C7).copy(alpha = 0.25f)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                imageVector = currentStep.icon,
-                                contentDescription = null,
-                                tint = Color(0xFF38BDF8),
-                                modifier = Modifier.size(24.dp)
-                            )
-                        }
-                        Spacer(modifier = Modifier.width(12.dp))
-                        Column {
-                            Text(
-                                text = currentStep.title,
-                                style = MaterialTheme.typography.titleMedium.copy(
-                                    fontWeight = FontWeight.Bold,
-                                    color = Color.White
-                                )
-                            )
-                            Text(
-                                text = currentStep.subtitle,
-                                style = MaterialTheme.typography.bodySmall.copy(
-                                    color = Color(0xFF38BDF8),
-                                    fontWeight = FontWeight.Medium
-                                )
-                            )
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(14.dp))
-
-                    Text(
-                        text = currentStep.description,
-                        style = MaterialTheme.typography.bodyMedium.copy(
-                            color = Color(0xFFE2E8F0),
-                            lineHeight = 20.sp
-                        )
+                    val guideTabs = listOf(
+                        Triple(0, "Sobre", Icons.Default.Star),
+                        Triple(1, "Tour", Icons.Default.Explore),
+                        Triple(2, "Estratégias", Icons.Default.Insights),
+                        Triple(3, "Checklist", Icons.Default.Checklist)
                     )
-
-                    Spacer(modifier = Modifier.height(14.dp))
-
-                    Text(
-                        text = "Destaques & Parâmetros:",
-                        style = MaterialTheme.typography.labelLarge.copy(
-                            fontWeight = FontWeight.Bold,
-                            color = Color(0xFF22D3EE)
-                        )
-                    )
-                    Spacer(modifier = Modifier.height(6.dp))
-
-                    currentStep.highlights.forEach { (label, desc) ->
-                        Row(
+                    guideTabs.forEach { (index, label, icon) ->
+                        val isSelected = activeGuideSection == index
+                        Surface(
                             modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 4.dp),
-                            verticalAlignment = Alignment.Top
+                                .weight(1f)
+                                .clickable { activeGuideSection = index },
+                            shape = RoundedCornerShape(9.dp),
+                            color = if (isSelected) Color(0xFF0284C7) else Color.Transparent
                         ) {
-                            Icon(
-                                imageVector = Icons.Default.CheckCircle,
-                                contentDescription = null,
-                                tint = Color(0xFF10B981),
-                                modifier = Modifier
-                                    .size(16.dp)
-                                    .padding(top = 2.dp)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Column {
+                            Row(
+                                modifier = Modifier.padding(vertical = 7.dp, horizontal = 2.dp),
+                                horizontalArrangement = Arrangement.Center,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = icon,
+                                    contentDescription = null,
+                                    tint = if (isSelected) Color.White else Color(0xFF94A3B8),
+                                    modifier = Modifier.size(13.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
                                 Text(
                                     text = label,
-                                    style = MaterialTheme.typography.bodySmall.copy(
-                                        fontWeight = FontWeight.Bold,
-                                        color = Color.White
-                                    )
-                                )
-                                Text(
-                                    text = desc,
-                                    style = MaterialTheme.typography.bodySmall.copy(
-                                        color = Color(0xFF94A3B8)
-                                    )
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                        fontSize = 11.sp
+                                    ),
+                                    color = if (isSelected) Color.White else Color(0xFF94A3B8)
                                 )
                             }
                         }
                     }
-
-                    Spacer(modifier = Modifier.height(14.dp))
-
-                    // Tip Card
-                    Card(
-                        colors = CardDefaults.cardColors(containerColor = Color(0xFF0284C7).copy(alpha = 0.15f)),
-                        shape = RoundedCornerShape(10.dp),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .border(1.dp, Color(0xFF0284C7).copy(alpha = 0.4f), RoundedCornerShape(10.dp))
-                    ) {
-                        Text(
-                            text = currentStep.tip,
-                            style = MaterialTheme.typography.bodySmall.copy(
-                                color = Color(0xFF38BDF8),
-                                fontWeight = FontWeight.Medium
-                            ),
-                            modifier = Modifier.padding(12.dp)
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(16.dp))
-
-                    // Deep-link Action Button to navigate directly to the step's tab
-                    OutlinedButton(
-                        onClick = {
-                            onNavigateTab(currentStep.targetTab)
-                        },
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF22D3EE)),
-                        border = BorderStroke(1.dp, Color(0xFF22D3EE)),
-                        shape = RoundedCornerShape(10.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Icon(
-                            imageVector = currentStep.targetTab.icon,
-                            contentDescription = null,
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "Ir para a tela: ${currentStep.targetTab.label}",
-                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
-                        )
-                    }
                 }
 
-                Spacer(modifier = Modifier.height(20.dp))
+                Spacer(modifier = Modifier.height(12.dp))
 
-                // Navigation Controls (Anterior / Próximo / Concluir)
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    if (currentStepIndex > 0) {
-                        TextButton(
-                            onClick = { currentStepIndex-- },
-                            colors = ButtonDefaults.textButtonColors(contentColor = Color(0xFF94A3B8))
+                when (activeGuideSection) {
+                    0 -> {
+                        // ABA 0: SOBRE O APLICATIVO & BENEFÍCIOS REVOLUCIONÁRIOS
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 450.dp)
+                                .verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
-                            Icon(
-                                imageVector = Icons.Default.ArrowBack,
-                                contentDescription = "Anterior",
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Anterior")
-                        }
-                    } else {
-                        TextButton(
-                            onClick = onDismiss,
-                            colors = ButtonDefaults.textButtonColors(contentColor = Color(0xFF64748B))
-                        ) {
-                            Text("Pular Tour")
+                            // Hero Card de Apresentação
+                            Card(
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFF0C4A6E).copy(alpha = 0.35f)),
+                                shape = RoundedCornerShape(14.dp),
+                                border = BorderStroke(1.dp, Color(0xFF0284C7).copy(alpha = 0.5f)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(modifier = Modifier.padding(14.dp)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Icon(
+                                            imageVector = Icons.Default.WorkspacePremium,
+                                            contentDescription = null,
+                                            tint = Color(0xFFFACC15),
+                                            modifier = Modifier.size(24.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(
+                                            text = "Portal Fimaster: Liberdade & Lucro Automatizado",
+                                            style = MaterialTheme.typography.titleSmall.copy(
+                                                fontWeight = FontWeight.Bold,
+                                                color = Color.White
+                                            )
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    Text(
+                                        text = "O Portal Fimaster é a central de comando definitiva criada para traders que buscam consistência profissional sem abrir mão da sua qualidade de vida.",
+                                        style = MaterialTheme.typography.bodySmall.copy(
+                                            color = Color(0xFFBAE6FD),
+                                            lineHeight = 17.sp
+                                        )
+                                    )
+                                }
+                            }
+
+                            // SEÇÃO DE DESTAQUE: BENEFÍCIO DE NÃO FICAR PRESO NA FRENTE DO GRÁFICO
+                            Card(
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
+                                shape = RoundedCornerShape(14.dp),
+                                border = BorderStroke(1.dp, Color(0xFF10B981).copy(alpha = 0.4f)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(32.dp)
+                                                .clip(CircleShape)
+                                                .background(Color(0xFF10B981).copy(alpha = 0.2f)),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Sensors,
+                                                contentDescription = null,
+                                                tint = Color(0xFF34D399),
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                        }
+                                        Spacer(modifier = Modifier.width(10.dp))
+                                        Column {
+                                            Text(
+                                                text = "A Grande Revolução: Liberdade de Tela",
+                                                style = MaterialTheme.typography.bodyMedium.copy(
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = Color(0xFF34D399)
+                                                )
+                                            )
+                                            Text(
+                                                text = "Por que nunca mais ser refém dos gráficos?",
+                                                style = MaterialTheme.typography.bodySmall.copy(
+                                                    color = Color(0xFFA7F3D0),
+                                                    fontSize = 11.sp
+                                                )
+                                            )
+                                        }
+                                    }
+
+                                    Text(
+                                        text = "Ficar 6 a 10 horas por dia encarando velas e candles oscilando é o principal motivo de fracasso no trading. O desgaste psicológico gera ansiedade, medo de perder (FOMO) e leva a entradas precipitadas por impulso (revenge trading).",
+                                        style = MaterialTheme.typography.bodySmall.copy(
+                                            color = Color(0xFFE2E8F0),
+                                            lineHeight = 17.sp
+                                        )
+                                    )
+
+                                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        val benefits = listOf(
+                                            "⏱️ Liberdade de Tempo" to "Trabalhe na sua profissão, passe tempo com a família, treine e durma tranquilo enquanto o EA executa no VPS 24h/dia.",
+                                            "🧠 Psicologia 100% Blindada" to "O robô não hesita, não tem medo de entrar e não tem ganância de sair fora da regra. A matemática prevalece.",
+                                            "🔊 Monitoramento por Áudio (TTS)" to "Você ouve as ordens e metas sendo batidas em português claro pelo celular, sem precisar tirar os olhos do trânsito ou do seu trabalho.",
+                                            "🛡️ Trava de Segurança Automática" to "Ao bater a meta de ganho ou limite de perda, o sistema desativa as operações automaticamente, protegendo seu lucro."
+                                        )
+                                        benefits.forEach { (title, desc) ->
+                                            Row(
+                                                verticalAlignment = Alignment.Top,
+                                                modifier = Modifier.fillMaxWidth()
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.CheckCircle,
+                                                    contentDescription = null,
+                                                    tint = Color(0xFF34D399),
+                                                    modifier = Modifier
+                                                        .size(15.dp)
+                                                        .padding(top = 2.dp)
+                                                )
+                                                Spacer(modifier = Modifier.width(8.dp))
+                                                Column {
+                                                    Text(
+                                                        text = title,
+                                                        style = MaterialTheme.typography.bodySmall.copy(
+                                                            fontWeight = FontWeight.Bold,
+                                                            color = Color.White,
+                                                            fontSize = 11.5.sp
+                                                        )
+                                                    )
+                                                    Text(
+                                                        text = desc,
+                                                        style = MaterialTheme.typography.bodySmall.copy(
+                                                            color = Color(0xFF94A3B8),
+                                                            fontSize = 11.sp,
+                                                            lineHeight = 15.sp
+                                                        )
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // FUNCIONALIDADES EXCLUSIVAS DO ECOSSISTEMA FIMASTER
+                            Card(
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
+                                shape = RoundedCornerShape(14.dp),
+                                border = BorderStroke(1.dp, Color(0xFF38BDF8).copy(alpha = 0.3f)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Text(
+                                        text = "Arsenal Tecnológico do Aplicativo:",
+                                        style = MaterialTheme.typography.labelLarge.copy(
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color(0xFF38BDF8)
+                                        )
+                                    )
+
+                                    val features = listOf(
+                                        Triple("⚡ Smart Sync & Room SQLite", "Sincronização inteligente incremental que economiza 95% dos seus dados móveis e carrega seu histórico mesmo offline.", Icons.Default.Sync),
+                                        Triple("📊 Presets Oficiais do Admin", "Acesso instantâneo a setups consagrados pela mesa proprietária aplicados com 1 toque sob a regra de 0.5% de risco.", Icons.Default.CloudDownload),
+                                        Triple("📸 Captura de Gráficos MT5", "Comando de screenshot remoto que traz uma foto cristalina do gráfico do MT5 para conferência imediata.", Icons.Default.Screenshot),
+                                        Triple("🔒 Licenciamento & Auditoria UID", "Segurança avançada por hardware para blindar sua conta contra clones e invasões.", Icons.Default.Security)
+                                    )
+
+                                    features.forEach { (title, desc, icon) ->
+                                        Row(
+                                            verticalAlignment = Alignment.Top,
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Box(
+                                                modifier = Modifier
+                                                    .size(28.dp)
+                                                    .clip(CircleShape)
+                                                    .background(Color(0xFF0284C7).copy(alpha = 0.2f)),
+                                                contentAlignment = Alignment.Center
+                                            ) {
+                                                Icon(
+                                                    imageVector = icon,
+                                                    contentDescription = null,
+                                                    tint = Color(0xFF38BDF8),
+                                                    modifier = Modifier.size(15.dp)
+                                                )
+                                            }
+                                            Spacer(modifier = Modifier.width(10.dp))
+                                            Column {
+                                                Text(
+                                                    text = title,
+                                                    style = MaterialTheme.typography.bodySmall.copy(
+                                                        fontWeight = FontWeight.Bold,
+                                                        color = Color.White,
+                                                        fontSize = 11.5.sp
+                                                    )
+                                                )
+                                                Text(
+                                                    text = desc,
+                                                    style = MaterialTheme.typography.bodySmall.copy(
+                                                        color = Color(0xFF94A3B8),
+                                                        fontSize = 11.sp,
+                                                        lineHeight = 15.sp
+                                                    )
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Botão de Ir para o Tour
+                            Button(
+                                onClick = { activeGuideSection = 1 },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
+                                shape = RoundedCornerShape(10.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Explore,
+                                    contentDescription = null,
+                                    tint = Color.White,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Ver Tour Passo a Passo", fontWeight = FontWeight.Bold, color = Color.White)
+                            }
                         }
                     }
 
-                    if (currentStepIndex < steps.size - 1) {
-                        Button(
-                            onClick = { currentStepIndex++ },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
-                            shape = RoundedCornerShape(10.dp)
+                    1 -> {
+                        // ABA 1: TOUR PASSO A PASSO (1 ao 6)
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 450.dp)
                         ) {
-                            Text(
-                                text = "Próximo",
-                                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
+                            // Step counter + progress bar
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Passo ${currentStep.stepIndex} de ${steps.size}",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        color = Color(0xFF38BDF8),
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                )
+                                Text(
+                                    text = currentStep.subtitle,
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        color = Color(0xFF94A3B8),
+                                        fontSize = 10.5.sp
+                                    )
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.height(6.dp))
+
+                            LinearProgressIndicator(
+                                progress = { (currentStepIndex + 1).toFloat() / steps.size.toFloat() },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(5.dp)
+                                    .clip(RoundedCornerShape(3.dp)),
+                                color = Color(0xFF22D3EE),
+                                trackColor = Color(0xFF1E293B)
                             )
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Icon(
-                                imageVector = Icons.Default.ArrowForward,
-                                contentDescription = "Próximo",
-                                modifier = Modifier.size(16.dp)
-                            )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            Column(
+                                modifier = Modifier
+                                    .weight(1f, fill = false)
+                                    .verticalScroll(rememberScrollState())
+                            ) {
+                                // Step Card Title Banner
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .background(Color(0xFF1E293B), RoundedCornerShape(12.dp))
+                                        .padding(12.dp)
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(40.dp)
+                                            .clip(CircleShape)
+                                            .background(Color(0xFF0284C7).copy(alpha = 0.25f)),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = currentStep.icon,
+                                            contentDescription = null,
+                                            tint = Color(0xFF38BDF8),
+                                            modifier = Modifier.size(22.dp)
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.width(10.dp))
+                                    Column {
+                                        Text(
+                                            text = currentStep.title,
+                                            style = MaterialTheme.typography.titleSmall.copy(
+                                                fontWeight = FontWeight.Bold,
+                                                color = Color.White
+                                            )
+                                        )
+                                        Text(
+                                            text = currentStep.subtitle,
+                                            style = MaterialTheme.typography.bodySmall.copy(
+                                                color = Color(0xFF38BDF8),
+                                                fontSize = 11.sp
+                                            )
+                                        )
+                                    }
+                                }
+
+                                Spacer(modifier = Modifier.height(10.dp))
+
+                                Text(
+                                    text = currentStep.description,
+                                    style = MaterialTheme.typography.bodySmall.copy(
+                                        color = Color(0xFFE2E8F0),
+                                        lineHeight = 17.sp
+                                    )
+                                )
+
+                                Spacer(modifier = Modifier.height(10.dp))
+
+                                Text(
+                                    text = "Destaques & Parâmetros:",
+                                    style = MaterialTheme.typography.labelMedium.copy(
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color(0xFF22D3EE)
+                                    )
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+
+                                currentStep.highlights.forEach { (label, desc) ->
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(vertical = 3.dp),
+                                        verticalAlignment = Alignment.Top
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.CheckCircle,
+                                            contentDescription = null,
+                                            tint = Color(0xFF10B981),
+                                            modifier = Modifier
+                                                .size(15.dp)
+                                                .padding(top = 2.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Column {
+                                            Text(
+                                                text = label,
+                                                style = MaterialTheme.typography.bodySmall.copy(
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = Color.White,
+                                                    fontSize = 11.5.sp
+                                                )
+                                            )
+                                            Text(
+                                                text = desc,
+                                                style = MaterialTheme.typography.bodySmall.copy(
+                                                    color = Color(0xFF94A3B8),
+                                                    fontSize = 11.sp
+                                                )
+                                            )
+                                        }
+                                    }
+                                }
+
+                                Spacer(modifier = Modifier.height(10.dp))
+
+                                // Tip Card
+                                Card(
+                                    colors = CardDefaults.cardColors(containerColor = Color(0xFF0284C7).copy(alpha = 0.15f)),
+                                    shape = RoundedCornerShape(10.dp),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .border(1.dp, Color(0xFF0284C7).copy(alpha = 0.4f), RoundedCornerShape(10.dp))
+                                ) {
+                                    Text(
+                                        text = currentStep.tip,
+                                        style = MaterialTheme.typography.bodySmall.copy(
+                                            color = Color(0xFF38BDF8),
+                                            fontWeight = FontWeight.Medium,
+                                            fontSize = 11.5.sp
+                                        ),
+                                        modifier = Modifier.padding(10.dp)
+                                    )
+                                }
+
+                                Spacer(modifier = Modifier.height(10.dp))
+
+                                // Deep-link Action Button to navigate directly to the step's tab
+                                OutlinedButton(
+                                    onClick = {
+                                        onNavigateTab(currentStep.targetTab)
+                                    },
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF22D3EE)),
+                                    border = BorderStroke(1.dp, Color(0xFF22D3EE)),
+                                    shape = RoundedCornerShape(10.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Icon(
+                                        imageVector = currentStep.targetTab.icon,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "Abrir Tela: ${currentStep.targetTab.label}",
+                                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
+                                    )
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(12.dp))
+
+                            // Navigation Controls (Anterior / Próximo)
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                if (currentStepIndex > 0) {
+                                    TextButton(
+                                        onClick = { currentStepIndex-- },
+                                        colors = ButtonDefaults.textButtonColors(contentColor = Color(0xFF94A3B8))
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.ArrowBack,
+                                            contentDescription = "Anterior",
+                                            modifier = Modifier.size(15.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text("Anterior", fontSize = 12.sp)
+                                    }
+                                } else {
+                                    TextButton(
+                                        onClick = { activeGuideSection = 0 },
+                                        colors = ButtonDefaults.textButtonColors(contentColor = Color(0xFF64748B))
+                                    ) {
+                                        Text("Voltar ao Sobre", fontSize = 12.sp)
+                                    }
+                                }
+
+                                if (currentStepIndex < steps.size - 1) {
+                                    Button(
+                                        onClick = { currentStepIndex++ },
+                                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
+                                        shape = RoundedCornerShape(8.dp)
+                                    ) {
+                                        Text(
+                                            text = "Próximo",
+                                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
+                                        )
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Icon(
+                                            imageVector = Icons.Default.ArrowForward,
+                                            contentDescription = "Próximo",
+                                            modifier = Modifier.size(15.dp)
+                                        )
+                                    }
+                                } else {
+                                    Button(
+                                        onClick = { activeGuideSection = 2 },
+                                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981)),
+                                        shape = RoundedCornerShape(8.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.TrendingUp,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(15.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(
+                                            text = "Ver Estratégias",
+                                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
+                                        )
+                                    }
+                                }
+                            }
                         }
-                    } else {
-                        Button(
-                            onClick = onDismiss,
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981)),
-                            shape = RoundedCornerShape(10.dp)
+                    }
+
+                    2 -> {
+                        // ABA 2: ESTRATÉGIAS & REGRAS DE OURO
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 450.dp)
+                                .verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
-                            Icon(
-                                imageVector = Icons.Default.Check,
-                                contentDescription = null,
-                                modifier = Modifier.size(18.dp)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
                             Text(
-                                text = "Concluir Tour",
-                                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
+                                text = "Regras de Ouro da Mesa Fimaster",
+                                style = MaterialTheme.typography.labelLarge.copy(
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color(0xFF38BDF8)
+                                )
                             )
+
+                            // Regra 1: Exposição 0.5%
+                            Card(
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
+                                shape = RoundedCornerShape(12.dp),
+                                border = BorderStroke(1.dp, Color(0xFFF59E0B).copy(alpha = 0.4f)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(modifier = Modifier.padding(12.dp)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Icon(imageVector = Icons.Default.Shield, contentDescription = null, tint = Color(0xFFF59E0B), modifier = Modifier.size(18.dp))
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text("1. A Regra Inegociável dos 0.5%", style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold, color = Color(0xFFFDE68A)))
+                                    }
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text(
+                                        text = "Nunca arrisque mais do que 0.5% da banca em uma única operação. Exemplo: Para uma banca de \$1.000 USD, o risco máximo por stop deve ser \$5 USD (Lote 0.01 em micro/cent ou ajustado no ouro).",
+                                        style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFFCBD5E1), fontSize = 11.sp, lineHeight = 16.sp)
+                                    )
+                                }
+                            }
+
+                            // Regra 2: Linhas de Equador e Canais
+                            Card(
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
+                                shape = RoundedCornerShape(12.dp),
+                                border = BorderStroke(1.dp, Color(0xFF0284C7).copy(alpha = 0.4f)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(modifier = Modifier.padding(12.dp)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Icon(imageVector = Icons.Default.ShowChart, contentDescription = null, tint = Color(0xFF38BDF8), modifier = Modifier.size(18.dp))
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text("2. Linhas de Equador & Canais", style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold, color = Color(0xFFBAE6FD)))
+                                    }
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text(
+                                        text = "O robô utiliza o centro do canal (Equador) como divisor de águas entre zonas de compra e venda. Quando o preço rompe o canal superior, aciona gatilhos de continuação ou exaustão matemática.",
+                                        style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFFCBD5E1), fontSize = 11.sp, lineHeight = 16.sp)
+                                    )
+                                }
+                            }
+
+                            // Regra 3: Virada de Jogo / Costurar
+                            Card(
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
+                                shape = RoundedCornerShape(12.dp),
+                                border = BorderStroke(1.dp, Color(0xFF10B981).copy(alpha = 0.4f)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(modifier = Modifier.padding(12.dp)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Icon(imageVector = Icons.Default.Autorenew, contentDescription = null, tint = Color(0xFF34D399), modifier = Modifier.size(18.dp))
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text("3. Algoritmo de Costura (Virada)", style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold, color = Color(0xFFA7F3D0)))
+                                    }
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text(
+                                        text = "Se o mercado inverter bruscamente, o EA executa contra-ordens milimétricas calculadas para sair no zero a zero (breakeven) ou com lucro reduzido, preservando o capital principal.",
+                                        style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFFCBD5E1), fontSize = 11.sp, lineHeight = 16.sp)
+                                    )
+                                }
+                            }
+
+                            // Sessões de Mercado
+                            Surface(
+                                color = Color(0xFF0F172A),
+                                shape = RoundedCornerShape(10.dp),
+                                border = BorderStroke(1.dp, Color(0xFF334155)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Text("Horários das Sessões:", style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold, color = Color(0xFF94A3B8)))
+                                    Text("🌏 Tóquio / Ásia: 21:00 às 06:00 (Mercado calmo, ideal para canais estreitos)", style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFFCBD5E1), fontSize = 10.5.sp))
+                                    Text("🇬🇧 Londres: 04:00 às 13:00 (Alta liquidez, fortes rompimentos de canais)", style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFFCBD5E1), fontSize = 10.5.sp))
+                                    Text("🇺🇸 Nova York: 09:30 às 17:00 (Máxima volatilidade, notícias e tendências)", style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFFCBD5E1), fontSize = 10.5.sp))
+                                }
+                            }
+
+                            Button(
+                                onClick = { activeGuideSection = 3 },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
+                                shape = RoundedCornerShape(10.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Icon(imageVector = Icons.Default.Checklist, contentDescription = null, tint = Color.White, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Ir para o Checklist Diário", fontWeight = FontWeight.Bold, color = Color.White)
+                            }
+                        }
+                    }
+
+                    else -> {
+                        // ABA 3: CHECKLIST DIÁRIO DO TRADER AUTOMATIZADO
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 450.dp)
+                                .verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Text(
+                                text = "Rotina Pré-Mercado (5 Minutos por Dia)",
+                                style = MaterialTheme.typography.labelLarge.copy(
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color(0xFF34D399)
+                                )
+                            )
+                            Text(
+                                text = "Marque os itens antes de deixar o robô operando autonomamente:",
+                                style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8), fontSize = 11.sp)
+                            )
+
+                            // Item 1: VPS / AlgoTrading
+                            Card(
+                                colors = CardDefaults.cardColors(containerColor = if (checkVps) Color(0xFF064E3B).copy(alpha = 0.3f) else Color(0xFF1E293B)),
+                                shape = RoundedCornerShape(10.dp),
+                                border = BorderStroke(1.dp, if (checkVps) Color(0xFF10B981) else Color(0xFF334155)),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { checkVps = !checkVps }
+                            ) {
+                                Row(modifier = Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    Checkbox(
+                                        checked = checkVps,
+                                        onCheckedChange = { checkVps = it },
+                                        colors = CheckboxDefaults.colors(checkedColor = Color(0xFF10B981))
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text("1. VPS & Botão AlgoTrading", style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold, color = Color.White))
+                                        Text("MT5 aberto na VPS com o botão verde AlgoTrading ativo.", style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8), fontSize = 10.5.sp))
+                                    }
+                                }
+                            }
+
+                            // Item 2: Conta MT5
+                            Card(
+                                colors = CardDefaults.cardColors(containerColor = if (checkMt5) Color(0xFF064E3B).copy(alpha = 0.3f) else Color(0xFF1E293B)),
+                                shape = RoundedCornerShape(10.dp),
+                                border = BorderStroke(1.dp, if (checkMt5) Color(0xFF10B981) else Color(0xFF334155)),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { checkMt5 = !checkMt5 }
+                            ) {
+                                Row(modifier = Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    Checkbox(
+                                        checked = checkMt5,
+                                        onCheckedChange = { checkMt5 = it },
+                                        colors = CheckboxDefaults.colors(checkedColor = Color(0xFF10B981))
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text("2. Conta MT5 Vinculada", style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold, color = Color.White))
+                                        Text("Número salvo na aba 'Conta EA' e status ONLINE verificado.", style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8), fontSize = 10.5.sp))
+                                    }
+                                }
+                            }
+
+                            // Item 3: Licença
+                            Card(
+                                colors = CardDefaults.cardColors(containerColor = if (checkLicenca) Color(0xFF064E3B).copy(alpha = 0.3f) else Color(0xFF1E293B)),
+                                shape = RoundedCornerShape(10.dp),
+                                border = BorderStroke(1.dp, if (checkLicenca) Color(0xFF10B981) else Color(0xFF334155)),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { checkLicenca = !checkLicenca }
+                            ) {
+                                Row(modifier = Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    Checkbox(
+                                        checked = checkLicenca,
+                                        onCheckedChange = { checkLicenca = it },
+                                        colors = CheckboxDefaults.colors(checkedColor = Color(0xFF10B981))
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text("3. Validade da Licença", style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold, color = Color.White))
+                                        Text("Licença com status 'LICENÇA ATIVA' no app.", style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8), fontSize = 10.5.sp))
+                                    }
+                                }
+                            }
+
+                            // Item 4: Lote & Risco
+                            Card(
+                                colors = CardDefaults.cardColors(containerColor = if (checkLoteRisco) Color(0xFF064E3B).copy(alpha = 0.3f) else Color(0xFF1E293B)),
+                                shape = RoundedCornerShape(10.dp),
+                                border = BorderStroke(1.dp, if (checkLoteRisco) Color(0xFF10B981) else Color(0xFF334155)),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { checkLoteRisco = !checkLoteRisco }
+                            ) {
+                                Row(modifier = Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    Checkbox(
+                                        checked = checkLoteRisco,
+                                        onCheckedChange = { checkLoteRisco = it },
+                                        colors = CheckboxDefaults.colors(checkedColor = Color(0xFF10B981))
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text("4. Lote Ajustado para 0.5% de Risco", style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold, color = Color.White))
+                                        Text("Lote dimensionado conforme o saldo atual da banca.", style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8), fontSize = 10.5.sp))
+                                    }
+                                }
+                            }
+
+                            // Item 5: Notificações e Voz
+                            Card(
+                                colors = CardDefaults.cardColors(containerColor = if (checkVozTts) Color(0xFF064E3B).copy(alpha = 0.3f) else Color(0xFF1E293B)),
+                                shape = RoundedCornerShape(10.dp),
+                                border = BorderStroke(1.dp, if (checkVozTts) Color(0xFF10B981) else Color(0xFF334155)),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { checkVozTts = !checkVozTts }
+                            ) {
+                                Row(modifier = Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    Checkbox(
+                                        checked = checkVozTts,
+                                        onCheckedChange = { checkVozTts = it },
+                                        colors = CheckboxDefaults.colors(checkedColor = Color(0xFF10B981))
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text("5. Voz TTS Pronta & Viver a Vida!", style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold, color = Color.White))
+                                        Text("Celular preparado para avisos em áudio enquanto você aproveita seu dia.", style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8), fontSize = 10.5.sp))
+                                    }
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(4.dp))
+
+                            Button(
+                                onClick = onDismiss,
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981)),
+                                shape = RoundedCornerShape(10.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Icon(imageVector = Icons.Default.Check, contentDescription = null, tint = Color.White, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Tudo Pronto! Fechar Guia", fontWeight = FontWeight.Bold, color = Color.White)
+                            }
                         }
                     }
                 }
@@ -11644,11 +14975,13 @@ fun ChartScreenshotCard(
     onViewMql5Code: () -> Unit
 ) {
     var showFullModal by remember { mutableStateOf(false) }
+    val userPlanConfig = LocalLicensePlanConfig.current
+    val canCapture = userPlanConfig.capturaDeTela
 
     Card(
         colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B).copy(alpha = 0.95f)),
         shape = RoundedCornerShape(24.dp),
-        border = BorderStroke(1.dp, Color(0xFF0284C7).copy(alpha = 0.4f)),
+        border = BorderStroke(1.dp, if (canCapture) Color(0xFF0284C7).copy(alpha = 0.4f) else Color(0xFFEF4444).copy(alpha = 0.4f)),
         modifier = Modifier.fillMaxWidth()
     ) {
         Column(
@@ -11664,14 +14997,14 @@ fun ChartScreenshotCard(
                     Box(
                         modifier = Modifier
                             .size(38.dp)
-                            .background(Color(0xFF0284C7).copy(alpha = 0.2f), CircleShape)
-                            .border(1.dp, Color(0xFF38BDF8), CircleShape),
+                            .background(if (canCapture) Color(0xFF0284C7).copy(alpha = 0.2f) else Color(0xFFEF4444).copy(alpha = 0.2f), CircleShape)
+                            .border(1.dp, if (canCapture) Color(0xFF38BDF8) else Color(0xFFEF4444), CircleShape),
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
-                            imageVector = Icons.Default.CameraAlt,
+                            imageVector = if (canCapture) Icons.Default.CameraAlt else Icons.Default.Lock,
                             contentDescription = "Captura de Tela",
-                            tint = Color(0xFF38BDF8),
+                            tint = if (canCapture) Color(0xFF38BDF8) else Color(0xFFEF4444),
                             modifier = Modifier.size(20.dp)
                         )
                     }
@@ -11680,7 +15013,7 @@ fun ChartScreenshotCard(
                         Text(
                             text = "CAPTURA DE TELA DO GRÁFICO MT5",
                             style = MaterialTheme.typography.labelSmall.copy(
-                                color = Color(0xFF38BDF8),
+                                color = if (canCapture) Color(0xFF38BDF8) else Color(0xFFEF4444),
                                 fontWeight = FontWeight.Black,
                                 letterSpacing = 1.sp
                             )
@@ -11692,16 +15025,59 @@ fun ChartScreenshotCard(
                             } else ""
                         }
                         Text(
-                            text = if (chartScreenshot.isRequested) 
+                            text = if (!canCapture) "Recurso bloqueado pelo plano"
+                                else if (chartScreenshot.isRequested) 
                                 "Paridade: ${chartScreenshot.symbol} • ${chartScreenshot.timeframe}" + if (timeFormatted.isNotEmpty()) " • às $timeFormatted" else ""
                                 else "Aguardando solicitação",
-                            style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF38BDF8), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                color = if (canCapture) Color(0xFF38BDF8) else Color(0xFF94A3B8),
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 12.sp
+                            )
                         )
                     }
                 }
             }
 
-            if (chartScreenshot.isRequested) {
+            if (!canCapture) {
+                Surface(
+                    color = Color(0xFFEF4444).copy(alpha = 0.15f),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, Color(0xFFEF4444).copy(alpha = 0.5f)),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Lock,
+                            contentDescription = "Bloqueado",
+                            tint = Color(0xFFEF4444),
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Column {
+                            Text(
+                                text = "🔒 RECURSO BLOQUEADO PELO SEU PLANO",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontWeight = FontWeight.Black,
+                                    color = Color(0xFFEF4444)
+                                )
+                            )
+                            Text(
+                                text = "A captura de tela gráfica remota do MT5 está desabilitada (captura de tela: false). Faça upgrade para o plano Pro ou Master VIP para liberar.",
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    color = Color(0xFFE2E8F0),
+                                    fontSize = 11.sp
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+
+            if (canCapture && chartScreenshot.isRequested) {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -11720,7 +15096,7 @@ fun ChartScreenshotCard(
 
                     Surface(
                         onClick = { showFullModal = true },
-                        color = Color(0xFF0F172A).copy(alpha = 0.8f),
+                        color = Color(0xFF0F172A).copy(alpha = 0.85f),
                         shape = RoundedCornerShape(8.dp),
                         modifier = Modifier
                             .align(Alignment.BottomEnd)
@@ -11829,24 +15205,86 @@ fun ChartScreenshotCard(
                 }
             }
 
-            Button(
-                onClick = onRequestScreenshot,
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
-                shape = RoundedCornerShape(12.dp),
-                modifier = Modifier.fillMaxWidth(),
-                contentPadding = PaddingValues(vertical = 12.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Refresh,
-                    contentDescription = "Solicitar Captura",
-                    tint = Color.White,
-                    modifier = Modifier.size(18.dp)
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = "SOLICITAR CAPTURA",
-                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
-                )
+            val currentContext = androidx.compose.ui.platform.LocalContext.current
+            if (canCapture && chartScreenshot.isRequested) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Button(
+                        onClick = onRequestScreenshot,
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.weight(1.3f),
+                        contentPadding = PaddingValues(vertical = 12.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Refresh,
+                            contentDescription = "Solicitar Captura",
+                            tint = Color.White,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "ATUALIZAR",
+                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
+                        )
+                    }
+
+                    Button(
+                        onClick = { shareChartScreenshot(currentContext, chartScreenshot) },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981)),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.weight(1.3f),
+                        contentPadding = PaddingValues(vertical = 12.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Share,
+                            contentDescription = "Compartilhar Captura",
+                            tint = Color.White,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "COMPARTILHAR",
+                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
+                        )
+                    }
+                }
+            } else {
+                Button(
+                    onClick = {
+                        if (!canCapture) {
+                            android.widget.Toast.makeText(currentContext, "🔒 Recurso de captura gráfica bloqueado no seu plano.", android.widget.Toast.LENGTH_SHORT).show()
+                            return@Button
+                        }
+                        onRequestScreenshot()
+                    },
+                    enabled = canCapture,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF0284C7),
+                        disabledContainerColor = Color(0xFF334155),
+                        disabledContentColor = Color(0xFF64748B)
+                    ),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(vertical = 12.dp)
+                ) {
+                    Icon(
+                        imageVector = if (!canCapture) Icons.Default.Lock else Icons.Default.Refresh,
+                        contentDescription = "Solicitar Captura",
+                        tint = if (canCapture) Color.White else Color(0xFF64748B),
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = if (!canCapture) "CAPTURA BLOQUEADA PELO PLANO" else "SOLICITAR CAPTURA",
+                        style = MaterialTheme.typography.labelMedium.copy(
+                            fontWeight = FontWeight.Bold,
+                            color = if (canCapture) Color.White else Color(0xFF64748B)
+                        )
+                    )
+                }
             }
         }
     }
@@ -11866,6 +15304,7 @@ fun ChartScreenshotModalDialog(
     onRequestScreenshot: () -> Unit,
     onDismiss: () -> Unit
 ) {
+    val context = androidx.compose.ui.platform.LocalContext.current
     var scale by remember { mutableFloatStateOf(1.0f) }
     var offsetX by remember { mutableFloatStateOf(0f) }
     var offsetY by remember { mutableFloatStateOf(0f) }
@@ -11932,18 +15371,19 @@ fun ChartScreenshotModalDialog(
                     )
                 }
 
-                // Top bar with Parity & Time
+                // Top bar with Parity, Time, Share button & Close
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .statusBarsPadding()
                         .padding(16.dp)
-                        .background(Color(0xFF0F172A).copy(alpha = 0.85f), RoundedCornerShape(16.dp))
-                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                        .background(Color(0xFF0F172A).copy(alpha = 0.9f), RoundedCornerShape(16.dp))
+                        .border(1.dp, Color(0xFF334155), RoundedCornerShape(16.dp))
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Column {
+                    Column(modifier = Modifier.weight(1f)) {
                         Text(
                             text = "PARIDADE: ${chartScreenshot.symbol} (${chartScreenshot.timeframe})",
                             style = MaterialTheme.typography.titleMedium.copy(
@@ -11960,29 +15400,58 @@ fun ChartScreenshotModalDialog(
                         )
                     }
 
-                    IconButton(
-                        onClick = onDismiss,
-                        modifier = Modifier
-                            .background(Color(0xFF1E293B), CircleShape)
-                            .size(36.dp)
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.Close,
-                            contentDescription = "Fechar",
-                            tint = Color.White
-                        )
+                        Button(
+                            onClick = { shareChartScreenshot(context, chartScreenshot) },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981)),
+                            shape = RoundedCornerShape(10.dp),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                            modifier = Modifier.height(36.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Share,
+                                contentDescription = "Compartilhar",
+                                tint = Color.White,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(5.dp))
+                            Text(
+                                text = "Compartilhar",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.White
+                                )
+                            )
+                        }
+
+                        IconButton(
+                            onClick = onDismiss,
+                            modifier = Modifier
+                                .background(Color(0xFF1E293B), CircleShape)
+                                .size(36.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Fechar",
+                                tint = Color.White
+                            )
+                        }
                     }
                 }
 
-                // Bottom Zoom Indicator & Reset
+                // Bottom Zoom Indicator, Reset & Share Button
                 Row(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .navigationBarsPadding()
                         .padding(16.dp)
-                        .background(Color(0xFF0F172A).copy(alpha = 0.85f), RoundedCornerShape(16.dp))
-                        .padding(horizontal = 16.dp, vertical = 8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                        .background(Color(0xFF0F172A).copy(alpha = 0.9f), RoundedCornerShape(16.dp))
+                        .border(1.dp, Color(0xFF334155), RoundedCornerShape(16.dp))
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
@@ -11990,13 +15459,40 @@ fun ChartScreenshotModalDialog(
                         style = MaterialTheme.typography.labelSmall.copy(color = Color.White, fontWeight = FontWeight.Medium)
                     )
                     if (scale > 1.0f) {
-                        TextButton(onClick = {
-                            scale = 1.0f
-                            offsetX = 0f
-                            offsetY = 0f
-                        }) {
+                        TextButton(
+                            onClick = {
+                                scale = 1.0f
+                                offsetX = 0f
+                                offsetY = 0f
+                            },
+                            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp)
+                        ) {
                             Text("RESETAR", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF38BDF8), fontWeight = FontWeight.Bold))
                         }
+                    }
+                    Spacer(modifier = Modifier.weight(1f))
+                    Button(
+                        onClick = { shareChartScreenshot(context, chartScreenshot) },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
+                        shape = RoundedCornerShape(8.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                        modifier = Modifier.height(32.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Share,
+                            contentDescription = "Compartilhar",
+                            tint = Color.White,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "ENVIAR",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontWeight = FontWeight.Black,
+                                color = Color.White,
+                                fontSize = 11.sp
+                            )
+                        )
                     }
                 }
             }
@@ -12124,6 +15620,15 @@ data class ChartHorizontalLine(
     val color: Color = Color(0xFF38BDF8)
 )
 
+private fun formatChartPriceValue(price: Double, currencySymbol: String = ""): String {
+    val formatted = if (price < 10.0 && price > 0.0) {
+        String.format(java.util.Locale.US, "%.5f", price)
+    } else {
+        String.format(java.util.Locale.US, "%.2f", price)
+    }
+    return if (currencySymbol.isNotBlank()) "$currencySymbol $formatted" else formatted
+}
+
 @Composable
 fun FinancialEquityCandlestickCard(
     candles: List<com.example.ui.FinancialCandle>,
@@ -12155,6 +15660,9 @@ fun FinancialEquityCandlestickCard(
         if (selectedObjectId == id) selectedObjectId = null
     }
 
+    val selectedHorizontalLine = horizontalLines.find { it.id == selectedObjectId }
+    val selectedTrendline = trendlines.find { it.id == selectedObjectId }
+
     val activeCandle = selectedCandle ?: candles.lastOrNull()
 
     val totalDeposits = remember(candles, cambio) { candles.sumOf { it.deposits } * cambio }
@@ -12162,10 +15670,13 @@ fun FinancialEquityCandlestickCard(
     val totalNetProfit = remember(candles, cambio) { candles.sumOf { it.netProfit } * cambio }
     val finalEquity = remember(candles, cambio) { (candles.lastOrNull()?.closeBalance ?: 0.0) * cambio }
 
+    val userPlanConfig = LocalLicensePlanConfig.current
+    val canViewChart = userPlanConfig.graficoDePatrimonio
+
     Card(
         colors = CardDefaults.cardColors(containerColor = Color(0xFF0F172A).copy(alpha = 0.95f)),
         shape = RoundedCornerShape(18.dp),
-        border = BorderStroke(1.dp, Color(0xFF10B981).copy(alpha = 0.4f)),
+        border = BorderStroke(1.dp, if (canViewChart) Color(0xFF10B981).copy(alpha = 0.4f) else Color(0xFFEF4444).copy(alpha = 0.4f)),
         modifier = Modifier.fillMaxWidth()
     ) {
         Column(
@@ -12185,14 +15696,14 @@ fun FinancialEquityCandlestickCard(
                     Box(
                         modifier = Modifier
                             .size(32.dp)
-                            .background(Color(0xFF10B981).copy(alpha = 0.2f), CircleShape)
-                            .border(1.dp, Color(0xFF10B981), CircleShape),
+                            .background(if (canViewChart) Color(0xFF10B981).copy(alpha = 0.2f) else Color(0xFFEF4444).copy(alpha = 0.2f), CircleShape)
+                            .border(1.dp, if (canViewChart) Color(0xFF10B981) else Color(0xFFEF4444), CircleShape),
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
-                            imageVector = Icons.Default.ShowChart,
+                            imageVector = if (canViewChart) Icons.Default.ShowChart else Icons.Default.Lock,
                             contentDescription = "Gráfico Candlestick",
-                            tint = Color(0xFF10B981),
+                            tint = if (canViewChart) Color(0xFF10B981) else Color(0xFFEF4444),
                             modifier = Modifier.size(16.dp)
                         )
                     }
@@ -12201,14 +15712,14 @@ fun FinancialEquityCandlestickCard(
                         Text(
                             text = "GRÁFICO CANDLESTICK DE PATRIMÔNIO",
                             style = MaterialTheme.typography.labelSmall.copy(
-                                color = Color(0xFF10B981),
+                                color = if (canViewChart) Color(0xFF10B981) else Color(0xFFEF4444),
                                 fontWeight = FontWeight.Black,
                                 fontSize = 11.sp,
                                 letterSpacing = 0.5.sp
                             )
                         )
                         Text(
-                            text = "Sincronização via Robô EA MT5",
+                            text = if (canViewChart) "Sincronização via Robô EA MT5" else "Recurso bloqueado pelo seu plano",
                             style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8), fontSize = 10.sp)
                         )
                     }
@@ -12216,31 +15727,71 @@ fun FinancialEquityCandlestickCard(
 
                 Spacer(modifier = Modifier.width(6.dp))
 
+                if (canViewChart) {
+                    Surface(
+                        onClick = { isFullScreen = true },
+                        color = Color(0xFF10B981).copy(alpha = 0.15f),
+                        shape = RoundedCornerShape(6.dp),
+                        border = BorderStroke(1.dp, Color(0xFF10B981).copy(alpha = 0.4f))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.AspectRatio,
+                                contentDescription = "Tela Cheia",
+                                tint = Color(0xFF10B981),
+                                modifier = Modifier.size(12.dp)
+                            )
+                            Text(
+                                text = "TELA CHEIA",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = Color(0xFF10B981),
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 9.sp
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+
+            if (!canViewChart) {
                 Surface(
-                    onClick = { isFullScreen = true },
-                    color = Color(0xFF10B981).copy(alpha = 0.15f),
-                    shape = RoundedCornerShape(6.dp),
-                    border = BorderStroke(1.dp, Color(0xFF10B981).copy(alpha = 0.4f))
+                    color = Color(0xFFEF4444).copy(alpha = 0.15f),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, Color(0xFFEF4444).copy(alpha = 0.5f)),
+                    modifier = Modifier.fillMaxWidth()
                 ) {
                     Row(
-                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp),
+                        modifier = Modifier.padding(12.dp),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         Icon(
-                            imageVector = Icons.Default.AspectRatio,
-                            contentDescription = "Tela Cheia",
-                            tint = Color(0xFF10B981),
-                            modifier = Modifier.size(12.dp)
+                            imageVector = Icons.Default.Lock,
+                            contentDescription = "Bloqueado",
+                            tint = Color(0xFFEF4444),
+                            modifier = Modifier.size(20.dp)
                         )
-                        Text(
-                            text = "TELA CHEIA",
-                            style = MaterialTheme.typography.labelSmall.copy(
-                                color = Color(0xFF10B981),
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 9.sp
+                        Column {
+                            Text(
+                                text = "🔒 RECURSO BLOQUEADO PELO SEU PLANO",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontWeight = FontWeight.Black,
+                                    color = Color(0xFFEF4444)
+                                )
                             )
-                        )
+                            Text(
+                                text = "A visualização gráfica de patrimônio e candlesticks de ordens está desabilitada (grafico de património: false). Faça upgrade para Pro ou Master VIP para liberar.",
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    color = Color(0xFFE2E8F0),
+                                    fontSize = 11.sp
+                                )
+                            )
+                        }
                     }
                 }
             }
@@ -12592,25 +16143,21 @@ fun FinancialEquityCandlestickCard(
                     val isTrendActive = activeToolMode == "TRENDLINE" || trendlines.isNotEmpty()
                     Surface(
                         onClick = {
-                            if (activeToolMode == "TRENDLINE") {
-                                activeToolMode = null
-                                pendingTrendlineStart = null
-                            } else {
-                                activeToolMode = "TRENDLINE"
-                                if (trendlines.isEmpty() && candles.size >= 2) {
-                                    val minCandleIdx = candles.indices.minByOrNull { candles[it].lowBalance } ?: 0
-                                    val maxCandleIdx = candles.indices.maxByOrNull { candles[it].highBalance } ?: (candles.size - 1)
-                                    val startIdx = kotlin.math.min(minCandleIdx, maxCandleIdx)
-                                    val endIdx = kotlin.math.max(minCandleIdx, maxCandleIdx)
-                                    trendlines = listOf(
-                                        ChartTrendline(
-                                            startCandleIndex = startIdx.toFloat(),
-                                            startPrice = candles[startIdx].lowBalance * cambio,
-                                            endCandleIndex = endIdx.toFloat(),
-                                            endPrice = candles[endIdx].highBalance * cambio
-                                        )
-                                    )
-                                }
+                            activeToolMode = if (activeToolMode == "TRENDLINE") null else "TRENDLINE"
+                            if (candles.size >= 2) {
+                                val count = candles.size
+                                val startIdx = (count * 0.2f).coerceIn(0f, (count - 1).toFloat())
+                                val endIdx = (count * 0.8f).coerceIn(0f, (count - 1).toFloat())
+                                val p1 = candles[startIdx.toInt()].closeBalance * cambio
+                                val p2 = candles[endIdx.toInt()].closeBalance * cambio
+                                val newLine = ChartTrendline(
+                                    startCandleIndex = startIdx,
+                                    startPrice = p1,
+                                    endCandleIndex = endIdx,
+                                    endPrice = p2
+                                )
+                                trendlines = trendlines + newLine
+                                selectedObjectId = newLine.id
                             }
                         },
                         shape = RoundedCornerShape(6.dp),
@@ -12624,12 +16171,12 @@ fun FinancialEquityCandlestickCard(
                         ) {
                             Icon(
                                 imageVector = Icons.Default.ShowChart,
-                                contentDescription = null,
+                                contentDescription = "Linha de Tendência",
                                 tint = if (isTrendActive) Color.Black else Color(0xFFEAB308),
                                 modifier = Modifier.size(14.dp)
                             )
                             Text(
-                                text = "Tendência",
+                                text = "+ Tendência",
                                 style = MaterialTheme.typography.labelSmall.copy(
                                     color = if (isTrendActive) Color.Black else Color.White,
                                     fontWeight = FontWeight.Bold,
@@ -12642,14 +16189,12 @@ fun FinancialEquityCandlestickCard(
                     val isHorizActive = activeToolMode == "HORIZONTAL" || horizontalLines.isNotEmpty()
                     Surface(
                         onClick = {
-                            if (activeToolMode == "HORIZONTAL") {
-                                activeToolMode = null
-                            } else {
-                                activeToolMode = "HORIZONTAL"
-                                val currentPrice = (activeCandle?.closeBalance ?: candles.lastOrNull()?.closeBalance ?: 0.0) * cambio
-                                if (currentPrice > 0.0 && horizontalLines.none { kotlin.math.abs(it.price - currentPrice) < 0.01 }) {
-                                    horizontalLines = horizontalLines + ChartHorizontalLine(price = currentPrice)
-                                }
+                            activeToolMode = if (activeToolMode == "HORIZONTAL") null else "HORIZONTAL"
+                            val currentPrice = (activeCandle?.closeBalance ?: candles.lastOrNull()?.closeBalance ?: 0.0) * cambio
+                            if (currentPrice > 0.0) {
+                                val newLine = ChartHorizontalLine(price = currentPrice)
+                                horizontalLines = horizontalLines + newLine
+                                selectedObjectId = newLine.id
                             }
                         },
                         shape = RoundedCornerShape(6.dp),
@@ -12663,82 +16208,18 @@ fun FinancialEquityCandlestickCard(
                         ) {
                             Icon(
                                 imageVector = Icons.Default.HorizontalRule,
-                                contentDescription = null,
+                                contentDescription = "Linha Horizontal",
                                 tint = if (isHorizActive) Color.White else Color(0xFF38BDF8),
                                 modifier = Modifier.size(14.dp)
                             )
                             Text(
-                                text = "Horizontal",
+                                text = "+ Horizontal",
                                 style = MaterialTheme.typography.labelSmall.copy(
                                     color = Color.White,
                                     fontWeight = FontWeight.Bold,
                                     fontSize = 9.5.sp
                                 )
                             )
-                        }
-                    }
-
-                    // Botão Mover / Selecionar Objeto
-                    Surface(
-                        onClick = {
-                            activeToolMode = if (activeToolMode == "MOVE") null else "MOVE"
-                        },
-                        shape = RoundedCornerShape(6.dp),
-                        color = if (activeToolMode == "MOVE") Color(0xFFF59E0B) else Color(0xFF1E293B),
-                        border = BorderStroke(0.5.dp, if (activeToolMode == "MOVE") Color(0xFFFBBF24) else Color(0xFF334155))
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(4.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.OpenWith,
-                                contentDescription = "Mover Objeto",
-                                tint = if (activeToolMode == "MOVE") Color.Black else Color(0xFFF59E0B),
-                                modifier = Modifier.size(14.dp)
-                            )
-                            Text(
-                                text = "Mover",
-                                style = MaterialTheme.typography.labelSmall.copy(
-                                    color = if (activeToolMode == "MOVE") Color.Black else Color.White,
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 9.5.sp
-                                )
-                            )
-                        }
-                    }
-
-                    // Botão Excluir Objeto Selecionado
-                    if (selectedObjectId != null) {
-                        Surface(
-                            onClick = {
-                                selectedObjectId?.let { handleDeleteObject(it) }
-                            },
-                            shape = RoundedCornerShape(6.dp),
-                            color = Color(0xFFEF4444).copy(alpha = 0.25f),
-                            border = BorderStroke(0.5.dp, Color(0xFFEF4444))
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(4.dp)
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Delete,
-                                    contentDescription = "Excluir Objeto",
-                                    tint = Color(0xFFEF4444),
-                                    modifier = Modifier.size(14.dp)
-                                )
-                                Text(
-                                    text = "Excluir",
-                                    style = MaterialTheme.typography.labelSmall.copy(
-                                        color = Color(0xFFEF4444),
-                                        fontWeight = FontWeight.Bold,
-                                        fontSize = 9.5.sp
-                                    )
-                                )
-                            }
                         }
                     }
 
@@ -12766,90 +16247,260 @@ fun FinancialEquityCandlestickCard(
                 }
             }
 
-            // Candlestick Chart Canvas
-            FinancialCandlestickCanvas(
-                candles = candles,
-                selectedCandle = activeCandle,
-                onCandleSelect = { selectedCandle = it },
-                cambio = cambio,
-                currencySymbol = currencySymbol,
-                zoomLevelX = zoomLevelX,
-                zoomLevelY = zoomLevelY,
-                onZoomChange = { newX, newY ->
-                    zoomLevelX = newX
-                    zoomLevelY = newY
-                },
-                trendlines = trendlines,
-                horizontalLines = horizontalLines,
-                activeToolMode = activeToolMode,
-                isLandscapeMode = isLandscapeMode,
-                selectedObjectId = selectedObjectId,
-                onSelectObject = { selectedObjectId = it },
-                onUpdateHorizontalLine = handleUpdateHorizontalLine,
-                onUpdateTrendline = handleUpdateTrendline,
-                onDeleteObject = handleDeleteObject,
-                onAddHorizontalLine = { price ->
-                    horizontalLines = horizontalLines + ChartHorizontalLine(price = price)
-                },
-                onAddTrendlinePoint = { index, price ->
-                    val pending = pendingTrendlineStart
-                    if (pending == null) {
-                        pendingTrendlineStart = Pair(index, price)
-                    } else {
-                        trendlines = trendlines + ChartTrendline(
-                            startCandleIndex = pending.first,
-                            startPrice = pending.second,
-                            endCandleIndex = index,
-                            endPrice = price
-                        )
-                        pendingTrendlineStart = null
-                    }
-                },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(if (isLandscapeMode) 320.dp else 240.dp)
-            )
-
-            // Legend Organized in 2 Clean Rows
-            Column(
-                modifier = Modifier.fillMaxWidth(),
-                verticalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                Row(
+            // Contextual Overlay Bar when a Line is Selected
+            if (selectedObjectId != null) {
+                Surface(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceEvenly,
-                    verticalAlignment = Alignment.CenterVertically
+                    shape = RoundedCornerShape(10.dp),
+                    color = Color(0xFF1E293B).copy(alpha = 0.95f),
+                    border = BorderStroke(1.dp, Color(0xFF38BDF8).copy(alpha = 0.6f))
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(modifier = Modifier.size(10.dp).background(Color(0xFF10B981), RoundedCornerShape(2.dp)))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Lucro / Alta", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF94A3B8), fontSize = 10.5.sp))
-                    }
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(modifier = Modifier.size(10.dp).background(Color(0xFFEF4444), RoundedCornerShape(2.dp)))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Prejuízo / Baixa", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF94A3B8), fontSize = 10.5.sp))
-                    }
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(modifier = Modifier.width(12.dp).height(2.dp).background(Color(0xFF38BDF8)))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Preço Atual", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF38BDF8), fontSize = 10.5.sp, fontWeight = FontWeight.SemiBold))
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            if (selectedHorizontalLine != null) {
+                                Icon(
+                                    imageVector = Icons.Default.HorizontalRule,
+                                    contentDescription = null,
+                                    tint = selectedHorizontalLine.color,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Text(
+                                    text = "Horizontal: ${formatChartPriceValue(selectedHorizontalLine.price, currencySymbol)}",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 11.sp
+                                    )
+                                )
+                            } else if (selectedTrendline != null) {
+                                Icon(
+                                    imageVector = Icons.Default.ShowChart,
+                                    contentDescription = null,
+                                    tint = selectedTrendline.color,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Text(
+                                    text = "Linha de Tendência (Arraste pontas ou corpo)",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 10.5.sp
+                                    )
+                                )
+                            }
+                        }
+
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            // Color Selector Chips
+                            val colors = listOf(
+                                Color(0xFFF59E0B),
+                                Color(0xFF38BDF8),
+                                Color(0xFF10B981),
+                                Color(0xFFA855F7),
+                                Color(0xFFEF4444)
+                            )
+                            colors.forEach { col ->
+                                Box(
+                                    modifier = Modifier
+                                        .size(18.dp)
+                                        .background(col, CircleShape)
+                                        .border(1.dp, Color.White.copy(alpha = 0.8f), CircleShape)
+                                        .clickable {
+                                            selectedHorizontalLine?.let {
+                                                handleUpdateHorizontalLine(it.copy(color = col))
+                                            }
+                                            selectedTrendline?.let {
+                                                handleUpdateTrendline(it.copy(color = col))
+                                            }
+                                        }
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.width(4.dp))
+
+                            // Delete Button
+                            Surface(
+                                onClick = {
+                                    selectedObjectId?.let { handleDeleteObject(it) }
+                                },
+                                shape = RoundedCornerShape(6.dp),
+                                color = Color(0xFFEF4444).copy(alpha = 0.25f),
+                                border = BorderStroke(0.5.dp, Color(0xFFEF4444))
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Delete,
+                                    contentDescription = "Excluir Linha",
+                                    tint = Color(0xFFEF4444),
+                                    modifier = Modifier.padding(4.dp).size(14.dp)
+                                )
+                            }
+
+                            // Deselect / Done Button
+                            Surface(
+                                onClick = { selectedObjectId = null },
+                                shape = RoundedCornerShape(6.dp),
+                                color = Color(0xFF10B981).copy(alpha = 0.25f),
+                                border = BorderStroke(0.5.dp, Color(0xFF10B981))
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Check,
+                                    contentDescription = "Concluir",
+                                    tint = Color(0xFF10B981),
+                                    modifier = Modifier.padding(4.dp).size(14.dp)
+                                )
+                            }
+                        }
                     }
                 }
-                Row(
+            }
+
+            if (canViewChart) {
+                // Candlestick Chart Canvas
+                FinancialCandlestickCanvas(
+                    candles = candles,
+                    selectedCandle = activeCandle,
+                    onCandleSelect = { selectedCandle = it },
+                    cambio = cambio,
+                    currencySymbol = currencySymbol,
+                    zoomLevelX = zoomLevelX,
+                    zoomLevelY = zoomLevelY,
+                    onZoomChange = { newX, newY ->
+                        zoomLevelX = newX
+                        zoomLevelY = newY
+                    },
+                    trendlines = trendlines,
+                    horizontalLines = horizontalLines,
+                    activeToolMode = activeToolMode,
+                    isLandscapeMode = isLandscapeMode,
+                    selectedObjectId = selectedObjectId,
+                    onSelectObject = { selectedObjectId = it },
+                    onUpdateHorizontalLine = handleUpdateHorizontalLine,
+                    onUpdateTrendline = handleUpdateTrendline,
+                    onDeleteObject = handleDeleteObject,
+                    onAddHorizontalLine = { price ->
+                        val newLine = ChartHorizontalLine(price = price)
+                        horizontalLines = horizontalLines + newLine
+                        selectedObjectId = newLine.id
+                    },
+                    onAddTrendlinePoint = { index, price ->
+                        val pending = pendingTrendlineStart
+                        if (pending == null) {
+                            pendingTrendlineStart = Pair(index, price)
+                        } else {
+                            val newLine = ChartTrendline(
+                                startCandleIndex = pending.first,
+                                startPrice = pending.second,
+                                endCandleIndex = index,
+                                endPrice = price
+                            )
+                            trendlines = trendlines + newLine
+                            selectedObjectId = newLine.id
+                            pendingTrendlineStart = null
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(if (isLandscapeMode) 320.dp else 240.dp)
+                )
+
+                // Legend Organized in 2 Clean Rows
+                Column(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceEvenly,
-                    verticalAlignment = Alignment.CenterVertically
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(modifier = Modifier.size(8.dp).background(Color(0xFF22D3EE), CircleShape))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("● Depósito (MT5 Auto)", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF22D3EE), fontSize = 10.5.sp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(modifier = Modifier.size(10.dp).background(Color(0xFF10B981), RoundedCornerShape(2.dp)))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Lucro / Alta", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF94A3B8), fontSize = 10.5.sp))
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(modifier = Modifier.size(10.dp).background(Color(0xFFEF4444), RoundedCornerShape(2.dp)))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Prejuízo / Baixa", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF94A3B8), fontSize = 10.5.sp))
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(modifier = Modifier.width(12.dp).height(2.dp).background(Color(0xFF38BDF8)))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Preço Atual", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF38BDF8), fontSize = 10.5.sp, fontWeight = FontWeight.SemiBold))
+                        }
                     }
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(modifier = Modifier.size(8.dp).background(Color(0xFFF59E0B), CircleShape))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("● Saque (MT5 Auto)", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFFF59E0B), fontSize = 10.5.sp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(modifier = Modifier.size(8.dp).background(Color(0xFF22D3EE), CircleShape))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("● Depósito (MT5 Auto)", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFF22D3EE), fontSize = 10.5.sp))
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(modifier = Modifier.size(8.dp).background(Color(0xFFF59E0B), CircleShape))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("● Saque (MT5 Auto)", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFFF59E0B), fontSize = 10.5.sp))
+                        }
+                    }
+                }
+            } else {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(180.dp)
+                        .background(Color(0xFF0B132B), RoundedCornerShape(12.dp))
+                        .border(1.dp, Color(0xFF334155), RoundedCornerShape(12.dp)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.padding(16.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(44.dp)
+                                .background(Color(0xFFEF4444).copy(alpha = 0.15f), CircleShape)
+                                .border(1.dp, Color(0xFFEF4444).copy(alpha = 0.5f), CircleShape),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Lock,
+                                contentDescription = null,
+                                tint = Color(0xFFEF4444),
+                                modifier = Modifier.size(22.dp)
+                            )
+                        }
+                        Text(
+                            text = "GRÁFICO BLOQUEADO PELO PLANO",
+                            style = MaterialTheme.typography.labelMedium.copy(
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold
+                            )
+                        )
+                        Text(
+                            text = "Acompanhe a curva de evolução patrimonial e candlesticks com os planos Pro ou Master VIP.",
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                color = Color(0xFF94A3B8),
+                                fontSize = 11.sp,
+                                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                            )
+                        )
                     }
                 }
             }
@@ -13073,25 +16724,21 @@ fun FinancialEquityCandlestickCard(
                         val isTrendActive = activeToolMode == "TRENDLINE" || trendlines.isNotEmpty()
                         Surface(
                             onClick = {
-                                if (activeToolMode == "TRENDLINE") {
-                                    activeToolMode = null
-                                    pendingTrendlineStart = null
-                                } else {
-                                    activeToolMode = "TRENDLINE"
-                                    if (trendlines.isEmpty() && candles.size >= 2) {
-                                        val minCandleIdx = candles.indices.minByOrNull { candles[it].lowBalance } ?: 0
-                                        val maxCandleIdx = candles.indices.maxByOrNull { candles[it].highBalance } ?: (candles.size - 1)
-                                        val startIdx = kotlin.math.min(minCandleIdx, maxCandleIdx)
-                                        val endIdx = kotlin.math.max(minCandleIdx, maxCandleIdx)
-                                        trendlines = listOf(
-                                            ChartTrendline(
-                                                startCandleIndex = startIdx.toFloat(),
-                                                startPrice = candles[startIdx].lowBalance * cambio,
-                                                endCandleIndex = endIdx.toFloat(),
-                                                endPrice = candles[endIdx].highBalance * cambio
-                                            )
-                                        )
-                                    }
+                                activeToolMode = if (activeToolMode == "TRENDLINE") null else "TRENDLINE"
+                                if (candles.size >= 2) {
+                                    val count = candles.size
+                                    val startIdx = (count * 0.2f).coerceIn(0f, (count - 1).toFloat())
+                                    val endIdx = (count * 0.8f).coerceIn(0f, (count - 1).toFloat())
+                                    val p1 = candles[startIdx.toInt()].closeBalance * cambio
+                                    val p2 = candles[endIdx.toInt()].closeBalance * cambio
+                                    val newLine = ChartTrendline(
+                                        startCandleIndex = startIdx,
+                                        startPrice = p1,
+                                        endCandleIndex = endIdx,
+                                        endPrice = p2
+                                    )
+                                    trendlines = trendlines + newLine
+                                    selectedObjectId = newLine.id
                                 }
                             },
                             shape = RoundedCornerShape(6.dp),
@@ -13105,12 +16752,12 @@ fun FinancialEquityCandlestickCard(
                             ) {
                                 Icon(
                                     imageVector = Icons.Default.ShowChart,
-                                    contentDescription = null,
+                                    contentDescription = "Linha de Tendência",
                                     tint = if (isTrendActive) Color.Black else Color(0xFFEAB308),
                                     modifier = Modifier.size(14.dp)
                                 )
                                 Text(
-                                    text = "Tendência",
+                                    text = "+ Tendência",
                                     style = MaterialTheme.typography.labelSmall.copy(
                                         color = if (isTrendActive) Color.Black else Color.White,
                                         fontWeight = FontWeight.Bold,
@@ -13123,14 +16770,12 @@ fun FinancialEquityCandlestickCard(
                         val isHorizActive = activeToolMode == "HORIZONTAL" || horizontalLines.isNotEmpty()
                         Surface(
                             onClick = {
-                                if (activeToolMode == "HORIZONTAL") {
-                                    activeToolMode = null
-                                } else {
-                                    activeToolMode = "HORIZONTAL"
-                                    val currentPrice = (activeCandle?.closeBalance ?: candles.lastOrNull()?.closeBalance ?: 0.0) * cambio
-                                    if (currentPrice > 0.0 && horizontalLines.none { kotlin.math.abs(it.price - currentPrice) < 0.01 }) {
-                                        horizontalLines = horizontalLines + ChartHorizontalLine(price = currentPrice)
-                                    }
+                                activeToolMode = if (activeToolMode == "HORIZONTAL") null else "HORIZONTAL"
+                                val currentPrice = (activeCandle?.closeBalance ?: candles.lastOrNull()?.closeBalance ?: 0.0) * cambio
+                                if (currentPrice > 0.0) {
+                                    val newLine = ChartHorizontalLine(price = currentPrice)
+                                    horizontalLines = horizontalLines + newLine
+                                    selectedObjectId = newLine.id
                                 }
                             },
                             shape = RoundedCornerShape(6.dp),
@@ -13144,82 +16789,18 @@ fun FinancialEquityCandlestickCard(
                             ) {
                                 Icon(
                                     imageVector = Icons.Default.HorizontalRule,
-                                    contentDescription = null,
+                                    contentDescription = "Linha Horizontal",
                                     tint = if (isHorizActive) Color.White else Color(0xFF38BDF8),
                                     modifier = Modifier.size(14.dp)
                                 )
                                 Text(
-                                    text = "Horizontal",
+                                    text = "+ Horizontal",
                                     style = MaterialTheme.typography.labelSmall.copy(
                                         color = Color.White,
                                         fontWeight = FontWeight.Bold,
                                         fontSize = 10.sp
                                     )
                                 )
-                            }
-                        }
-
-                        // Botão Mover / Selecionar Objeto
-                        Surface(
-                            onClick = {
-                                activeToolMode = if (activeToolMode == "MOVE") null else "MOVE"
-                            },
-                            shape = RoundedCornerShape(6.dp),
-                            color = if (activeToolMode == "MOVE") Color(0xFFF59E0B) else Color(0xFF1E293B),
-                            border = BorderStroke(0.5.dp, if (activeToolMode == "MOVE") Color(0xFFFBBF24) else Color(0xFF334155))
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(4.dp)
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.OpenWith,
-                                    contentDescription = "Mover Objeto",
-                                    tint = if (activeToolMode == "MOVE") Color.Black else Color(0xFFF59E0B),
-                                    modifier = Modifier.size(14.dp)
-                                )
-                                Text(
-                                    text = "Mover",
-                                    style = MaterialTheme.typography.labelSmall.copy(
-                                        color = if (activeToolMode == "MOVE") Color.Black else Color.White,
-                                        fontWeight = FontWeight.Bold,
-                                        fontSize = 10.sp
-                                    )
-                                )
-                            }
-                        }
-
-                        // Botão Excluir Objeto Selecionado
-                        if (selectedObjectId != null) {
-                            Surface(
-                                onClick = {
-                                    selectedObjectId?.let { handleDeleteObject(it) }
-                                },
-                                shape = RoundedCornerShape(6.dp),
-                                color = Color(0xFFEF4444).copy(alpha = 0.25f),
-                                border = BorderStroke(0.5.dp, Color(0xFFEF4444))
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Delete,
-                                        contentDescription = "Excluir Objeto",
-                                        tint = Color(0xFFEF4444),
-                                        modifier = Modifier.size(14.dp)
-                                    )
-                                    Text(
-                                        text = "Excluir",
-                                        style = MaterialTheme.typography.labelSmall.copy(
-                                            color = Color(0xFFEF4444),
-                                            fontWeight = FontWeight.Bold,
-                                            fontSize = 10.sp
-                                        )
-                                    )
-                                }
                             }
                         }
 
@@ -13237,6 +16818,125 @@ fun FinancialEquityCandlestickCard(
                                 border = BorderStroke(0.5.dp, Color(0xFFEF4444))
                             ) {
                                 Text("Limpar", style = MaterialTheme.typography.labelSmall.copy(color = Color(0xFFEF4444), fontSize = 10.sp, fontWeight = FontWeight.Bold), modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp))
+                            }
+                        }
+                    }
+
+                    // Contextual Overlay Bar in Fullscreen when a Line is Selected
+                    if (selectedObjectId != null) {
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(10.dp),
+                            color = Color(0xFF1E293B).copy(alpha = 0.95f),
+                            border = BorderStroke(1.dp, Color(0xFF38BDF8).copy(alpha = 0.6f))
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    if (selectedHorizontalLine != null) {
+                                        Icon(
+                                            imageVector = Icons.Default.HorizontalRule,
+                                            contentDescription = null,
+                                            tint = selectedHorizontalLine.color,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                        Text(
+                                            text = "Horizontal: ${formatChartPriceValue(selectedHorizontalLine.price, currencySymbol)}",
+                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                color = Color.White,
+                                                fontWeight = FontWeight.Bold,
+                                                fontSize = 11.sp
+                                            )
+                                        )
+                                    } else if (selectedTrendline != null) {
+                                        Icon(
+                                            imageVector = Icons.Default.ShowChart,
+                                            contentDescription = null,
+                                            tint = selectedTrendline.color,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                        Text(
+                                            text = "Linha de Tendência (Arraste pontas ou corpo)",
+                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                color = Color.White,
+                                                fontWeight = FontWeight.Bold,
+                                                fontSize = 10.5.sp
+                                            )
+                                        )
+                                    }
+                                }
+
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    // Color Selector Chips
+                                    val colors = listOf(
+                                        Color(0xFFF59E0B),
+                                        Color(0xFF38BDF8),
+                                        Color(0xFF10B981),
+                                        Color(0xFFA855F7),
+                                        Color(0xFFEF4444)
+                                    )
+                                    colors.forEach { col ->
+                                        Box(
+                                            modifier = Modifier
+                                                .size(18.dp)
+                                                .background(col, CircleShape)
+                                                .border(1.dp, Color.White.copy(alpha = 0.8f), CircleShape)
+                                                .clickable {
+                                                    selectedHorizontalLine?.let {
+                                                        handleUpdateHorizontalLine(it.copy(color = col))
+                                                    }
+                                                    selectedTrendline?.let {
+                                                        handleUpdateTrendline(it.copy(color = col))
+                                                    }
+                                                }
+                                        )
+                                    }
+
+                                    Spacer(modifier = Modifier.width(4.dp))
+
+                                    // Delete Button
+                                    Surface(
+                                        onClick = {
+                                            selectedObjectId?.let { handleDeleteObject(it) }
+                                        },
+                                        shape = RoundedCornerShape(6.dp),
+                                        color = Color(0xFFEF4444).copy(alpha = 0.25f),
+                                        border = BorderStroke(0.5.dp, Color(0xFFEF4444))
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Delete,
+                                            contentDescription = "Excluir Linha",
+                                            tint = Color(0xFFEF4444),
+                                            modifier = Modifier.padding(4.dp).size(14.dp)
+                                        )
+                                    }
+
+                                    // Deselect / Done Button
+                                    Surface(
+                                        onClick = { selectedObjectId = null },
+                                        shape = RoundedCornerShape(6.dp),
+                                        color = Color(0xFF10B981).copy(alpha = 0.25f),
+                                        border = BorderStroke(0.5.dp, Color(0xFF10B981))
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Check,
+                                            contentDescription = "Concluir",
+                                            tint = Color(0xFF10B981),
+                                            modifier = Modifier.padding(4.dp).size(14.dp)
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
@@ -13323,6 +17023,9 @@ fun FinancialCandlestickCanvas(
     onAddTrendlinePoint: ((Float, Double) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
+    val licenseTier = LocalLicenseTier.current
+    val isTrial = (licenseTier == LicenseTier.TRIAL)
+
     Box(
         modifier = modifier
             .background(Color(0xFF020617))
@@ -13346,7 +17049,11 @@ fun FinancialCandlestickCanvas(
         val scrollStateX = rememberScrollState()
         val scrollStateY = rememberScrollState()
 
-        BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        BoxWithConstraints(
+            modifier = Modifier
+                .fillMaxSize()
+                .then(if (isTrial) Modifier.blur(12.dp) else Modifier)
+        ) {
             val baseWidthPx = constraints.maxWidth.toFloat()
             val baseHeightPx = constraints.maxHeight.toFloat()
             val totalChartWidthPx = (baseWidthPx * zoomLevelX).coerceAtLeast(baseWidthPx)
@@ -13366,200 +17073,242 @@ fun FinancialCandlestickCanvas(
                         .width(with(androidx.compose.ui.platform.LocalDensity.current) { totalChartWidthPx.toDp() })
                         .height(with(androidx.compose.ui.platform.LocalDensity.current) { totalChartHeightPx.toDp() })
                         .padding(top = 16.dp, bottom = 28.dp, start = 16.dp, end = 16.dp)
-                        .pointerInput(candles, zoomLevelX, zoomLevelY, isLandscapeMode, onZoomChange) {
-                            detectTransformGestures { _, pan, zoom, _ ->
-                                if (zoom != 1.0f && onZoomChange != null) {
-                                    val newX = (zoomLevelX * zoom).coerceIn(0.5f, 5.0f)
-                                    val newY = (zoomLevelY * zoom).coerceIn(0.5f, 5.0f)
-                                    onZoomChange(newX, newY)
-                                }
-                                if (pan != androidx.compose.ui.geometry.Offset.Zero) {
-                                    val deltaX = if (isLandscapeMode) pan.y else -pan.x
-                                    val deltaY = if (isLandscapeMode) -pan.x else -pan.y
-                                    scrollStateX.dispatchRawDelta(deltaX)
-                                    scrollStateY.dispatchRawDelta(deltaY)
-                                }
-                            }
-                        }
-                        .pointerInput(candles, horizontalLines, trendlines, minEquity, equityRange, isLandscapeMode) {
-                            var activeDragId: String? = null
-                            var activeDragMode: String? = null
-                            var touchStartPos: androidx.compose.ui.geometry.Offset? = null
-                            var initialStartIdx: Float = 0f
-                            var initialEndIdx: Float = 0f
-                            var initialStartPrice: Double = 0.0
-                            var initialEndPrice: Double = 0.0
-                            var initialHLinePrice: Double = 0.0
+                        .pointerInput(candles, horizontalLines, trendlines, minEquity, equityRange, isLandscapeMode, selectedObjectId, activeToolMode, zoomLevelX, zoomLevelY) {
+                            awaitEachGesture {
+                                val down = awaitFirstDown(requireUnconsumed = false)
+                                val touchStart = down.position
+                                val w = size.width.toFloat()
+                                val h = size.height.toFloat()
+                                val count = candles.size.coerceAtLeast(1)
+                                val rightMargin = 120f
+                                val chartWidth = (w - rightMargin).coerceAtLeast(50f)
+                                val slotWidth = chartWidth / count
 
-                            detectDragGestures(
-                                onDragStart = { touchOffset ->
-                                    val w = size.width.toFloat()
-                                    val h = size.height.toFloat()
-                                    val count = candles.size.coerceAtLeast(1)
-                                    val rightMargin = 112f
-                                    val chartWidth = (w - rightMargin).coerceAtLeast(50f)
-                                    val slotWidth = chartWidth / count
+                                // 1. Hit testing with highest priority on selected object handles, then unselected lines
+                                var hitId: String? = null
+                                var hitMode: String? = null // "START", "END", "TRENDLINE_BODY", "HORIZONTAL"
+                                var initialStartIdx = 0f
+                                var initialEndIdx = 0f
+                                var initialStartPrice = 0.0
+                                var initialEndPrice = 0.0
+                                var initialHLinePrice = 0.0
 
+                                val selTLine = trendlines.find { it.id == selectedObjectId }
+                                if (selTLine != null) {
+                                    val x1 = (selTLine.startCandleIndex + 0.5f) * slotWidth
+                                    val y1 = h * (1f - ((selTLine.startPrice - minEquity) / equityRange).toFloat())
+                                    val x2 = (selTLine.endCandleIndex + 0.5f) * slotWidth
+                                    val y2 = h * (1f - ((selTLine.endPrice - minEquity) / equityRange).toFloat())
+                                    val midX = (x1 + x2) / 2f
+                                    val midY = (y1 + y2) / 2f
+
+                                    val d1 = kotlin.math.hypot(touchStart.x - x1, touchStart.y - y1)
+                                    val d2 = kotlin.math.hypot(touchStart.x - x2, touchStart.y - y2)
+                                    val dMid = kotlin.math.hypot(touchStart.x - midX, touchStart.y - midY)
+                                    val dBody = distanceToSegment(touchStart.x, touchStart.y, x1, y1, x2, y2)
+
+                                    if (d1 <= 64f) {
+                                        hitId = selTLine.id
+                                        hitMode = "START"
+                                        initialStartIdx = selTLine.startCandleIndex
+                                        initialStartPrice = selTLine.startPrice
+                                    } else if (d2 <= 64f) {
+                                        hitId = selTLine.id
+                                        hitMode = "END"
+                                        initialEndIdx = selTLine.endCandleIndex
+                                        initialEndPrice = selTLine.endPrice
+                                    } else if (dMid <= 48f || dBody <= 44f) {
+                                        hitId = selTLine.id
+                                        hitMode = "TRENDLINE_BODY"
+                                        initialStartIdx = selTLine.startCandleIndex
+                                        initialEndIdx = selTLine.endCandleIndex
+                                        initialStartPrice = selTLine.startPrice
+                                        initialEndPrice = selTLine.endPrice
+                                    }
+                                }
+
+                                if (hitId == null) {
+                                    // Check all other trendlines
                                     for (tLine in trendlines) {
                                         val x1 = (tLine.startCandleIndex + 0.5f) * slotWidth
                                         val y1 = h * (1f - ((tLine.startPrice - minEquity) / equityRange).toFloat())
                                         val x2 = (tLine.endCandleIndex + 0.5f) * slotWidth
                                         val y2 = h * (1f - ((tLine.endPrice - minEquity) / equityRange).toFloat())
+                                        val d1 = kotlin.math.hypot(touchStart.x - x1, touchStart.y - y1)
+                                        val d2 = kotlin.math.hypot(touchStart.x - x2, touchStart.y - y2)
+                                        val dSeg = distanceToSegment(touchStart.x, touchStart.y, x1, y1, x2, y2)
 
-                                        val d1 = kotlin.math.hypot(touchOffset.x - x1, touchOffset.y - y1)
-                                        val d2 = kotlin.math.hypot(touchOffset.x - x2, touchOffset.y - y2)
-
-                                        if (d1 < 60f) {
-                                            activeDragId = tLine.id
-                                            activeDragMode = "START"
-                                            touchStartPos = touchOffset
+                                        if (d1 <= 54f) {
+                                            hitId = tLine.id
+                                            hitMode = "START"
                                             initialStartIdx = tLine.startCandleIndex
                                             initialStartPrice = tLine.startPrice
-                                            onSelectObject?.invoke(tLine.id)
-                                            return@detectDragGestures
-                                        } else if (d2 < 60f) {
-                                            activeDragId = tLine.id
-                                            activeDragMode = "END"
-                                            touchStartPos = touchOffset
+                                            break
+                                        } else if (d2 <= 54f) {
+                                            hitId = tLine.id
+                                            hitMode = "END"
                                             initialEndIdx = tLine.endCandleIndex
                                             initialEndPrice = tLine.endPrice
-                                            onSelectObject?.invoke(tLine.id)
-                                            return@detectDragGestures
+                                            break
+                                        } else if (dSeg <= 44f) {
+                                            hitId = tLine.id
+                                            hitMode = "TRENDLINE_BODY"
+                                            initialStartIdx = tLine.startCandleIndex
+                                            initialEndIdx = tLine.endCandleIndex
+                                            initialStartPrice = tLine.startPrice
+                                            initialEndPrice = tLine.endPrice
+                                            break
+                                        }
+                                    }
+                                }
+
+                                if (hitId == null) {
+                                    // Check horizontal lines (selected first or closest)
+                                    val selHLine = horizontalLines.find { it.id == selectedObjectId }
+                                    if (selHLine != null) {
+                                        val yLine = h * (1f - ((selHLine.price - minEquity) / equityRange).toFloat())
+                                        if (kotlin.math.abs(touchStart.y - yLine) <= 48f) {
+                                            hitId = selHLine.id
+                                            hitMode = "HORIZONTAL"
+                                            initialHLinePrice = selHLine.price
+                                        }
+                                    }
+                                    if (hitId == null) {
+                                        for (hLine in horizontalLines) {
+                                            val yLine = h * (1f - ((hLine.price - minEquity) / equityRange).toFloat())
+                                            if (kotlin.math.abs(touchStart.y - yLine) <= 44f) {
+                                                hitId = hLine.id
+                                                hitMode = "HORIZONTAL"
+                                                initialHLinePrice = hLine.price
+                                                break
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // If a line or control handle was touched:
+                                if (hitId != null && hitMode != null) {
+                                    // Immediate selection on touch down without lag
+                                    onSelectObject?.invoke(hitId)
+                                    down.consume()
+
+                                    while (true) {
+                                        val event = awaitPointerEvent(PointerEventPass.Main)
+                                        val pointer = event.changes.find { it.id == down.id } ?: event.changes.firstOrNull()
+                                        if (pointer == null || !pointer.pressed) {
+                                            // Finger released or cancelled -> State already saved automatically
+                                            break
+                                        }
+
+                                        val currentPos = pointer.position
+                                        pointer.consume()
+
+                                        val totalDx = currentPos.x - touchStart.x
+                                        val totalDy = currentPos.y - touchStart.y
+
+                                        val idxShift = totalDx / slotWidth
+                                        val priceShift = -(totalDy / h) * equityRange
+
+                                        if (hitMode == "HORIZONTAL") {
+                                            val line = horizontalLines.find { it.id == hitId }
+                                            if (line != null && onUpdateHorizontalLine != null) {
+                                                val newPrice = (initialHLinePrice + priceShift).coerceIn(minEquity, maxEquity)
+                                                onUpdateHorizontalLine(line.copy(price = newPrice))
+                                            }
                                         } else {
-                                            val dSeg = distanceToSegment(touchOffset.x, touchOffset.y, x1, y1, x2, y2)
-                                            if (dSeg < 44f) {
-                                                activeDragId = tLine.id
-                                                activeDragMode = "TRENDLINE_BODY"
-                                                touchStartPos = touchOffset
-                                                initialStartIdx = tLine.startCandleIndex
-                                                initialEndIdx = tLine.endCandleIndex
-                                                initialStartPrice = tLine.startPrice
-                                                initialEndPrice = tLine.endPrice
-                                                onSelectObject?.invoke(tLine.id)
-                                                return@detectDragGestures
-                                            }
-                                        }
-                                    }
+                                            val tLine = trendlines.find { it.id == hitId }
+                                            if (tLine != null && onUpdateTrendline != null) {
+                                                when (hitMode) {
+                                                    "START" -> {
+                                                        val newStartIdx = (initialStartIdx + idxShift).coerceIn(0f, (count - 1).toFloat())
+                                                        val newStartPrice = (initialStartPrice + priceShift).coerceIn(minEquity, maxEquity)
+                                                        onUpdateTrendline(tLine.copy(startCandleIndex = newStartIdx, startPrice = newStartPrice))
+                                                    }
+                                                    "END" -> {
+                                                        val newEndIdx = (initialEndIdx + idxShift).coerceIn(0f, (count - 1).toFloat())
+                                                        val newEndPrice = (initialEndPrice + priceShift).coerceIn(minEquity, maxEquity)
+                                                        onUpdateTrendline(tLine.copy(endCandleIndex = newEndIdx, endPrice = newEndPrice))
+                                                    }
+                                                    "TRENDLINE_BODY" -> {
+                                                        val newStartIdx = (initialStartIdx + idxShift).coerceIn(0f, (count - 1).toFloat())
+                                                        val newEndIdx = (initialEndIdx + idxShift).coerceIn(0f, (count - 1).toFloat())
+                                                        val newStartPrice = (initialStartPrice + priceShift).coerceIn(minEquity, maxEquity)
+                                                        val newEndPrice = (initialEndPrice + priceShift).coerceIn(minEquity, maxEquity)
 
-                                    for (hLine in horizontalLines) {
-                                        val yLine = h * (1f - ((hLine.price - minEquity) / equityRange).toFloat())
-                                        if (kotlin.math.abs(touchOffset.y - yLine) < 48f) {
-                                            activeDragId = hLine.id
-                                            activeDragMode = "HORIZONTAL"
-                                            touchStartPos = touchOffset
-                                            initialHLinePrice = hLine.price
-                                            onSelectObject?.invoke(hLine.id)
-                                            return@detectDragGestures
-                                        }
-                                    }
-                                },
-                                onDrag = { change, _ ->
-                                    val dragId = activeDragId ?: return@detectDragGestures
-                                    change.consume()
-
-                                    val w = size.width.toFloat()
-                                    val h = size.height.toFloat()
-                                    val count = candles.size.coerceAtLeast(1)
-                                    val rightMargin = 112f
-                                    val chartWidth = (w - rightMargin).coerceAtLeast(50f)
-                                    val slotWidth = chartWidth / count
-
-                                    val currentPos = change.position
-                                    val startPos = touchStartPos ?: currentPos
-
-                                    val totalDx = currentPos.x - startPos.x
-                                    val totalDy = currentPos.y - startPos.y
-
-                                    val idxShift = totalDx / slotWidth
-                                    val priceShift = -(totalDy / h) * equityRange
-
-                                    if (activeDragMode == "HORIZONTAL") {
-                                        val line = horizontalLines.find { it.id == dragId }
-                                        if (line != null && onUpdateHorizontalLine != null) {
-                                            val newPrice = (initialHLinePrice + priceShift).coerceIn(minEquity, maxEquity)
-                                            onUpdateHorizontalLine(line.copy(price = newPrice))
-                                        }
-                                    } else {
-                                        val tLine = trendlines.find { it.id == dragId }
-                                        if (tLine != null && onUpdateTrendline != null) {
-                                            when (activeDragMode) {
-                                                "START" -> {
-                                                    val newStartIdx = (initialStartIdx + idxShift).coerceIn(0f, (count - 1).toFloat())
-                                                    val newStartPrice = (initialStartPrice + priceShift).coerceIn(minEquity, maxEquity)
-                                                    onUpdateTrendline(tLine.copy(startCandleIndex = newStartIdx, startPrice = newStartPrice))
-                                                }
-                                                "END" -> {
-                                                    val newEndIdx = (initialEndIdx + idxShift).coerceIn(0f, (count - 1).toFloat())
-                                                    val newEndPrice = (initialEndPrice + priceShift).coerceIn(minEquity, maxEquity)
-                                                    onUpdateTrendline(tLine.copy(endCandleIndex = newEndIdx, endPrice = newEndPrice))
-                                                }
-                                                "TRENDLINE_BODY" -> {
-                                                    val newStartIdx = (initialStartIdx + idxShift).coerceIn(0f, (count - 1).toFloat())
-                                                    val newEndIdx = (initialEndIdx + idxShift).coerceIn(0f, (count - 1).toFloat())
-                                                    val newStartPrice = (initialStartPrice + priceShift).coerceIn(minEquity, maxEquity)
-                                                    val newEndPrice = (initialEndPrice + priceShift).coerceIn(minEquity, maxEquity)
-
-                                                    onUpdateTrendline(tLine.copy(
-                                                        startCandleIndex = newStartIdx,
-                                                        startPrice = newStartPrice,
-                                                        endCandleIndex = newEndIdx,
-                                                        endPrice = newEndPrice
-                                                    ))
+                                                        onUpdateTrendline(tLine.copy(
+                                                            startCandleIndex = newStartIdx,
+                                                            startPrice = newStartPrice,
+                                                            endCandleIndex = newEndIdx,
+                                                            endPrice = newEndPrice
+                                                        ))
+                                                    }
                                                 }
                                             }
                                         }
                                     }
-                                },
-                                onDragEnd = {
-                                    activeDragId = null
-                                    activeDragMode = null
-                                    touchStartPos = null
-                                },
-                                onDragCancel = {
-                                    activeDragId = null
-                                    activeDragMode = null
-                                    touchStartPos = null
-                                }
-                            )
-                        }
-                        .pointerInput(candles, zoomLevelX, zoomLevelY, activeToolMode, horizontalLines, trendlines) {
-                            detectTapGestures { offset ->
-                                val w = size.width
-                                val h = size.height
-                                val count = candles.size
-                                val rightMargin = 112f
-                                val chartWidth = (w - rightMargin).coerceAtLeast(50f)
-                                val slotWidth = chartWidth / count
-                                val clickedIndex = (offset.x / slotWidth).coerceIn(0f, (count - 1).toFloat())
-                                val clickedPrice = maxEquity - (offset.y / h) * equityRange
-
-                                val tappedHLine = horizontalLines.find { line ->
-                                    val yLine = h * (1f - ((line.price - minEquity) / equityRange).toFloat())
-                                    kotlin.math.abs(offset.y - yLine) < 36f
-                                }
-
-                                val tappedTLine = trendlines.find { tLine ->
-                                    val x1 = (tLine.startCandleIndex + 0.5f) * slotWidth
-                                    val y1 = h * (1f - ((tLine.startPrice - minEquity) / equityRange).toFloat())
-                                    val x2 = (tLine.endCandleIndex + 0.5f) * slotWidth
-                                    val y2 = h * (1f - ((tLine.endPrice - minEquity) / equityRange).toFloat())
-                                    val dSeg = distanceToSegment(offset.x, offset.y, x1, y1, x2, y2)
-                                    dSeg < 36f || kotlin.math.hypot(offset.x - x1, offset.y - y1) < 48f || kotlin.math.hypot(offset.x - x2, offset.y - y2) < 48f
-                                }
-
-                                if (tappedHLine != null) {
-                                    onSelectObject?.invoke(tappedHLine.id)
-                                } else if (tappedTLine != null) {
-                                    onSelectObject?.invoke(tappedTLine.id)
-                                } else if (activeToolMode == "HORIZONTAL" && onAddHorizontalLine != null) {
-                                    onAddHorizontalLine(clickedPrice)
-                                } else if (activeToolMode == "TRENDLINE" && onAddTrendlinePoint != null) {
-                                    onAddTrendlinePoint(clickedIndex, clickedPrice)
                                 } else {
-                                    onSelectObject?.invoke(null)
-                                    val candleIdx = clickedIndex.toInt().coerceIn(0, candles.size - 1)
-                                    if (candleIdx in candles.indices) {
-                                        onCandleSelect(candles[candleIdx])
+                                    // Touch on chart background / candles / pinch-zoom
+                                    var hasMoved = false
+                                    var lastPos = touchStart
+
+                                    while (true) {
+                                        val event = awaitPointerEvent(PointerEventPass.Main)
+                                        if (event.changes.size > 1 && onZoomChange != null) {
+                                            // Multi-touch pinch zoom
+                                            val p1 = event.changes[0]
+                                            val p2 = event.changes[1]
+                                            val currentDist = (p1.position - p2.position).getDistance()
+                                            val prevDist = (p1.previousPosition - p2.previousPosition).getDistance()
+                                            if (prevDist > 0f) {
+                                                val zoomFactor = (currentDist / prevDist).coerceIn(0.85f, 1.15f)
+                                                val newX = (zoomLevelX * zoomFactor).coerceIn(0.5f, 5.0f)
+                                                val newY = (zoomLevelY * zoomFactor).coerceIn(0.5f, 5.0f)
+                                                onZoomChange(newX, newY)
+                                                p1.consume()
+                                                p2.consume()
+                                                hasMoved = true
+                                            }
+                                        } else {
+                                            val pointer = event.changes.find { it.id == down.id } ?: event.changes.firstOrNull()
+                                            if (pointer == null || !pointer.pressed) {
+                                                break
+                                            }
+
+                                            val currentPos = pointer.position
+                                            val dx = currentPos.x - lastPos.x
+                                            val dy = currentPos.y - lastPos.y
+
+                                            if (kotlin.math.abs(currentPos.x - touchStart.x) > 10f || kotlin.math.abs(currentPos.y - touchStart.y) > 10f) {
+                                                hasMoved = true
+                                                if (zoomLevelX > 1.0f || zoomLevelY > 1.0f || isLandscapeMode) {
+                                                    pointer.consume()
+                                                    val scrollDeltaX = if (isLandscapeMode) dy else -dx
+                                                    val scrollDeltaY = if (isLandscapeMode) -dx else -dy
+                                                    scrollStateX.dispatchRawDelta(scrollDeltaX)
+                                                    scrollStateY.dispatchRawDelta(scrollDeltaY)
+                                                }
+                                            }
+                                            lastPos = currentPos
+                                        }
+                                    }
+
+                                    if (!hasMoved) {
+                                        // Tap on background or candle
+                                        val clickedIndex = (touchStart.x / slotWidth).coerceIn(0f, (count - 1).toFloat())
+                                        val clickedPrice = maxEquity - (touchStart.y / h) * equityRange
+
+                                        if (activeToolMode == "HORIZONTAL" && onAddHorizontalLine != null) {
+                                            onAddHorizontalLine(clickedPrice)
+                                        } else if (activeToolMode == "TRENDLINE" && onAddTrendlinePoint != null) {
+                                            onAddTrendlinePoint(clickedIndex, clickedPrice)
+                                        } else {
+                                            // Deselect any line and select tapped candle
+                                            onSelectObject?.invoke(null)
+                                            val candleIdx = clickedIndex.toInt().coerceIn(0, candles.size - 1)
+                                            if (candleIdx in candles.indices) {
+                                                onCandleSelect(candles[candleIdx])
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -13569,7 +17318,7 @@ fun FinancialCandlestickCanvas(
                     val h = size.height
                     val count = candles.size
                     
-                    val rightMargin = 112f
+                    val rightMargin = 120f
                     val chartWidth = (w - rightMargin).coerceAtLeast(50f)
                     val slotWidth = chartWidth / count
                     val candleBodyWidth = (slotWidth * 0.55f).coerceIn(6f, 36f)
@@ -13653,35 +17402,78 @@ fun FinancialCandlestickCanvas(
                         }
                     }
 
-                    // 1. Horizontal Lines (Analysis Tool)
+                    // 1. Horizontal Lines (Analysis Tool) with Real-Time Draggable Price & Accompanying Price Label
                     horizontalLines.forEach { line ->
                         val yLine = h * (1f - ((line.price - minEquity) / equityRange).toFloat())
                         if (yLine in 0f..h) {
                             val isObjSelected = line.id == selectedObjectId
-                            val lineDashEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(10f, 6f), 0f)
+                            val lineDashEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(12f, 6f), 0f)
 
                             if (isObjSelected) {
+                                // Outer Glow line
                                 drawLine(
-                                    color = Color(0xFFF59E0B),
+                                    color = line.color.copy(alpha = 0.35f),
                                     start = androidx.compose.ui.geometry.Offset(0f, yLine),
                                     end = androidx.compose.ui.geometry.Offset(w, yLine),
-                                    strokeWidth = 6f
+                                    strokeWidth = 9f
                                 )
-                                drawCircle(color = Color(0xFFF59E0B), radius = 8f, center = androidx.compose.ui.geometry.Offset(16f, yLine))
-                                drawCircle(color = Color.White, radius = 5f, center = androidx.compose.ui.geometry.Offset(16f, yLine))
+                                // Left Grab Handle
+                                drawCircle(color = line.color, radius = 10f, center = androidx.compose.ui.geometry.Offset(18f, yLine))
+                                drawCircle(color = Color.White, radius = 6f, center = androidx.compose.ui.geometry.Offset(18f, yLine))
                             }
 
+                            // Main Horizontal Line
                             drawLine(
-                                color = if (isObjSelected) Color(0xFFFBBF24) else line.color,
+                                color = if (isObjSelected) line.color else line.color.copy(alpha = 0.85f),
                                 start = androidx.compose.ui.geometry.Offset(0f, yLine),
                                 end = androidx.compose.ui.geometry.Offset(w, yLine),
                                 pathEffect = if (isObjSelected) null else lineDashEffect,
-                                strokeWidth = if (isObjSelected) 3.5f else 2.5f
+                                strokeWidth = if (isObjSelected) 4f else 2.5f
                             )
+
+                            // Accompanying Price Badge on the Right Edge
+                            val priceText = formatChartPriceValue(line.price, currencySymbol)
+                            val badgeWidth = 108f
+                            val badgeHeight = 24f
+                            val badgeLeft = (w - badgeWidth).coerceAtLeast(0f)
+                            val badgeTop = (yLine - (badgeHeight / 2f)).coerceIn(0f, h - badgeHeight)
+
+                            // Badge Background
+                            drawRoundRect(
+                                color = Color(0xFF020617),
+                                topLeft = androidx.compose.ui.geometry.Offset(badgeLeft, badgeTop),
+                                size = androidx.compose.ui.geometry.Size(badgeWidth, badgeHeight),
+                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(6f, 6f)
+                            )
+                            // Badge Border
+                            drawRoundRect(
+                                color = if (isObjSelected) line.color else line.color.copy(alpha = 0.8f),
+                                topLeft = androidx.compose.ui.geometry.Offset(badgeLeft, badgeTop),
+                                size = androidx.compose.ui.geometry.Size(badgeWidth, badgeHeight),
+                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(6f, 6f),
+                                style = androidx.compose.ui.graphics.drawscope.Stroke(width = if (isObjSelected) 2f else 1.2f)
+                            )
+
+                            // Badge Text
+                            drawContext.canvas.nativeCanvas.apply {
+                                val paint = android.graphics.Paint().apply {
+                                    color = if (isObjSelected) android.graphics.Color.WHITE else android.graphics.Color.parseColor("#38BDF8")
+                                    textSize = 21f
+                                    isFakeBoldText = true
+                                    textAlign = android.graphics.Paint.Align.CENTER
+                                    isAntiAlias = true
+                                }
+                                drawText(
+                                    priceText,
+                                    badgeLeft + (badgeWidth / 2f),
+                                    badgeTop + (badgeHeight / 2f) + 6.5f,
+                                    paint
+                                )
+                            }
                         }
                     }
 
-                    // 2. Trendlines (Analysis Tool)
+                    // 2. Trendlines (Analysis Tool) with Endpoints and Body Handles
                     trendlines.forEach { tLine ->
                         val x1 = (tLine.startCandleIndex + 0.5f) * slotWidth
                         val y1 = h * (1f - ((tLine.startPrice - minEquity) / equityRange).toFloat())
@@ -13691,29 +17483,47 @@ fun FinancialCandlestickCanvas(
                         val isObjSelected = tLine.id == selectedObjectId
 
                         if (isObjSelected) {
+                            // Outer Glow Line
                             drawLine(
-                                color = Color(0xFFF59E0B),
+                                color = tLine.color.copy(alpha = 0.35f),
                                 start = androidx.compose.ui.geometry.Offset(x1, y1),
                                 end = androidx.compose.ui.geometry.Offset(x2, y2),
-                                strokeWidth = 8f
+                                strokeWidth = 10f
                             )
-                            drawCircle(color = Color(0xFFF59E0B), radius = 10f, center = androidx.compose.ui.geometry.Offset(x1, y1))
-                            drawCircle(color = Color.White, radius = 6f, center = androidx.compose.ui.geometry.Offset(x1, y1))
-                            drawCircle(color = Color(0xFFF59E0B), radius = 10f, center = androidx.compose.ui.geometry.Offset(x2, y2))
-                            drawCircle(color = Color.White, radius = 6f, center = androidx.compose.ui.geometry.Offset(x2, y2))
                         }
 
+                        // Main Trendline
                         drawLine(
-                            color = if (isObjSelected) Color(0xFFFBBF24) else tLine.color,
+                            color = if (isObjSelected) tLine.color else tLine.color.copy(alpha = 0.9f),
                             start = androidx.compose.ui.geometry.Offset(x1, y1),
                             end = androidx.compose.ui.geometry.Offset(x2, y2),
-                            strokeWidth = if (isObjSelected) 4.5f else 3.5f
+                            strokeWidth = if (isObjSelected) 4.5f else 3f
                         )
-                        drawCircle(color = if (isObjSelected) Color(0xFFFBBF24) else tLine.color, radius = 6f, center = androidx.compose.ui.geometry.Offset(x1, y1))
-                        drawCircle(color = if (isObjSelected) Color(0xFFFBBF24) else tLine.color, radius = 6f, center = androidx.compose.ui.geometry.Offset(x2, y2))
+
+                        if (isObjSelected) {
+                            // Start Endpoint Handle (Adjusts Inclination)
+                            drawCircle(color = tLine.color.copy(alpha = 0.4f), radius = 16f, center = androidx.compose.ui.geometry.Offset(x1, y1))
+                            drawCircle(color = tLine.color, radius = 10f, center = androidx.compose.ui.geometry.Offset(x1, y1))
+                            drawCircle(color = Color.White, radius = 5.5f, center = androidx.compose.ui.geometry.Offset(x1, y1))
+
+                            // End Endpoint Handle (Adjusts Inclination)
+                            drawCircle(color = tLine.color.copy(alpha = 0.4f), radius = 16f, center = androidx.compose.ui.geometry.Offset(x2, y2))
+                            drawCircle(color = tLine.color, radius = 10f, center = androidx.compose.ui.geometry.Offset(x2, y2))
+                            drawCircle(color = Color.White, radius = 5.5f, center = androidx.compose.ui.geometry.Offset(x2, y2))
+
+                            // Midpoint Handle (Move entire line without changing inclination)
+                            val midX = (x1 + x2) / 2f
+                            val midY = (y1 + y2) / 2f
+                            drawCircle(color = tLine.color, radius = 8f, center = androidx.compose.ui.geometry.Offset(midX, midY))
+                            drawCircle(color = Color.Black, radius = 4f, center = androidx.compose.ui.geometry.Offset(midX, midY))
+                        } else {
+                            // Subtle endpoints when unselected
+                            drawCircle(color = tLine.color, radius = 5.5f, center = androidx.compose.ui.geometry.Offset(x1, y1))
+                            drawCircle(color = tLine.color, radius = 5.5f, center = androidx.compose.ui.geometry.Offset(x2, y2))
+                        }
                     }
 
-                    // Current Price / Equity Horizontal Line
+                    // Current Price / Equity Horizontal Reference Line
                     val lastCandle = candles.lastOrNull()
                     if (lastCandle != null) {
                         val currentPrice = lastCandle.closeBalance * cambio
@@ -13764,6 +17574,80 @@ fun FinancialCandlestickCanvas(
                                 badgeTop + (badgeHeight / 2f) + 6f,
                                 paint
                             )
+                        }
+                    }
+                }
+            }
+        }
+
+        if (isTrial) {
+            Surface(
+                color = Color(0xFF0F172A).copy(alpha = 0.92f),
+                shape = RoundedCornerShape(18.dp),
+                border = BorderStroke(1.5.dp, Brush.horizontalGradient(listOf(Color(0xFFF59E0B), Color(0xFF38BDF8)))),
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .fillMaxWidth(0.92f)
+                    .padding(16.dp)
+            ) {
+                Column(
+                    modifier = Modifier.padding(20.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(46.dp)
+                            .background(Color(0xFFF59E0B).copy(alpha = 0.2f), CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Lock,
+                            contentDescription = "Gráficos Bloqueados",
+                            tint = Color(0xFFF59E0B),
+                            modifier = Modifier.size(26.dp)
+                        )
+                    }
+
+                    Text(
+                        text = "GRÁFICO BLOQUEADO NO PLANO TRIAL",
+                        style = MaterialTheme.typography.titleSmall.copy(
+                            color = Color(0xFFF59E0B),
+                            fontWeight = FontWeight.Black,
+                            letterSpacing = 1.sp
+                        ),
+                        textAlign = TextAlign.Center
+                    )
+
+                    Text(
+                        text = "O gráfico financeiro ao vivo de velas (M15/H1), linhas de tendência dinâmicas e níveis de equador estão disponíveis para usuários a partir do Plano Starter.",
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            color = Color(0xFFCBD5E1),
+                            lineHeight = 18.sp
+                        ),
+                        textAlign = TextAlign.Center
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterHorizontally)
+                    ) {
+                        listOf("Lote Ilimitado", "Pro: Templates", "Master: Sala VIP 👑").forEach { tag ->
+                            Surface(
+                                color = Color(0xFF1E293B),
+                                shape = RoundedCornerShape(6.dp),
+                                border = BorderStroke(0.5.dp, Color(0xFF38BDF8).copy(alpha = 0.4f))
+                            ) {
+                                Text(
+                                    text = tag,
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        color = Color(0xFF38BDF8),
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Bold
+                                    ),
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)
+                                )
+                            }
                         }
                     }
                 }

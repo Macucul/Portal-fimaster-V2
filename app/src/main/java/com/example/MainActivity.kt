@@ -54,8 +54,16 @@ class MainActivity : ComponentActivity() {
         }
 
         // Initialize Database and Repository
+        com.example.data.NotificationStateManager.initIfNeeded(this)
+        handleIntentGid(intent)
         val database = AppDatabase.getDatabase(this)
-        val repository = PortalRepository(database.userProfileDao(), database.refundRequestDao(), database.eaConfigDao())
+        val repository = PortalRepository(
+            database.userProfileDao(),
+            database.refundRequestDao(),
+            database.eaConfigDao(),
+            database.eaRobotEventDao(),
+            database.syncMetadataDao()
+        )
 
         // Create ViewModel using Factory
         val factory = PortalViewModelFactory(application, repository)
@@ -65,6 +73,19 @@ class MainActivity : ComponentActivity() {
             MyApplicationTheme {
                 PortalApp(viewModel = viewModel)
             }
+        }
+    }
+
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIntentGid(intent)
+    }
+
+    private fun handleIntentGid(intent: android.content.Intent?) {
+        val eventGid = intent?.getStringExtra("EVENT_GID")
+        if (!eventGid.isNullOrBlank()) {
+            com.example.data.NotificationStateManager.setFocusedEventGid(eventGid)
         }
     }
 }
