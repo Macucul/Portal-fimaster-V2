@@ -1,0 +1,21 @@
+# replacements.txt for git-filter-repo
+# Use with: git filter-repo --replace-text replacements.txt
+
+# Specific GitHub PAT found in repository
+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==>REDACTED_GITHUB_PAT
+
+# Generic GitHub PAT pattern (tokens starting with ghp_)
+regex:ghp_[A-Za-z0-9_\-]+==>REDACTED_GITHUB_PAT
+
+# Google API key pattern (AIza...)
+regex:AIza[0-9A-Za-z_\-]+==>REDACTED_GOOGLE_API_KEY
+
+# AWS Access Key ID (AKIA...)
+regex:AKIA[0-9A-Z]{16}==>REDACTED_AWS_ACCESS_KEY
+
+# Generic private key block (multi-line) - try to remove full PEM blocks
+# Note: This regex attempts to match BEGIN/END PRIVATE KEY blocks across lines.
+regex:-----BEGIN (?:RSA )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA )?PRIVATE KEY-----==>REDACTED_PRIVATE_KEY
+
+# Generic generic token-like strings (put additional patterns as needed)
+# regex:[A-Za-z0-9-_]{40,}==>REDACTED_POTENTIAL_SECRET
