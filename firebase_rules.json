@@ -1,38 +1,69 @@
 {
   "rules": {
     "dados": {
-      "usuarios": {
-        ".read": "true",
-        "$userId": {
-          ".read": "true",
-          ".write": "true"
+      "indice": {
+        "licenca": {
+          ".read": true,
+          ".write": "auth != null && auth.token.admin === true"
         }
       },
       "indices": {
-        ".read": "true",
-        ".write": "true"
+        "licenca": {
+          ".read": true,
+          ".write": "auth != null && auth.token.admin === true"
+        },
+        "instrucoes_admin_templates": {
+          ".read": "auth != null",
+          ".write": "auth != null && auth.token.admin === true"
+        }
       },
       "parametros": {
-        ".read": "true",
-        "$mt5Id": {
-          ".write": "true"
+        "$mt5AccountId": {
+          ".read": "auth != null",
+          ".write": "auth != null"
+        }
+      },
+      "config": {
+        "$mt5AccountId": {
+          ".read": "auth != null",
+          ".write": "auth != null"
         }
       },
       "status": {
-        ".read": "true",
-        "$mt5Id": {
-          ".write": "true"
+        "$mt5AccountId": {
+          ".read": "auth != null",
+          ".write": "auth != null"
         }
       },
       "eventos": {
-        ".read": "true",
-        "$mt5Id": {
-          ".write": "true"
+        "$mt5AccountId": {
+          ".read": "auth != null",
+          ".write": "auth != null",
+          "capturar_tela": {
+            ".read": "auth != null",
+            ".write": "auth != null"
+          },
+          "captura_tela": {
+            ".read": "auth != null",
+            ".write": "auth != null"
+          },
+          "notificacao_mql5": {
+            ".read": "auth != null",
+            ".write": "auth != null"
+          }
+        },
+        "historico_patrimonio": {
+          "$mt5AccountId": {
+            ".read": "auth != null",
+            ".write": "auth != null"
+          }
         }
       },
-      "versao": {
-        ".read": "true",
-        ".write": "true"
+      "usuarios": {
+        "$userId": {
+          ".read": "auth != null && (auth.uid == $userId || auth.token.admin === true)",
+          ".write": "auth != null && (auth.uid == $userId || auth.token.admin === true)"
+        }
       }
     }
   }
