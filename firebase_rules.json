@@ -2,37 +2,24 @@
   "rules": {
     "dados": {
       "usuarios": {
-        ".read": "true",
         "$userId": {
-          ".read": "true",
-          ".write": "true"
+          ".read": "auth != null && (auth.uid == $userId || auth.token.admin == true)",
+          ".write": "auth != null && (auth.uid == $userId || auth.token.admin == true)"
         }
       },
       "indices": {
-        ".read": "true",
-        ".write": "true"
+        ".read": "auth != null",
+        ".write": "auth != null && auth.token.admin == true"
       },
       "parametros": {
-        ".read": "true",
         "$mt5Id": {
-          ".write": "true"
-        }
-      },
-      "status": {
-        ".read": "true",
-        "$mt5Id": {
-          ".write": "true"
-        }
-      },
-      "eventos": {
-        ".read": "true",
-        "$mt5Id": {
-          ".write": "true"
+          ".read": "auth != null && (auth.token.admin == true || root.child('dados/indices/mt5/' + $mt5Id + '/allowRead').val() == true)",
+          ".write": "auth != null && auth.token.admin == true"
         }
       },
       "versao": {
-        ".read": "true",
-        ".write": "true"
+        ".read": "auth != null",
+        ".write": "auth != null && auth.token.admin == true"
       }
     }
   }
