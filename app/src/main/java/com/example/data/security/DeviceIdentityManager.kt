@@ -5,6 +5,7 @@ import android.provider.Settings
 import com.example.data.GithubUser
 import com.google.firebase.auth.FirebaseAuth
 import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withTimeoutOrNull
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -64,8 +65,10 @@ class DeviceIdentityManager(private val context: Context) {
             val firebaseUid = if (currentUser != null) {
                 currentUser.uid
             } else {
-                val authResult = auth.signInAnonymously().await()
-                authResult.user?.uid ?: deviceUid
+                val authResult = withTimeoutOrNull(2000L) {
+                    auth.signInAnonymously().await()
+                }
+                authResult?.user?.uid ?: deviceUid
             }
 
             prefs.edit()

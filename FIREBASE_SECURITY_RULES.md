@@ -18,9 +18,8 @@ Este documento detalha todos os nós do **Firebase Realtime Database** acessados
 | `/dados/eventos/historico_patrimonio/{mt5AccountId}` | Histórico de evolução patrimonial/equity da conta | App Android |
 | `/dados/usuarios/{userId}/eventos` | Eventos do robô associados à conta do usuário | App Android |
 | `/dados/parametros/{mt5AccountId}` | Parâmetros e configurações operacionais ativas no MT5 | App Android & EA MQL5 |
-| `/dados/config/{mt5AccountId}` | Configurações gerais e parâmetros de trading | App Android & EA MQL5 |
 | `/dados/usuarios/{userId}/config` | Configurações personalizadas salvas pelo usuário | App Android |
-| `/dados/indice/licenca` | Configurações globais de licenças, preços, links de pagamento, WhatsApp e Telegram | App Android |
+| `/dados/indices/licenca` | Configurações globais de licenças, preços, links de pagamento, WhatsApp e Telegram | App Android |
 | `/dados/indices/instrucoes_admin_templates` | Templates e estratégias predefinidas criadas pelo administrador | App Android |
 
 ---
@@ -30,12 +29,11 @@ Este documento detalha todos os nós do **Firebase Realtime Database** acessados
 | Caminho do Nó (Firebase Path) | Descrição / Finalidade | Quem Escreve |
 | :--- | :--- | :--- |
 | `/dados/parametros/{mt5AccountId}` | Envio de novos parâmetros operacionais (Lote, SL/TP, Trailing, Horários) | App Android / Admin |
-| `/dados/config/{mt5AccountId}` | Sincronização de configurações para o EA no MT5 | App Android |
 | `/dados/usuarios/{userId}/config` | Atualização das preferências de configuração do usuário | App Android |
 | `/dados/eventos/{mt5AccountId}/capturar_tela` | Sinal de comando remoto para solicitar screenshot do gráfico no MT5 | App Android |
 | `/dados/status/{mt5AccountId}` | Telemetria contínua, status da conta e saldo | EA MQL5 (Metatrader) |
 | `/dados/eventos/{mt5AccountId}/*` | Disparo de eventos de ordens, erros e relatórios | EA MQL5 (Metatrader) |
-| `/dados/indice/licenca` | Atualização de planos, preços, WhatsApp, Telegram e QR Code | Painel Admin |
+| `/dados/indices/licenca` | Atualização de planos, preços, WhatsApp, Telegram e QR Code | Painel Admin |
 | `/dados/indices/instrucoes_admin_templates` | Publicação de novos templates de estratégia | Painel Admin |
 
 ---
@@ -45,7 +43,6 @@ Este documento detalha todos os nós do **Firebase Realtime Database** acessados
 | Caminho do Nó | Finalidade |
 | :--- | :--- |
 | `/dados/parametros/{oldMt5Id}` | Limpeza de conta MT5 antiga ao desvincular ou trocar de conta |
-| `/dados/config/{oldMt5Id}` | Remoção de configurações antigas |
 | `/dados/status/{oldMt5Id}` | Limpeza de status de conta desvinculada |
 | `/dados/eventos/{oldMt5Id}` | Limpeza de eventos da conta anterior |
 
@@ -59,13 +56,7 @@ Abaixo está o arquivo de regras do **Firebase Realtime Database** configurado p
 {
   "rules": {
     "dados": {
-      // 1. Licenças e Templates: Qualquer usuário autenticado (ou público) pode consultar
-      "indice": {
-        "licenca": {
-          ".read": true,
-          ".write": "auth != null && auth.token.admin === true"
-        }
-      },
+      // 1. Licenças, Templates e Índices:
       "indices": {
         "licenca": {
           ".read": true,
@@ -74,18 +65,19 @@ Abaixo está o arquivo de regras do **Firebase Realtime Database** configurado p
         "instrucoes_admin_templates": {
           ".read": "auth != null",
           ".write": "auth != null && auth.token.admin === true"
-        }
-      },
-
-      // 2. Parâmetros e Configurações por Conta MT5
-      "parametros": {
-        "$mt5AccountId": {
-          // Permite leitura/escrita se autenticado ou pelo próprio UID/EA
+        },
+        "telefones": {
+          ".read": "auth != null",
+          ".write": "auth != null"
+        },
+        "mt5": {
           ".read": "auth != null",
           ".write": "auth != null"
         }
       },
-      "config": {
+
+      // 2. Parâmetros Operacionais por Conta MT5
+      "parametros": {
         "$mt5AccountId": {
           ".read": "auth != null",
           ".write": "auth != null"
@@ -108,6 +100,14 @@ Abaixo está o arquivo de regras do **Firebase Realtime Database** configurado p
           "capturar_tela": {
             ".read": "auth != null",
             ".write": "auth != null"
+          },
+          "captura_tela": {
+            ".read": "auth != null",
+            ".write": "auth != null"
+          },
+          "notificacao_mql5": {
+            ".read": "auth != null",
+            ".write": "auth != null"
           }
         },
         "historico_patrimonio": {
@@ -118,10 +118,9 @@ Abaixo está o arquivo de regras do **Firebase Realtime Database** configurado p
         }
       },
 
-      // 5. Dados Privados Isolados por Usuário (UID do Dispositivo / Auth)
+      // 5. Dados Privados Isolados por Usuário
       "usuarios": {
         "$userId": {
-          // Apenas o próprio usuário autenticado pode ler e escrever seus dados
           ".read": "auth != null && (auth.uid == $userId || auth.token.admin === true)",
           ".write": "auth != null && (auth.uid == $userId || auth.token.admin === true)"
         }

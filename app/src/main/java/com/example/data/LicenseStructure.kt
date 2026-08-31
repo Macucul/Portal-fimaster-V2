@@ -7,9 +7,9 @@ import org.json.JSONObject
 
 /**
  * ====================================================================
- * 📜 DINÂMICA DE LICENÇAS E ACESSOS FIMASTER (dados/indice/licenca.json)
+ * 📜 DINÂMICA DE LICENÇAS E ACESSOS FIMASTER (dados/indices/licenca.json)
  *
- * Estrutura unificada e dinâmica lida de: dados/indice/licenca.json
+ * Estrutura unificada e dinâmica lida de: dados/indices/licenca.json
  *
  * Parâmetros por tipo de licença:
  * - templates (Booleano): Permissão para carregar e salvar templates/presets.

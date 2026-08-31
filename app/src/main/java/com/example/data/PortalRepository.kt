@@ -8,12 +8,14 @@ import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.TimeUnit
 
 class PortalRepository(
     private val userProfileDao: UserProfileDao,
@@ -27,6 +29,12 @@ class PortalRepository(
         var mockPasswordSalt: String? = null
         var mockRefundSolicitado: Boolean? = null
         var mockRefundStatus: String? = null
+
+        private val fastHttpClient = OkHttpClient.Builder()
+            .connectTimeout(3, TimeUnit.SECONDS)
+            .readTimeout(4, TimeUnit.SECONDS)
+            .writeTimeout(4, TimeUnit.SECONDS)
+            .build()
     }
 
     val userProfile: Flow<UserProfile?> = userProfileDao.getUserProfile()
@@ -202,128 +210,130 @@ class PortalRepository(
             return getMockUserForInput(rawInput, cleanDigits, phone9)
         }
 
-        return withContext(Dispatchers.IO) {
-            try {
-                val client = OkHttpClient()
+        return withTimeoutOrNull(4000L) {
+            withContext(Dispatchers.IO) {
+                try {
+                    val client = fastHttpClient
 
-                fun fetchGithubUserFile(userFilename: String): GithubUser? {
-                    val folder = if (adminConfig.path.isNotBlank()) adminConfig.path.trim().removeSuffix("/") else "dados/usuarios"
-                    val userPath = "$folder/$userFilename"
-                    val userUrl = "https://api.github.com/repos/$repo/contents/$userPath?ref=$branch"
-                    val userRequest = Request.Builder()
-                        .url(userUrl)
+                    fun fetchGithubUserFile(userFilename: String): GithubUser? {
+                        val folder = if (adminConfig.path.isNotBlank()) adminConfig.path.trim().removeSuffix("/") else "dados/usuarios"
+                        val userPath = "$folder/$userFilename"
+                        val userUrl = "https://api.github.com/repos/$repo/contents/$userPath?ref=$branch"
+                        val userRequest = Request.Builder()
+                            .url(userUrl)
+                            .addHeader("Authorization", "Bearer $token")
+                            .addHeader("Accept", "application/vnd.github+json")
+                            .get()
+                            .build()
+
+                        var userContent: String? = null
+                        var fileSha = ""
+                        client.newCall(userRequest).execute().use { response ->
+                            if (response.isSuccessful) {
+                                val bodyString = response.body?.string() ?: ""
+                                val json = JSONObject(bodyString)
+                                fileSha = json.optString("sha", "")
+                                val downloadUrl = json.optString("download_url", "")
+                                if (downloadUrl.isNotEmpty()) {
+                                    val downloadRequest = Request.Builder().url(downloadUrl).get().build()
+                                    client.newCall(downloadRequest).execute().use { downloadResponse ->
+                                        if (downloadResponse.isSuccessful) {
+                                            userContent = downloadResponse.body?.string()
+                                        }
+                                    }
+                                }
+                                if (userContent == null) {
+                                    val contentBase64 = json.optString("content", "")
+                                    if (contentBase64.isNotEmpty()) {
+                                        val cleanBase64 = contentBase64.replace("\n", "").replace("\r", "")
+                                        userContent = String(Base64.decode(cleanBase64, Base64.DEFAULT), Charsets.UTF_8)
+                                    }
+                                }
+                            }
+                        }
+
+                        if (userContent != null) {
+                            return GithubUserParser.parseUserJson(userContent!!, userFilename, fileSha)
+                        }
+                        return null
+                    }
+
+                    // 1. Try direct user file if input is User ID (e.g. USR000001.json)
+                    if (rawInput.isNotBlank()) {
+                        val fn = if (rawInput.endsWith(".json")) rawInput else "$rawInput.json"
+                        val user = fetchGithubUserFile(fn)
+                        if (user != null) return@withContext user
+                    }
+
+                    // 2. Fetch indices/telefones.json
+                    val telefonesUrl = "https://api.github.com/repos/$repo/contents/dados/indices/telefones.json?ref=$branch"
+                    val indexRequest = Request.Builder()
+                        .url(telefonesUrl)
                         .addHeader("Authorization", "Bearer $token")
                         .addHeader("Accept", "application/vnd.github+json")
                         .get()
                         .build()
 
-                    var userContent: String? = null
-                    var fileSha = ""
-                    client.newCall(userRequest).execute().use { response ->
+                    var telefonesContent: String? = null
+                    client.newCall(indexRequest).execute().use { response ->
                         if (response.isSuccessful) {
                             val bodyString = response.body?.string() ?: ""
                             val json = JSONObject(bodyString)
-                            fileSha = json.optString("sha", "")
                             val downloadUrl = json.optString("download_url", "")
                             if (downloadUrl.isNotEmpty()) {
                                 val downloadRequest = Request.Builder().url(downloadUrl).get().build()
                                 client.newCall(downloadRequest).execute().use { downloadResponse ->
                                     if (downloadResponse.isSuccessful) {
-                                        userContent = downloadResponse.body?.string()
+                                        telefonesContent = downloadResponse.body?.string()
                                     }
                                 }
                             }
-                            if (userContent == null) {
+                            if (telefonesContent == null) {
                                 val contentBase64 = json.optString("content", "")
                                 if (contentBase64.isNotEmpty()) {
                                     val cleanBase64 = contentBase64.replace("\n", "").replace("\r", "")
-                                    userContent = String(Base64.decode(cleanBase64, Base64.DEFAULT), Charsets.UTF_8)
+                                    telefonesContent = String(Base64.decode(cleanBase64, Base64.DEFAULT), Charsets.UTF_8)
                                 }
                             }
                         }
                     }
 
-                    if (userContent != null) {
-                        return GithubUserParser.parseUserJson(userContent!!, userFilename, fileSha)
-                    }
-                    return null
-                }
+                    if (telefonesContent != null) {
+                        val phonesJson = JSONObject(telefonesContent!!)
+                        var targetUserId: String? = null
 
-                // 1. Try direct user file if input is User ID (e.g. USR000001.json)
-                if (rawInput.isNotBlank()) {
-                    val fn = if (rawInput.endsWith(".json")) rawInput else "$rawInput.json"
-                    val user = fetchGithubUserFile(fn)
-                    if (user != null) return@withContext user
-                }
-
-                // 2. Fetch indices/telefones.json
-                val telefonesUrl = "https://api.github.com/repos/$repo/contents/dados/indices/telefones.json?ref=$branch"
-                val indexRequest = Request.Builder()
-                    .url(telefonesUrl)
-                    .addHeader("Authorization", "Bearer $token")
-                    .addHeader("Accept", "application/vnd.github+json")
-                    .get()
-                    .build()
-
-                var telefonesContent: String? = null
-                client.newCall(indexRequest).execute().use { response ->
-                    if (response.isSuccessful) {
-                        val bodyString = response.body?.string() ?: ""
-                        val json = JSONObject(bodyString)
-                        val downloadUrl = json.optString("download_url", "")
-                        if (downloadUrl.isNotEmpty()) {
-                            val downloadRequest = Request.Builder().url(downloadUrl).get().build()
-                            client.newCall(downloadRequest).execute().use { downloadResponse ->
-                                if (downloadResponse.isSuccessful) {
-                                    telefonesContent = downloadResponse.body?.string()
+                        if (cleanDigits.isNotBlank() && phonesJson.has(cleanDigits)) {
+                            val entry = phonesJson.opt(cleanDigits)
+                            targetUserId = if (entry is JSONObject) entry.optString("usuario", "") else entry?.toString() ?: ""
+                        } else if (phonesJson.has(rawInput)) {
+                            val entry = phonesJson.opt(rawInput)
+                            targetUserId = if (entry is JSONObject) entry.optString("usuario", "") else entry?.toString() ?: ""
+                        } else {
+                            val keys = phonesJson.keys()
+                            while (keys.hasNext()) {
+                                val key = keys.next()
+                                val cleanKey = key.filter { it.isDigit() }
+                                if (cleanKey.length >= 9 && phone9.length >= 9 && cleanKey.takeLast(9) == phone9) {
+                                    val entry = phonesJson.opt(key)
+                                    targetUserId = if (entry is JSONObject) entry.optString("usuario", "") else entry?.toString() ?: ""
+                                    break
                                 }
                             }
                         }
-                        if (telefonesContent == null) {
-                            val contentBase64 = json.optString("content", "")
-                            if (contentBase64.isNotEmpty()) {
-                                val cleanBase64 = contentBase64.replace("\n", "").replace("\r", "")
-                                telefonesContent = String(Base64.decode(cleanBase64, Base64.DEFAULT), Charsets.UTF_8)
-                            }
-                        }
-                    }
-                }
 
-                if (telefonesContent != null) {
-                    val phonesJson = JSONObject(telefonesContent!!)
-                    var targetUserId: String? = null
-
-                    if (cleanDigits.isNotBlank() && phonesJson.has(cleanDigits)) {
-                        val entry = phonesJson.opt(cleanDigits)
-                        targetUserId = if (entry is JSONObject) entry.optString("usuario", "") else entry?.toString() ?: ""
-                    } else if (phonesJson.has(rawInput)) {
-                        val entry = phonesJson.opt(rawInput)
-                        targetUserId = if (entry is JSONObject) entry.optString("usuario", "") else entry?.toString() ?: ""
-                    } else {
-                        val keys = phonesJson.keys()
-                        while (keys.hasNext()) {
-                            val key = keys.next()
-                            val cleanKey = key.filter { it.isDigit() }
-                            if (cleanKey.length >= 9 && phone9.length >= 9 && cleanKey.takeLast(9) == phone9) {
-                                val entry = phonesJson.opt(key)
-                                targetUserId = if (entry is JSONObject) entry.optString("usuario", "") else entry?.toString() ?: ""
-                                break
-                            }
+                        if (!targetUserId.isNullOrBlank()) {
+                            val user = fetchGithubUserFile("$targetUserId.json")
+                            if (user != null) return@withContext user
                         }
                     }
 
-                    if (!targetUserId.isNullOrBlank()) {
-                        val user = fetchGithubUserFile("$targetUserId.json")
-                        if (user != null) return@withContext user
-                    }
+                    getMockUserForInput(rawInput, cleanDigits, phone9)
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    getMockUserForInput(rawInput, cleanDigits, phone9)
                 }
-
-                getMockUserForInput(rawInput, cleanDigits, phone9)
-            } catch (e: Exception) {
-                e.printStackTrace()
-                getMockUserForInput(rawInput, cleanDigits, phone9)
             }
-        }
+        } ?: getMockUserForInput(rawInput, cleanDigits, phone9)
     }
 
     suspend fun saveUserToGithub(user: GithubUser, adminConfig: GitHubAdminConfig): Boolean {
@@ -717,141 +727,143 @@ class PortalRepository(
             return getMockUserForInput(rawInput, cleanDigits, phone9)
         }
 
-        return withContext(Dispatchers.IO) {
-            try {
-                val client = OkHttpClient()
+        return withTimeoutOrNull(4000L) {
+            withContext(Dispatchers.IO) {
+                try {
+                    val client = fastHttpClient
 
-                fun extractUserId(entry: Any?): String {
-                    if (entry == null) return ""
-                    if (entry is JSONObject) {
-                        return entry.optString("usuario", entry.optString("id", entry.optString("id_conta", "")))
-                    }
-                    if (entry is String) {
-                        return entry.removeSurrounding("\"")
-                    }
-                    return entry.toString().removeSurrounding("\"")
-                }
-
-                fun fetchUserById(userId: String): GithubUser? {
-                    if (userId.isBlank()) return null
-                    val cleanId = userId.trim()
-                    val userUrl = buildFirebaseEndpoint(parsed, "/dados/usuarios/$cleanId.json", authKey)
-                    val req = Request.Builder().url(userUrl).get().build()
-                    try {
-                        client.newCall(req).execute().use { resp ->
-                            if (resp.isSuccessful) {
-                                val content = resp.body?.string()
-                                if (!content.isNullOrBlank() && content != "null" && content != "{}") {
-                                    val parsedUser = GithubUserParser.parseUserJson(content, "$cleanId.json", "")
-                                    if (parsedUser != null) return parsedUser
-                                }
-                            }
+                    fun extractUserId(entry: Any?): String {
+                        if (entry == null) return ""
+                        if (entry is JSONObject) {
+                            return entry.optString("usuario", entry.optString("id", entry.optString("id_conta", "")))
                         }
-                    } catch (e: Exception) {}
-                    return null
-                }
+                        if (entry is String) {
+                            return entry.removeSurrounding("\"")
+                        }
+                        return entry.toString().removeSurrounding("\"")
+                    }
 
-                // 1. Try fetching directly as User ID (e.g. USR000001, USR00001, usuario_1)
-                if (rawInput.isNotBlank()) {
-                    val directUser = fetchUserById(rawInput)
-                    if (directUser != null) return@withContext directUser
-                }
-
-                // 2. Try fetching directly from phone index endpoint in Firebase
-                val phoneKeysToTry = listOfNotNull(
-                    cleanDigits.ifBlank { null },
-                    phone9.ifBlank { null },
-                    if (phone9.isNotBlank()) "258$phone9" else null
-                ).distinct()
-
-                for (pkey in phoneKeysToTry) {
-                    val pUrl = buildFirebaseEndpoint(parsed, "/dados/indices/telefones/$pkey.json", authKey)
-                    val pReq = Request.Builder().url(pUrl).get().build()
-                    try {
-                        client.newCall(pReq).execute().use { pResp ->
-                            if (pResp.isSuccessful) {
-                                val pContent = pResp.body?.string()
-                                if (!pContent.isNullOrBlank() && pContent != "null") {
-                                    val targetId = if (pContent.trim().startsWith("{")) {
-                                        val obj = JSONObject(pContent)
-                                        obj.optString("usuario", obj.optString("id", ""))
-                                    } else {
-                                        pContent.trim().removeSurrounding("\"")
+                    fun fetchUserById(userId: String): GithubUser? {
+                        if (userId.isBlank()) return null
+                        val cleanId = userId.trim()
+                        val userUrl = buildFirebaseEndpoint(parsed, "/dados/usuarios/$cleanId.json", authKey)
+                        val req = Request.Builder().url(userUrl).get().build()
+                        try {
+                            client.newCall(req).execute().use { resp ->
+                                if (resp.isSuccessful) {
+                                    val content = resp.body?.string()
+                                    if (!content.isNullOrBlank() && content != "null" && content != "{}") {
+                                        val parsedUser = GithubUserParser.parseUserJson(content, "$cleanId.json", "")
+                                        if (parsedUser != null) return parsedUser
                                     }
-                                    val user = fetchUserById(targetId)
-                                    if (user != null) return@withContext user
                                 }
                             }
-                        }
-                    } catch (e: Exception) {}
-                }
+                        } catch (e: Exception) {}
+                        return null
+                    }
 
-                // 3. Try fetching directly from MT5 index endpoint in Firebase
-                if (cleanDigits.isNotBlank()) {
-                    val mt5Url = buildFirebaseEndpoint(parsed, "/dados/indices/mt5/$cleanDigits.json", authKey)
-                    val mt5Req = Request.Builder().url(mt5Url).get().build()
-                    try {
-                        client.newCall(mt5Req).execute().use { mt5Resp ->
-                            if (mt5Resp.isSuccessful) {
-                                val mt5Content = mt5Resp.body?.string()
-                                if (!mt5Content.isNullOrBlank() && mt5Content != "null") {
-                                    val targetId = if (mt5Content.trim().startsWith("{")) {
-                                        val obj = JSONObject(mt5Content)
-                                        obj.optString("usuario", obj.optString("id", ""))
-                                    } else {
-                                        mt5Content.trim().removeSurrounding("\"")
+                    // 1. Try fetching directly as User ID (e.g. USR000001, USR00001, usuario_1)
+                    if (rawInput.isNotBlank()) {
+                        val directUser = fetchUserById(rawInput)
+                        if (directUser != null) return@withContext directUser
+                    }
+
+                    // 2. Try fetching directly from phone index endpoint in Firebase
+                    val phoneKeysToTry = listOfNotNull(
+                        cleanDigits.ifBlank { null },
+                        phone9.ifBlank { null },
+                        if (phone9.isNotBlank()) "258$phone9" else null
+                    ).distinct()
+
+                    for (pkey in phoneKeysToTry) {
+                        val pUrl = buildFirebaseEndpoint(parsed, "/dados/indices/telefones/$pkey.json", authKey)
+                        val pReq = Request.Builder().url(pUrl).get().build()
+                        try {
+                            client.newCall(pReq).execute().use { pResp ->
+                                if (pResp.isSuccessful) {
+                                    val pContent = pResp.body?.string()
+                                    if (!pContent.isNullOrBlank() && pContent != "null") {
+                                        val targetId = if (pContent.trim().startsWith("{")) {
+                                            val obj = JSONObject(pContent)
+                                            obj.optString("usuario", obj.optString("id", ""))
+                                        } else {
+                                            pContent.trim().removeSurrounding("\"")
+                                        }
+                                        val user = fetchUserById(targetId)
+                                        if (user != null) return@withContext user
                                     }
-                                    val user = fetchUserById(targetId)
-                                    if (user != null) return@withContext user
+                                }
+                            }
+                        } catch (e: Exception) {}
+                    }
+
+                    // 3. Try fetching directly from MT5 index endpoint in Firebase
+                    if (cleanDigits.isNotBlank()) {
+                        val mt5Url = buildFirebaseEndpoint(parsed, "/dados/indices/mt5/$cleanDigits.json", authKey)
+                        val mt5Req = Request.Builder().url(mt5Url).get().build()
+                        try {
+                            client.newCall(mt5Req).execute().use { mt5Resp ->
+                                if (mt5Resp.isSuccessful) {
+                                    val mt5Content = mt5Resp.body?.string()
+                                    if (!mt5Content.isNullOrBlank() && mt5Content != "null") {
+                                        val targetId = if (mt5Content.trim().startsWith("{")) {
+                                            val obj = JSONObject(mt5Content)
+                                            obj.optString("usuario", obj.optString("id", ""))
+                                        } else {
+                                            mt5Content.trim().removeSurrounding("\"")
+                                        }
+                                        val user = fetchUserById(targetId)
+                                        if (user != null) return@withContext user
+                                    }
+                                }
+                            }
+                        } catch (e: Exception) {}
+                    }
+
+                    // 4. Try bulk /dados/indices/telefones.json
+                    val telefonesUrl = buildFirebaseEndpoint(parsed, "/dados/indices/telefones.json", authKey)
+                    val indexRequest = Request.Builder().url(telefonesUrl).get().build()
+                    var telefonesContent: String? = null
+                    client.newCall(indexRequest).execute().use { response ->
+                        if (response.isSuccessful) {
+                            telefonesContent = response.body?.string()
+                        }
+                    }
+
+                    if (!telefonesContent.isNullOrBlank() && telefonesContent != "null") {
+                        val phonesJson = JSONObject(telefonesContent!!)
+                        var targetUserId = ""
+
+                        if (cleanDigits.isNotBlank() && phonesJson.has(cleanDigits)) {
+                            targetUserId = extractUserId(phonesJson.opt(cleanDigits))
+                        } else if (rawInput.isNotBlank() && phonesJson.has(rawInput)) {
+                            targetUserId = extractUserId(phonesJson.opt(rawInput))
+                        } else {
+                            val keys = phonesJson.keys()
+                            while (keys.hasNext()) {
+                                val key = keys.next()
+                                val cleanKey = key.filter { it.isDigit() }
+                                if (cleanKey.length >= 9 && phone9.length >= 9 && cleanKey.takeLast(9) == phone9) {
+                                    targetUserId = extractUserId(phonesJson.opt(key))
+                                    break
                                 }
                             }
                         }
-                    } catch (e: Exception) {}
-                }
 
-                // 4. Try bulk /dados/indices/telefones.json
-                val telefonesUrl = buildFirebaseEndpoint(parsed, "/dados/indices/telefones.json", authKey)
-                val indexRequest = Request.Builder().url(telefonesUrl).get().build()
-                var telefonesContent: String? = null
-                client.newCall(indexRequest).execute().use { response ->
-                    if (response.isSuccessful) {
-                        telefonesContent = response.body?.string()
-                    }
-                }
-
-                if (!telefonesContent.isNullOrBlank() && telefonesContent != "null") {
-                    val phonesJson = JSONObject(telefonesContent!!)
-                    var targetUserId = ""
-
-                    if (cleanDigits.isNotBlank() && phonesJson.has(cleanDigits)) {
-                        targetUserId = extractUserId(phonesJson.opt(cleanDigits))
-                    } else if (rawInput.isNotBlank() && phonesJson.has(rawInput)) {
-                        targetUserId = extractUserId(phonesJson.opt(rawInput))
-                    } else {
-                        val keys = phonesJson.keys()
-                        while (keys.hasNext()) {
-                            val key = keys.next()
-                            val cleanKey = key.filter { it.isDigit() }
-                            if (cleanKey.length >= 9 && phone9.length >= 9 && cleanKey.takeLast(9) == phone9) {
-                                targetUserId = extractUserId(phonesJson.opt(key))
-                                break
-                            }
+                        if (targetUserId.isNotBlank()) {
+                            val user = fetchUserById(targetUserId)
+                            if (user != null) return@withContext user
                         }
                     }
 
-                    if (targetUserId.isNotBlank()) {
-                        val user = fetchUserById(targetUserId)
-                        if (user != null) return@withContext user
-                    }
+                    // 5. Fallback Mock
+                    getMockUserForInput(rawInput, cleanDigits, phone9)
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    getMockUserForInput(rawInput, cleanDigits, phone9)
                 }
-
-                // 5. Fallback Mock
-                getMockUserForInput(rawInput, cleanDigits, phone9)
-            } catch (e: Exception) {
-                e.printStackTrace()
-                getMockUserForInput(rawInput, cleanDigits, phone9)
             }
-        }
+        } ?: getMockUserForInput(rawInput, cleanDigits, phone9)
     }
 
     suspend fun fetchUserByUidFirebase(userId: String, firebaseUrl: String, authKey: String = ""): GithubUser? {
@@ -862,8 +874,10 @@ class PortalRepository(
         // 1. Try SDK first
         try {
             val db = if (parsed.baseUrl.isNotBlank()) FirebaseDatabase.getInstance(parsed.baseUrl) else FirebaseDatabase.getInstance()
-            val snapshot = db.getReference("dados/usuarios").child(cleanId).get().await()
-            if (snapshot.exists() && snapshot.value != null) {
+            val snapshot = withTimeoutOrNull(2000L) {
+                db.getReference("dados/usuarios").child(cleanId).get().await()
+            }
+            if (snapshot != null && snapshot.exists() && snapshot.value != null) {
                 val userMap = snapshot.value as? Map<*, *>
                 if (userMap != null) {
                     val jsonStr = JSONObject(userMap).toString()
@@ -878,7 +892,7 @@ class PortalRepository(
         // 2. REST fallback
         return withContext(Dispatchers.IO) {
             try {
-                val client = OkHttpClient()
+                val client = fastHttpClient
                 val userUrl = buildFirebaseEndpoint(parsed, "/dados/usuarios/$cleanId.json", authKey)
                 val req = Request.Builder().url(userUrl).get().build()
                 client.newCall(req).execute().use { resp ->
@@ -902,39 +916,45 @@ class PortalRepository(
 
         val targetId = if (user.id.isNotBlank()) user.id else if (user.mt5IdConta.isNotBlank()) user.mt5IdConta else user.numero.filter { it.isDigit() }.ifBlank { "usuario_1" }
 
-        // 1. Try via Official Firebase Database SDK first
+        // 1. Try via Official Firebase Database SDK first with safety timeout
         try {
             val db = if (parsed.baseUrl.isNotBlank()) FirebaseDatabase.getInstance(parsed.baseUrl) else FirebaseDatabase.getInstance()
             val userJsonString = GithubUserParser.serializeUserJson(user.copy(id = targetId), wrapWithId = false)
             val userMap = JSONObject(userJsonString).toMap()
-            db.getReference("dados/usuarios").child(targetId).setValue(userMap).await()
+            
+            val sdkSuccess = withTimeoutOrNull(2500L) {
+                db.getReference("dados/usuarios").child(targetId).setValue(userMap).await()
 
-            val cleanPhone = user.numero.trim().filter { it.isDigit() }
-            if (cleanPhone.isNotBlank()) {
-                val phoneMap = mapOf("usuario" to targetId, "mt5" to user.mt5IdConta, "status" to user.status)
-                db.getReference("dados/indices/telefones").child(cleanPhone).setValue(phoneMap).await()
+                val cleanPhone = user.numero.trim().filter { it.isDigit() }
+                if (cleanPhone.isNotBlank()) {
+                    val phoneMap = mapOf("usuario" to targetId, "mt5" to user.mt5IdConta, "status" to user.status)
+                    db.getReference("dados/indices/telefones").child(cleanPhone).setValue(phoneMap).await()
+                }
+
+                if (user.mt5IdConta.isNotBlank()) {
+                    val mt5Map = mapOf(
+                        "usuario" to targetId,
+                        "telefone" to user.numero,
+                        "nome" to user.nome,
+                        "licenca_ativa" to user.licencaAtiva,
+                        "validade" to user.licencaValidade,
+                        "status" to user.status.lowercase()
+                    )
+                    db.getReference("dados/indices/mt5").child(user.mt5IdConta).setValue(mt5Map).await()
+                }
+                true
             }
 
-            if (user.mt5IdConta.isNotBlank()) {
-                val mt5Map = mapOf(
-                    "usuario" to targetId,
-                    "telefone" to user.numero,
-                    "nome" to user.nome,
-                    "licenca_ativa" to user.licencaAtiva,
-                    "validade" to user.licencaValidade,
-                    "status" to user.status.lowercase()
-                )
-                db.getReference("dados/indices/mt5").child(user.mt5IdConta).setValue(mt5Map).await()
+            if (sdkSuccess == true) {
+                return Pair(true, "✅ Sincronizado via SDK Firebase Realtime Database com sucesso!")
             }
-
-            return Pair(true, "✅ Sincronizado via SDK Firebase Realtime Database com sucesso!")
         } catch (e: Exception) {
             // SDK attempt failed or no google-services initialized, proceeding to REST protocol fallback
         }
 
         return withContext(Dispatchers.IO) {
             try {
-                val client = OkHttpClient()
+                val client = fastHttpClient
                 val mediaType = "application/json; charset=utf-8".toMediaTypeOrNull()
                 
                 // 1. Save user object to /dados/usuarios/{targetId}.json
@@ -1014,20 +1034,25 @@ class PortalRepository(
         if (parsed.baseUrl.isBlank()) return Pair(false, "URL do Firebase não configurada.")
         val targetId = userId.ifBlank { "usuario_1" }
 
-        // 1. Try SDK
+        // 1. Try SDK with safety timeout
         try {
             val db = if (parsed.baseUrl.isNotBlank()) FirebaseDatabase.getInstance(parsed.baseUrl) else FirebaseDatabase.getInstance()
             val auditRef = db.getReference("dados/usuarios").child(targetId).child("auditoria")
-            auditRef.child("ultimo_dispositivo").setValue(silentDeviceUid).await()
-            auditRef.child("ultimo_login").setValue(isoTimestamp).await()
-            return Pair(true, "✅ Segurança silenciosa gravada via SDK Firebase!")
+            val sdkSuccess = withTimeoutOrNull(2000L) {
+                auditRef.child("ultimo_dispositivo").setValue(silentDeviceUid).await()
+                auditRef.child("ultimo_login").setValue(isoTimestamp).await()
+                true
+            }
+            if (sdkSuccess == true) {
+                return Pair(true, "✅ Segurança silenciosa gravada via SDK Firebase!")
+            }
         } catch (e: Exception) {
             // SDK attempt failed, fallback to REST
         }
 
         return withContext(Dispatchers.IO) {
             try {
-                val client = OkHttpClient()
+                val client = fastHttpClient
                 val mediaType = "application/json; charset=utf-8".toMediaTypeOrNull()
                 val auditObj = JSONObject().apply {
                     put("ultimo_dispositivo", silentDeviceUid)
@@ -1072,8 +1097,10 @@ class PortalRepository(
         // 1. Try Firebase Realtime Database SDK first
         try {
             val db = if (parsed.baseUrl.isNotBlank()) FirebaseDatabase.getInstance(parsed.baseUrl) else FirebaseDatabase.getInstance()
-            val snapshot = db.getReference("dados/indices/mt5").child(cleanMt5).get().await()
-            if (snapshot.exists()) {
+            val snapshot = withTimeoutOrNull(2000L) {
+                db.getReference("dados/indices/mt5").child(cleanMt5).get().await()
+            }
+            if (snapshot != null && snapshot.exists()) {
                 val usuario = snapshot.child("usuario").value?.toString().orEmpty().trim()
                 val telefone = snapshot.child("telefone").value?.toString().orEmpty().trim()
                 val nome = snapshot.child("nome").value?.toString().orEmpty().trim()
@@ -1096,7 +1123,7 @@ class PortalRepository(
         // 2. REST API check
         return withContext(Dispatchers.IO) {
             try {
-                val client = OkHttpClient()
+                val client = fastHttpClient
                 val indexUrl = buildFirebaseEndpoint(parsed, "/dados/indices/mt5/$cleanMt5.json", authKey)
                 val req = Request.Builder().url(indexUrl).get().build()
 
@@ -1141,14 +1168,16 @@ class PortalRepository(
 
         try {
             val db = if (parsed.baseUrl.isNotBlank()) FirebaseDatabase.getInstance(parsed.baseUrl) else FirebaseDatabase.getInstance()
-            db.getReference("dados/indices/mt5").child(cleanMt5).removeValue().await()
+            withTimeoutOrNull(2000L) {
+                db.getReference("dados/indices/mt5").child(cleanMt5).removeValue().await()
+            }
         } catch (e: Exception) {
             // SDK fallback
         }
 
         return withContext(Dispatchers.IO) {
             try {
-                val client = OkHttpClient()
+                val client = fastHttpClient
                 val indexUrl = buildFirebaseEndpoint(parsed, "/dados/indices/mt5/$cleanMt5.json", authKey)
                 val req = Request.Builder().url(indexUrl).delete().build()
                 client.newCall(req).execute().use { resp ->
@@ -1180,17 +1209,12 @@ class PortalRepository(
         try {
             val db = if (parsed.baseUrl.isNotBlank()) FirebaseDatabase.getInstance(parsed.baseUrl) else FirebaseDatabase.getInstance()
 
-            // a) Parametros / Config
+            // a) Parametros
             val paramsSnap = db.getReference("dados/parametros").child(cleanOld).get().await()
             if (paramsSnap.exists() && paramsSnap.value != null) {
                 db.getReference("dados/parametros").child(cleanNew).setValue(paramsSnap.value).await()
+                db.getReference("dados/usuarios").child(userId).child("config").setValue(paramsSnap.value).await()
                 db.getReference("dados/parametros").child(cleanOld).removeValue().await()
-            }
-            val configSnap = db.getReference("dados/config").child(cleanOld).get().await()
-            if (configSnap.exists() && configSnap.value != null) {
-                db.getReference("dados/config").child(cleanNew).setValue(configSnap.value).await()
-                db.getReference("dados/usuarios").child(userId).child("config").setValue(configSnap.value).await()
-                db.getReference("dados/config").child(cleanOld).removeValue().await()
             }
 
             // b) Status
@@ -1257,23 +1281,12 @@ class PortalRepository(
 
                 // Parametros
                 val paramsJson = httpGet("/dados/parametros/$cleanOld.json")
+                    ?: httpGet("/dados/usuarios/$userId/config.json")
                 if (paramsJson != null) {
                     val updatedParams = paramsJson.replace("\"$cleanOld\"", "\"$cleanNew\"")
                     httpPut("/dados/parametros/$cleanNew.json", updatedParams)
+                    httpPut("/dados/usuarios/$userId/config.json", updatedParams)
                     httpDelete("/dados/parametros/$cleanOld.json")
-                }
-
-                // Config
-                val configJson = httpGet("/dados/config/$cleanOld.json")
-                    ?: httpGet("/dados/usuarios/$userId/config.json")
-                    ?: httpGet("/dados/usuarios/$cleanOld/config.json")
-                if (configJson != null) {
-                    val updatedConfig = configJson.replace("\"$cleanOld\"", "\"$cleanNew\"")
-                    httpPut("/dados/config/$cleanNew.json", updatedConfig)
-                    httpPut("/dados/usuarios/$userId/config.json", updatedConfig)
-                    httpPut("/dados/usuarios/$cleanNew/config.json", updatedConfig)
-                    httpDelete("/dados/config/$cleanOld.json")
-                    httpDelete("/dados/usuarios/$cleanOld/config.json")
                 }
 
                 // Status
@@ -1331,8 +1344,6 @@ class PortalRepository(
             val db = if (parsed.baseUrl.isNotBlank()) FirebaseDatabase.getInstance(parsed.baseUrl) else FirebaseDatabase.getInstance()
             val configMap = JSONObject(jsonContent).toMap()
             db.getReference("dados/parametros").child(config.mt5AccountId).setValue(configMap).await()
-            db.getReference("dados/config").child(config.mt5AccountId).setValue(configMap).await()
-            db.getReference("dados/usuarios").child(config.mt5AccountId).child("config").setValue(configMap).await()
             if (userId.isNotBlank()) {
                 db.getReference("dados/usuarios").child(userId).child("config").setValue(configMap).await()
             }
@@ -1347,9 +1358,7 @@ class PortalRepository(
                 val mediaType = "application/json; charset=utf-8".toMediaTypeOrNull()
 
                 val endpointsToUpdate = mutableListOf(
-                    "/dados/parametros/${config.mt5AccountId}.json",
-                    "/dados/config/${config.mt5AccountId}.json",
-                    "/dados/usuarios/${config.mt5AccountId}/config.json"
+                    "/dados/parametros/${config.mt5AccountId}.json"
                 )
                 if (userId.isNotBlank()) {
                     endpointsToUpdate.add("/dados/usuarios/$userId/config.json")
@@ -1391,9 +1400,6 @@ class PortalRepository(
             val client = OkHttpClient()
             val pathsToTry = listOf(
                 "/dados/parametros/$mt5AccountId.json",
-                "/dados/usuarios/$mt5AccountId/config.json",
-                "/dados/config/$mt5AccountId.json",
-                "/dados/usuarios/$mt5AccountId/status.json",
                 "/dados/status/$mt5AccountId.json"
             )
 
@@ -1446,7 +1452,6 @@ class PortalRepository(
             withContext(Dispatchers.IO) {
                 val client = OkHttpClient()
                 val pathsToTry = listOf(
-                    "/dados/indices/instrucoes_admin_templates/instrucoes_admin_templates.json",
                     "/dados/indices/instrucoes_admin_templates.json"
                 )
 
@@ -1670,13 +1675,10 @@ class PortalRepository(
             val branch = if (adminConfig.branch.isNotBlank()) adminConfig.branch.trim() else "main"
             val client = OkHttpClient()
 
-            // 1. Tentar ler do GitHub no nó dados/indice/licenca.json
+            // 1. Tentar ler do GitHub no nó dados/indices/licenca.json
             if (token.isNotBlank() && repo.isNotBlank() && repo.contains("/")) {
                 val pathsToTry = listOf(
-                    "dados/indice/licenca.json",
-                    "dados/indices/licenca.json",
-                    "indice/licenca.json",
-                    "dados/licenca.json"
+                    "dados/indices/licenca.json"
                 )
 
                 for (filePath in pathsToTry) {
@@ -1730,10 +1732,7 @@ class PortalRepository(
             val parsedFirebase = parseFirebaseUrl(firebaseUrl)
             if (parsedFirebase.baseUrl.isNotBlank()) {
                 val firebasePaths = listOf(
-                    "/dados/indice/licenca.json",
-                    "/dados/indices/licenca.json",
-                    "/indice/licenca.json",
-                    "/dados/licenca.json"
+                    "/dados/indices/licenca.json"
                 )
 
                 for (fbPath in firebasePaths) {
@@ -1771,7 +1770,7 @@ class PortalRepository(
             cachedLicenseConfig = config
             val jsonPayload = config.toJsonString()
 
-            // 1. Salvar no GitHub em dados/indice/licenca.json
+            // 1. Salvar no GitHub em dados/indices/licenca.json
             val token = adminConfig.token.trim()
             val repo = adminConfig.repository.trim()
             val branch = if (adminConfig.branch.isNotBlank()) adminConfig.branch.trim() else "main"
@@ -1779,7 +1778,7 @@ class PortalRepository(
             if (token.isNotBlank() && repo.isNotBlank() && repo.contains("/")) {
                 try {
                     val client = OkHttpClient()
-                    val filePath = "dados/indice/licenca.json"
+                    val filePath = "dados/indices/licenca.json"
                     val getUrl = "https://api.github.com/repos/$repo/contents/$filePath?ref=$branch"
 
                     var existingSha: String? = null
@@ -1802,7 +1801,7 @@ class PortalRepository(
 
                     val encodedContent = Base64.encodeToString(jsonPayload.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
                     val putBodyObj = JSONObject().apply {
-                        put("message", "Atualização da configuração de planos de licença [dados/indice/licenca.json]")
+                        put("message", "Atualização da configuração de planos de licença [dados/indices/licenca.json]")
                         put("content", encodedContent)
                         put("branch", branch)
                         if (existingSha != null) {
@@ -1834,7 +1833,7 @@ class PortalRepository(
                 try {
                     val client = OkHttpClient()
                     val mediaType = "application/json; charset=utf-8".toMediaTypeOrNull()
-                    val fbUrl = buildFirebaseEndpoint(parsedFb, "/dados/indice/licenca.json", "")
+                    val fbUrl = buildFirebaseEndpoint(parsedFb, "/dados/indices/licenca.json", "")
                     val fbReq = Request.Builder().url(fbUrl).put(jsonPayload.toRequestBody(mediaType)).build()
                     client.newCall(fbReq).execute().use { fbResp ->
                         if (fbResp.isSuccessful) {
@@ -1904,25 +1903,15 @@ class PortalRepository(
             // 1. Direct MT5 Account ID node (Primary written by EA: /dados/status/{ACCOUNT_LOGIN}.json)
             if (mt5AccountId.isNotBlank()) {
                 pathsToTry.add("/dados/status/$mt5AccountId.json")
-                pathsToTry.add("/status/$mt5AccountId.json")
             }
 
             // 2. User ID nodes
             if (userId.isNotBlank()) {
                 pathsToTry.add("/dados/usuarios/$userId/status.json")
                 if (mt5AccountId.isNotBlank()) {
-                    pathsToTry.add("/dados/usuarios/$userId/$mt5AccountId/status.json")
                     pathsToTry.add("/dados/usuarios/$userId/status/$mt5AccountId.json")
                 }
             }
-
-            // 3. User account copy nodes
-            if (mt5AccountId.isNotBlank()) {
-                pathsToTry.add("/dados/usuarios/$mt5AccountId/status.json")
-            }
-
-            pathsToTry.add("/dados/status.json")
-            pathsToTry.add("/status.json")
 
             val urlsToTry = mutableListOf<String>()
             for (p in pathsToTry.distinct()) {
@@ -1967,7 +1956,6 @@ class PortalRepository(
                 pathsToTry.add("/dados/eventos/$mt5AccountId/erro_ordem.json")
                 pathsToTry.add("/dados/eventos/$mt5AccountId/ordem_executada.json")
                 pathsToTry.add("/dados/eventos/$mt5AccountId/ordem_modificada.json")
-                pathsToTry.add("/dados/eventos/$mt5AccountId/ordem_não_executada.json")
                 pathsToTry.add("/dados/eventos/$mt5AccountId/ordem_nao_executada.json")
                 pathsToTry.add("/dados/eventos/$mt5AccountId/inicializacao.json")
                 pathsToTry.add("/dados/eventos/$mt5AccountId/ping.json")
@@ -1982,28 +1970,13 @@ class PortalRepository(
             // 2. User ID nodes
             if (userId.isNotBlank()) {
                 pathsToTry.add("/dados/usuarios/$userId/eventos.json")
-                pathsToTry.add("/dados/usuarios/$userId/relatorio_financeiro.json")
-                pathsToTry.add("/dados/usuarios/$userId/posicao_alterada.json")
                 if (mt5AccountId.isNotBlank()) {
-                    pathsToTry.add("/dados/usuarios/$userId/$mt5AccountId/eventos.json")
                     pathsToTry.add("/dados/usuarios/$userId/eventos/$mt5AccountId.json")
                 }
             }
 
-            // 3. User account copy nodes
-            if (mt5AccountId.isNotBlank()) {
-                pathsToTry.add("/dados/usuarios/$mt5AccountId/eventos.json")
-            }
-
-            // 4. Fallback collection reading
+            // 3. Fallback collection reading
             pathsToTry.add("/dados/eventos.json")
-            pathsToTry.add("/eventos.json")
-            pathsToTry.add("/dados/relatorio_financeiro.json")
-            pathsToTry.add("/dados/posicao_alterada.json")
-            pathsToTry.add("/dados/ordens.json")
-            pathsToTry.add("/relatorio_financeiro.json")
-            pathsToTry.add("/posicao_alterada.json")
-            pathsToTry.add("/ordens.json")
 
             val urlsToTry = mutableListOf<String>()
             for (p in pathsToTry.distinct()) {
@@ -2226,7 +2199,7 @@ class PortalRepository(
                 pathsToTry.add("/dados/eventos/$mt5AccountId/posicao_alterada.json")
                 pathsToTry.add("/dados/eventos/$mt5AccountId/ordem_executada.json")
                 pathsToTry.add("/dados/eventos/$mt5AccountId/ordem_modificada.json")
-                pathsToTry.add("/dados/eventos/$mt5AccountId/ordem_não_executada.json")
+                pathsToTry.add("/dados/eventos/$mt5AccountId/ordem_nao_executada.json")
                 pathsToTry.add("/dados/eventos/$mt5AccountId/erro_ordem.json")
                 pathsToTry.add("/dados/eventos/$mt5AccountId/captura_tela.json")
                 pathsToTry.add("/dados/eventos/$mt5AccountId/sessao_inicio.json")
@@ -2238,16 +2211,13 @@ class PortalRepository(
 
             if (userId.isNotBlank()) {
                 pathsToTry.add("/dados/usuarios/$userId/eventos.json")
-                pathsToTry.add("/dados/usuarios/$userId/relatorio_financeiro.json")
-                pathsToTry.add("/dados/usuarios/$userId/posicao_alterada.json")
                 if (mt5AccountId.isNotBlank()) {
-                    pathsToTry.add("/dados/usuarios/$userId/$mt5AccountId/eventos.json")
+                    pathsToTry.add("/dados/usuarios/$userId/eventos/$mt5AccountId.json")
                 }
             }
 
             // Also check latest events root
             pathsToTry.add("/dados/eventos.json")
-            pathsToTry.add("/eventos.json")
 
             val urlsToTry = mutableListOf<String>()
             for (p in pathsToTry.distinct()) {

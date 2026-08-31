@@ -33,7 +33,6 @@ O EA consulta estes nós periodicamente (no `OnInit()`, no início de cada barra
 - **Caminho do Nó**: `/dados/parametros/{ACCOUNT_LOGIN}.json`
 - **Método HTTP no MQL5**: `GET`
 - **Finalidade**: O EA lê as configurações e parâmetros de trading enviados pelo aplicativo ou painel administrativo para a conta logada (`ACCOUNT_LOGIN` = número da conta MT5, ex: `859423`).
-- **Nó Alternativo/Espelho**: `/dados/config/{ACCOUNT_LOGIN}.json`
 
 #### Exemplo de Payload JSON lido pelo EA:
 ```json

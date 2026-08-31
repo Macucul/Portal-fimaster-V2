@@ -29,6 +29,7 @@ import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -373,13 +374,13 @@ class PortalViewModel(
 
     fun updateLicensePlanConfig(newConfig: com.example.data.GlobalLicenseConfig) {
         viewModelScope.launch {
-            _actionLoadingMessage.value = "Sincronizando regras de licença em dados/indice/licenca.json..."
+            _actionLoadingMessage.value = "Sincronizando regras de licença em dados/indices/licenca.json..."
             _actionLoading.value = true
             try {
                 _globalLicenseConfig.value = newConfig
                 val ok = repository.saveLicensePlanConfig(newConfig, _adminConfig.value, _firebaseUrl.value)
                 if (ok) {
-                    _messageState.value = "✅ Configuração de licenças sincronizada em dados/indice/licenca.json com sucesso!"
+                    _messageState.value = "✅ Configuração de licenças sincronizada em dados/indices/licenca.json com sucesso!"
                 } else {
                     _messageState.value = "⚠️ Configuração aplicada localmente, verifique as credenciais do GitHub/Firebase."
                 }
@@ -551,7 +552,7 @@ class PortalViewModel(
         _messageState.value = "Configurações salvas com sucesso!"
     }
 
-    // Login logic using GitHub / Offline Mode with Silent Security
+    // Login logic using Firebase / GitHub / Offline Mode with Silent Security
     fun login(phone: String, passwordText: String, deviceIdOverride: String? = null) {
         _messageState.value = null
         if (phone.isBlank() || passwordText.isBlank()) {
@@ -567,117 +568,139 @@ class PortalViewModel(
                 val deviceIdentityManager = com.example.data.security.DeviceIdentityManager(context)
                 val currentSilentUid = deviceIdOverride ?: deviceIdentityManager.getSilentDeviceUid()
 
-                // Primary method of access: Query Firebase first, then fallback to GitHub REST if needed
-                val userFromFirebase = repository.searchUserByPhoneFirebase(phone, _firebaseUrl.value, currentSilentUid)
-                val user = userFromFirebase ?: repository.searchUserByPhone(phone, _adminConfig.value)
+                // Primary method of access: Query Firebase first with safety timeout, then fallback to GitHub REST if needed
+                val userFromFirebase = withTimeoutOrNull(4000L) {
+                    repository.searchUserByPhoneFirebase(phone, _firebaseUrl.value, currentSilentUid)
+                }
+                val user = userFromFirebase ?: withTimeoutOrNull(4000L) {
+                    repository.searchUserByPhone(phone, _adminConfig.value)
+                }
+
                 if (user == null) {
-                    _messageState.value = "Utilizador não encontrado no sistema."
-                } else {
-                    // Password verification (SHA-256 with salt, without salt, plain text, or master password)
-                    val cleanPassword = passwordText.trim()
-                    val rawStoredHash = user.senhaHash.trim()
+                    _messageState.value = "Utilizador não encontrado no sistema. Verifique o número digitado."
+                    _loginLoading.value = false
+                    return@launch
+                }
 
-                    val hashParts = rawStoredHash.split(":")
-                    val storedHash = hashParts[0].trim()
-                    val saltFromHash = if (hashParts.size > 1) hashParts[1].trim() else ""
-                    val effectiveSalt = user.salt.trim().ifBlank { saltFromHash }
+                // Password verification (SHA-256 with salt, without salt, plain text, or master password)
+                val cleanPassword = passwordText.trim()
+                val rawStoredHash = user.senhaHash.trim()
 
-                    val calculatedHashWithSalt = GithubUserParser.sha256(cleanPassword + effectiveSalt)
-                    val calculatedHashNoSalt = GithubUserParser.sha256(cleanPassword)
+                val hashParts = rawStoredHash.split(":")
+                val storedHash = hashParts[0].trim()
+                val saltFromHash = if (hashParts.size > 1) hashParts[1].trim() else ""
+                val effectiveSalt = user.salt.trim().ifBlank { saltFromHash }
 
-                    val isPasswordValid = cleanPassword.equals(rawStoredHash, ignoreCase = true) ||
-                                         cleanPassword.equals(storedHash, ignoreCase = true) ||
-                                         calculatedHashWithSalt.equals(storedHash, ignoreCase = true) ||
-                                         calculatedHashWithSalt.equals(rawStoredHash, ignoreCase = true) ||
-                                         calculatedHashNoSalt.equals(storedHash, ignoreCase = true) ||
-                                         calculatedHashNoSalt.equals(rawStoredHash, ignoreCase = true) ||
-                                         rawStoredHash.isBlank()
+                val calculatedHashWithSalt = GithubUserParser.sha256(cleanPassword + effectiveSalt)
+                val calculatedHashNoSalt = GithubUserParser.sha256(cleanPassword)
 
-                    if (isPasswordValid) {
-                        // Password Match! Check conditions sequentially from the flowchart
-                        val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
-                        val todayStr = dateFormat.format(Date())
+                val isPasswordValid = cleanPassword.equals(rawStoredHash, ignoreCase = true) ||
+                                     cleanPassword.equals(storedHash, ignoreCase = true) ||
+                                     calculatedHashWithSalt.equals(storedHash, ignoreCase = true) ||
+                                     calculatedHashWithSalt.equals(rawStoredHash, ignoreCase = true) ||
+                                     calculatedHashNoSalt.equals(storedHash, ignoreCase = true) ||
+                                     calculatedHashNoSalt.equals(rawStoredHash, ignoreCase = true) ||
+                                     rawStoredHash.isBlank()
 
-                        val isoFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
-                        isoFormat.timeZone = TimeZone.getTimeZone("UTC")
-                        val isoTimestamp = isoFormat.format(Date())
+                if (!isPasswordValid) {
+                    _messageState.value = "Senha incorreta. Tente novamente."
+                    _loginLoading.value = false
+                    return@launch
+                }
 
-                            val isExpired = try {
-                                if (user.licencaValidade.isNotBlank()) {
-                                    val cleanValidade = user.licencaValidade.split(" ")[0].trim()
-                                    todayStr.substring(0, 10) > cleanValidade
-                                } else {
-                                    false
-                                }
-                            } catch (e: Exception) {
-                                false
-                            }
+                // Password Match! Check conditions sequentially from the flowchart
+                val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+                val todayStr = dateFormat.format(Date())
 
-                            if (!user.licencaAtiva) {
-                                _messageState.value = "Acesso recusado: LICENÇA INATIVA."
-                            } else if (isExpired) {
-                                _messageState.value = "Acesso recusado: LICENÇA EXPIRADA (Validade: ${user.licencaValidade})."
-                            } else if (user.status != "ATIVO") {
-                                _messageState.value = "Acesso recusado: STATUS INATIVO."
-                            } else if (user.reembolsoStatus == "APROVADO" || user.reembolsoStatus == "PAGO") {
-                                _messageState.value = "Acesso recusado: CONTA BLOQUEADA POR REEMBOLSO (Licença Revogada)."
-                            } else {
-                                // Update auditoria fields for silent device mapping and logging
-                                val updatedUser = user.copy(
-                                    auditoriaUltimoDispositivo = currentSilentUid,
-                                    auditoriaUltimoLogin = isoTimestamp,
-                                    auditoriaTentativasLogin = 0,
-                                    ultimaAtualizacao = isoTimestamp
-                                )
+                val isoFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
+                    timeZone = TimeZone.getTimeZone("UTC")
+                }
+                val isoTimestamp = isoFormat.format(Date())
 
-                                val targetUserId = if (updatedUser.id.isNotBlank()) updatedUser.id else if (updatedUser.mt5IdConta.isNotBlank()) updatedUser.mt5IdConta else updatedUser.numero.filter { it.isDigit() }.ifBlank { "usuario_1" }
-
-                                // Explicitly record silent device UID & ISO-8601 timestamp in Firebase auditoria node
-                                repository.updateSilentSecurityInFirebase(targetUserId, currentSilentUid, isoTimestamp, _firebaseUrl.value, currentSilentUid)
-
-                                // Sync the updated record back to selected database
-                                val (successSync, statusDetail) = if (_dataSourceMode.value == "FIREBASE") {
-                                    repository.saveUserToFirebaseWithDetails(updatedUser, _firebaseUrl.value, currentSilentUid)
-                                } else {
-                                    val gSuccess = repository.saveUserToGithub(updatedUser, _adminConfig.value)
-                                    Pair(gSuccess, if (gSuccess) "Sincronizado" else "Falha no GitHub")
-                                }
-
-                                // AUTORIZADO
-                                _loggedUser.value = updatedUser
-                                _isLoggedIn.value = true
-                                if (successSync) {
-                                    _messageState.value = "Login efetuado com sucesso! Bem-vindo, ${user.nome}."
-                                } else {
-                                    _messageState.value = "Bem-vindo, ${user.nome}! (Sessão iniciada localmente - $statusDetail)"
-                                }
-                                startStatusPolling(updatedUser.mt5IdConta)
-
-                                // Update local user profile state in Room
-                                val localProfile = UserProfile(
-                                    id = 1,
-                                    fullName = updatedUser.nome,
-                                    mt5AccountId = updatedUser.mt5IdConta,
-                                    passwordHash = updatedUser.senhaHash,
-                                    licenseStatus = if (updatedUser.licencaAtiva) "Ativa" else "Expirada",
-                                    licenseExpiryDate = updatedUser.licencaValidade,
-                                    balanceMT = updatedUser.saldo,
-                                    githubToken = _adminConfig.value.token,
-                                    githubRepo = _adminConfig.value.repository,
-                                    githubBranch = _adminConfig.value.branch,
-                                    deviceId = currentSilentUid
-                                )
-                                repository.insertOrUpdateProfileLocally(localProfile)
-
-                                // Seed EA local configuration if not exist
-                                repository.insertOrUpdateEaConfigLocally(EaConfigEntity(mt5AccountId = updatedUser.mt5IdConta))
-                            }
+                val isExpired = try {
+                    if (user.licencaValidade.isNotBlank()) {
+                        val cleanValidade = user.licencaValidade.split(" ")[0].trim()
+                        todayStr.substring(0, 10) > cleanValidade
                     } else {
-                        _messageState.value = "Senha incorreta. Tente novamente."
+                        false
+                    }
+                } catch (e: Exception) {
+                    false
+                }
+
+                if (!user.licencaAtiva) {
+                    _messageState.value = "Acesso recusado: LICENÇA INATIVA."
+                    _loginLoading.value = false
+                    return@launch
+                }
+                if (isExpired) {
+                    _messageState.value = "Acesso recusado: LICENÇA EXPIRADA (Validade: ${user.licencaValidade})."
+                    _loginLoading.value = false
+                    return@launch
+                }
+                if (user.status != "ATIVO") {
+                    _messageState.value = "Acesso recusado: STATUS INATIVO."
+                    _loginLoading.value = false
+                    return@launch
+                }
+                if (user.reembolsoStatus == "APROVADO" || user.reembolsoStatus == "PAGO") {
+                    _messageState.value = "Acesso recusado: CONTA BLOQUEADA POR REEMBOLSO (Licença Revogada)."
+                    _loginLoading.value = false
+                    return@launch
+                }
+
+                // AUTORIZADO - Update user model & authorize immediately without UI blocking
+                val updatedUser = user.copy(
+                    auditoriaUltimoDispositivo = currentSilentUid,
+                    auditoriaUltimoLogin = isoTimestamp,
+                    auditoriaTentativasLogin = 0,
+                    ultimaAtualizacao = isoTimestamp
+                )
+                val targetUserId = if (updatedUser.id.isNotBlank()) updatedUser.id else if (updatedUser.mt5IdConta.isNotBlank()) updatedUser.mt5IdConta else updatedUser.numero.filter { it.isDigit() }.ifBlank { "usuario_1" }
+
+                _loggedUser.value = updatedUser
+                _isLoggedIn.value = true
+                _loginLoading.value = false
+                _messageState.value = "Login efetuado com sucesso! Bem-vindo, ${user.nome}."
+                startStatusPolling(updatedUser.mt5IdConta)
+
+                // Background persistence and sync (Room, Firebase, GitHub) asynchronously
+                viewModelScope.launch(Dispatchers.IO) {
+                    try {
+                        val localProfile = UserProfile(
+                            id = 1,
+                            fullName = updatedUser.nome,
+                            mt5AccountId = updatedUser.mt5IdConta,
+                            passwordHash = updatedUser.senhaHash,
+                            licenseStatus = if (updatedUser.licencaAtiva) "Ativa" else "Expirada",
+                            licenseExpiryDate = updatedUser.licencaValidade,
+                            balanceMT = updatedUser.saldo,
+                            githubToken = _adminConfig.value.token,
+                            githubRepo = _adminConfig.value.repository,
+                            githubBranch = _adminConfig.value.branch,
+                            deviceId = currentSilentUid
+                        )
+                        repository.insertOrUpdateProfileLocally(localProfile)
+                        repository.insertOrUpdateEaConfigLocally(EaConfigEntity(mt5AccountId = updatedUser.mt5IdConta))
+
+                        // Silent audit & remote sync with timeout
+                        withTimeoutOrNull(3000L) {
+                            repository.updateSilentSecurityInFirebase(targetUserId, currentSilentUid, isoTimestamp, _firebaseUrl.value, currentSilentUid)
+                        }
+                        withTimeoutOrNull(3000L) {
+                            if (_dataSourceMode.value == "FIREBASE") {
+                                repository.saveUserToFirebaseWithDetails(updatedUser, _firebaseUrl.value, currentSilentUid)
+                            } else {
+                                repository.saveUserToGithub(updatedUser, _adminConfig.value)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        e.printStackTrace()
                     }
                 }
             } catch (e: Exception) {
-                _messageState.value = "Erro ao efetuar login: ${e.localizedMessage}"
+                _messageState.value = "Erro ao efetuar login: ${e.localizedMessage ?: "Falha na conexão"}"
+                _loginLoading.value = false
             } finally {
                 _loginLoading.value = false
             }

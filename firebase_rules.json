@@ -1,12 +1,6 @@
 {
   "rules": {
     "dados": {
-      "indice": {
-        "licenca": {
-          ".read": true,
-          ".write": "auth != null && auth.token.admin === true"
-        }
-      },
       "indices": {
         "licenca": {
           ".read": true,
@@ -15,15 +9,17 @@
         "instrucoes_admin_templates": {
           ".read": "auth != null",
           ".write": "auth != null && auth.token.admin === true"
-        }
-      },
-      "parametros": {
-        "$mt5AccountId": {
+        },
+        "telefones": {
+          ".read": "auth != null",
+          ".write": "auth != null"
+        },
+        "mt5": {
           ".read": "auth != null",
           ".write": "auth != null"
         }
       },
-      "config": {
+      "parametros": {
         "$mt5AccountId": {
           ".read": "auth != null",
           ".write": "auth != null"
