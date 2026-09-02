@@ -35,6 +35,60 @@ class PortalRepository(
             .readTimeout(4, TimeUnit.SECONDS)
             .writeTimeout(4, TimeUnit.SECONDS)
             .build()
+
+        data class ParsedFirebaseUrl(val baseUrl: String, val queryParams: String)
+
+        fun parseFirebaseUrl(url: String): ParsedFirebaseUrl {
+            var cleaned = url.trim().removeSuffix("/")
+            if (cleaned.isBlank()) return ParsedFirebaseUrl("", "")
+            if (!cleaned.startsWith("http://") && !cleaned.startsWith("https://")) {
+                cleaned = "https://$cleaned"
+            }
+            val qIndex = cleaned.indexOf('?')
+            return if (qIndex != -1) {
+                val base = cleaned.substring(0, qIndex).removeSuffix("/")
+                val query = cleaned.substring(qIndex)
+                ParsedFirebaseUrl(base, query)
+            } else {
+                ParsedFirebaseUrl(cleaned, "")
+            }
+        }
+
+        fun parseFirebaseUrlStatic(url: String): ParsedFirebaseUrl = parseFirebaseUrl(url)
+
+        fun buildFirebaseEndpoint(parsed: ParsedFirebaseUrl, path: String, authKey: String = ""): String {
+            val cleanPath = if (path.startsWith("/")) path else "/$path"
+            val baseWithPath = "${parsed.baseUrl}$cleanPath"
+            val queryMap = mutableMapOf<String, String>()
+
+            if (parsed.queryParams.isNotBlank()) {
+                val rawQuery = parsed.queryParams.removePrefix("?")
+                rawQuery.split("&").forEach { pair ->
+                    val parts = pair.split("=")
+                    if (parts.isNotEmpty() && parts[0].isNotBlank()) {
+                        val key = parts[0]
+                        val value = if (parts.size > 1) parts[1] else ""
+                        queryMap[key] = value
+                    }
+                }
+            }
+
+            if (authKey.isNotBlank()) {
+                if (!queryMap.containsKey("auth") || queryMap["auth"].isNullOrBlank()) {
+                    queryMap["auth"] = authKey
+                }
+            }
+
+            return if (queryMap.isNotEmpty()) {
+                val queryString = queryMap.entries.joinToString("&") { "${it.key}=${it.value}" }
+                "$baseWithPath?$queryString"
+            } else {
+                baseWithPath
+            }
+        }
+
+        fun buildFirebaseEndpointStatic(parsed: ParsedFirebaseUrl, path: String, authKey: String = ""): String =
+            buildFirebaseEndpoint(parsed, path, authKey)
     }
 
     val userProfile: Flow<UserProfile?> = userProfileDao.getUserProfile()
@@ -663,55 +717,6 @@ class PortalRepository(
     }
 
     // === FIREBASE REALTIME DATABASE REST INTEGRATIONS ===
-
-    private data class ParsedFirebaseUrl(val baseUrl: String, val queryParams: String)
-
-    private fun parseFirebaseUrl(url: String): ParsedFirebaseUrl {
-        var cleaned = url.trim().removeSuffix("/")
-        if (cleaned.isBlank()) return ParsedFirebaseUrl("", "")
-        if (!cleaned.startsWith("http://") && !cleaned.startsWith("https://")) {
-            cleaned = "https://$cleaned"
-        }
-        val qIndex = cleaned.indexOf('?')
-        return if (qIndex != -1) {
-            val base = cleaned.substring(0, qIndex).removeSuffix("/")
-            val query = cleaned.substring(qIndex)
-            ParsedFirebaseUrl(base, query)
-        } else {
-            ParsedFirebaseUrl(cleaned, "")
-        }
-    }
-
-    private fun buildFirebaseEndpoint(parsed: ParsedFirebaseUrl, path: String, authKey: String = ""): String {
-        val cleanPath = if (path.startsWith("/")) path else "/$path"
-        val baseWithPath = "${parsed.baseUrl}$cleanPath"
-        val queryMap = mutableMapOf<String, String>()
-
-        if (parsed.queryParams.isNotBlank()) {
-            val rawQuery = parsed.queryParams.removePrefix("?")
-            rawQuery.split("&").forEach { pair ->
-                val parts = pair.split("=")
-                if (parts.isNotEmpty() && parts[0].isNotBlank()) {
-                    val key = parts[0]
-                    val value = if (parts.size > 1) parts[1] else ""
-                    queryMap[key] = value
-                }
-            }
-        }
-
-        if (authKey.isNotBlank()) {
-            if (!queryMap.containsKey("auth") || queryMap["auth"].isNullOrBlank()) {
-                queryMap["auth"] = authKey
-            }
-        }
-
-        return if (queryMap.isNotEmpty()) {
-            val queryString = queryMap.entries.joinToString("&") { "${it.key}=${it.value}" }
-            "$baseWithPath?$queryString"
-        } else {
-            baseWithPath
-        }
-    }
 
     private fun sanitizeFirebaseUrl(url: String): String {
         return parseFirebaseUrl(url).baseUrl
