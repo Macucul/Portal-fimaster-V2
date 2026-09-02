@@ -1,16 +1,19 @@
 package com.example.data
 
+import com.example.data.security.CryptoSecurity
 import org.json.JSONArray
 import org.json.JSONObject
-import java.security.MessageDigest
 
 object GithubUserParser {
 
-    fun sha256(input: String): String {
-        val md = MessageDigest.getInstance("SHA-256")
-        val digest = md.digest(input.toByteArray(Charsets.UTF_8))
-        return digest.joinToString("") { "%02x".format(it) }
-    }
+    fun sha256(input: String): String = CryptoSecurity.sha256(input)
+
+    fun md5(input: String): String = CryptoSecurity.md5(input)
+
+    fun generateSalt(): String = CryptoSecurity.generateSecureSalt()
+
+    fun verifyPassword(plainPassword: String, storedHash: String, storedSalt: String = ""): Boolean =
+        CryptoSecurity.verifyPassword(plainPassword, storedHash, storedSalt)
 
     fun parseUserJson(fileContent: String, filename: String, sha: String): GithubUser? {
         return try {
@@ -18,14 +21,14 @@ object GithubUserParser {
             val id: String
             val userObj: JSONObject
 
-            if (root.has("status") || root.has("nome") || root.has("numero") || root.has("senha_hash") || root.has("senha") || root.has("password")) {
+            if (root.has("status") || root.has("nome") || root.has("numero") || root.has("senha_hash") || root.has("senha") || root.has("password") || root.has("saldo")) {
                 userObj = root
                 id = filename.removeSuffix(".json")
             } else {
                 val keys = root.keys()
                 if (!keys.hasNext()) return null
                 id = keys.next()
-                userObj = root.getJSONObject(id)
+                userObj = root.optJSONObject(id) ?: root
             }
 
             val status = userObj.optString("status", "ATIVO")
@@ -34,8 +37,38 @@ object GithubUserParser {
             val nome = userObj.optString("nome", "")
             val idTransacao = userObj.optString("id_transacao", "")
             val saldo = userObj.optDouble("saldo", 0.0)
-            val senhaHash = userObj.optString("senha_hash", userObj.optString("senha", userObj.optString("password", userObj.optString("pass", ""))))
-            val salt = userObj.optString("salt", userObj.optString("sal", ""))
+
+            // Extract password from all possible key variations and sub-objects
+            val senhaHash = run {
+                var s = userObj.optString("senha_hash", "")
+                if (s.isBlank()) s = userObj.optString("senha", "")
+                if (s.isBlank()) s = userObj.optString("password", "")
+                if (s.isBlank()) s = userObj.optString("pass", "")
+                if (s.isBlank()) s = userObj.optString("pin", "")
+                if (s.isBlank()) s = userObj.optString("codigo_acesso", "")
+                if (s.isBlank()) s = userObj.optString("codigo", "")
+                if (s.isBlank()) s = userObj.optString("chave", "")
+                if (s.isBlank()) {
+                    val cred = userObj.optJSONObject("credenciais") ?: userObj.optJSONObject("auth") ?: userObj.optJSONObject("autenticacao") ?: userObj.optJSONObject("seguranca")
+                    if (cred != null) {
+                        s = cred.optString("senha_hash", cred.optString("senha", cred.optString("password", cred.optString("pass", cred.optString("pin", "")))))
+                    }
+                }
+                s.removeSurrounding("\"").trim()
+            }
+
+            // Extract salt from all possible variations
+            val salt = run {
+                var sal = userObj.optString("salt", "")
+                if (sal.isBlank()) sal = userObj.optString("sal", "")
+                if (sal.isBlank()) {
+                    val cred = userObj.optJSONObject("credenciais") ?: userObj.optJSONObject("auth") ?: userObj.optJSONObject("autenticacao")
+                    if (cred != null) {
+                        sal = cred.optString("salt", cred.optString("sal", ""))
+                    }
+                }
+                sal.removeSurrounding("\"").trim()
+            }
             val tokenRecuperacao = userObj.optString("token_recuperacao", "")
             val nivelAutorizacao = userObj.optString("nivel_autorizacao", "CLIENTE")
             val dataRegistro = userObj.optString("data_registro", "")
@@ -196,13 +229,5 @@ object GithubUserParser {
         } else {
             userObj.toString(2)
         }
-    }
-
-    // Generates a random alphanumeric salt of standard 8 bytes (16 hex chars)
-    fun generateSalt(): String {
-        val allowedChars = "0123456789abcdef"
-        return (1..16)
-            .map { allowedChars.random() }
-            .joinToString("")
     }
 }

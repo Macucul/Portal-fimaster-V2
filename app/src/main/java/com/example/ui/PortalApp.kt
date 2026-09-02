@@ -11063,6 +11063,10 @@ fun LoginScreen(
     var phoneInput by remember { mutableStateOf("") }
     var passwordInput by remember { mutableStateOf("") }
     var isPasswordVisible by remember { mutableStateOf(false) }
+    var showForgotPasswordDialog by remember { mutableStateOf(false) }
+    var resetPhoneInput by remember { mutableStateOf("") }
+    var resetNewPasswordInput by remember { mutableStateOf("") }
+    var resetConfirmPasswordInput by remember { mutableStateOf("") }
 
     val feedbackMessage by viewModel.messageState.collectAsStateWithLifecycle()
     val dataSourceMode by viewModel.dataSourceMode.collectAsStateWithLifecycle()
@@ -11216,7 +11220,7 @@ fun LoginScreen(
                     )
 
                     Button(
-                        onClick = { viewModel.autoAuthenticateAndRegisterDevice() },
+                        onClick = { viewModel.checkSavedSessionOrDeviceAuth(isUserTriggered = true) },
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
                         shape = RoundedCornerShape(10.dp),
                         modifier = Modifier.fillMaxWidth(),
@@ -11328,6 +11332,57 @@ fun LoginScreen(
                         shape = RoundedCornerShape(12.dp)
                     )
 
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Surface(
+                            onClick = { passwordInput = "123456" },
+                            color = Color(0xFF334155).copy(alpha = 0.5f),
+                            shape = RoundedCornerShape(8.dp),
+                            border = BorderStroke(1.dp, Color(0xFF475569))
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Key,
+                                    contentDescription = null,
+                                    tint = Color(0xFF38BDF8),
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Text(
+                                    text = "Preencher 123456",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        color = Color(0xFF38BDF8),
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                )
+                            }
+                        }
+
+                        TextButton(
+                            onClick = {
+                                resetPhoneInput = phoneInput
+                                resetNewPasswordInput = ""
+                                resetConfirmPasswordInput = ""
+                                showForgotPasswordDialog = true
+                            },
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                        ) {
+                            Text(
+                                text = "Esqueci a Senha?",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = Color(0xFF94A3B8),
+                                    fontWeight = FontWeight.Medium
+                                )
+                            )
+                        }
+                    }
+
                     if (lastLoginError != null) {
                         Card(
                             colors = CardDefaults.cardColors(containerColor = Color(0xFF7F1D1D).copy(alpha = 0.9f)),
@@ -11336,44 +11391,84 @@ fun LoginScreen(
                                 .fillMaxWidth()
                                 .border(1.dp, Color(0xFFEF4444).copy(alpha = 0.6f), RoundedCornerShape(12.dp))
                         ) {
-                            Row(
-                                modifier = Modifier.padding(14.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.ErrorOutline,
-                                    contentDescription = "Erro de Acesso",
-                                    tint = Color(0xFFFCA5A5),
-                                    modifier = Modifier.size(24.dp)
-                                )
-                                Spacer(modifier = Modifier.width(12.dp))
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = "Falha no Login",
-                                        style = MaterialTheme.typography.bodyMedium.copy(
-                                            fontWeight = FontWeight.Bold,
-                                            color = Color.White
-                                        )
-                                    )
-                                    Text(
-                                        text = lastLoginError ?: "",
-                                        style = MaterialTheme.typography.bodySmall.copy(
-                                            color = Color(0xFFFCA5A5)
-                                        )
-                                    )
-                                }
-                                IconButton(
-                                    onClick = {
-                                        lastLoginError = null
-                                        viewModel.clearMessage()
-                                    }
+                            Column(modifier = Modifier.padding(14.dp)) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     Icon(
-                                        imageVector = Icons.Default.Close,
-                                        contentDescription = "Fechar aviso",
+                                        imageVector = Icons.Default.ErrorOutline,
+                                        contentDescription = "Erro de Acesso",
                                         tint = Color(0xFFFCA5A5),
-                                        modifier = Modifier.size(18.dp)
+                                        modifier = Modifier.size(24.dp)
                                     )
+                                    Spacer(modifier = Modifier.width(12.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "Falha no Login",
+                                            style = MaterialTheme.typography.bodyMedium.copy(
+                                                fontWeight = FontWeight.Bold,
+                                                color = Color.White
+                                            )
+                                        )
+                                        Text(
+                                            text = lastLoginError ?: "",
+                                            style = MaterialTheme.typography.bodySmall.copy(
+                                                color = Color(0xFFFCA5A5)
+                                            )
+                                        )
+                                    }
+                                    IconButton(
+                                        onClick = {
+                                            lastLoginError = null
+                                            viewModel.clearMessage()
+                                        }
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Close,
+                                            contentDescription = "Fechar aviso",
+                                            tint = Color(0xFFFCA5A5),
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                }
+
+                                if (lastLoginError?.contains("Senha", ignoreCase = true) == true) {
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        Button(
+                                            onClick = {
+                                                passwordInput = "123456"
+                                                viewModel.login(phoneInput, "123456")
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626)),
+                                            shape = RoundedCornerShape(8.dp),
+                                            modifier = Modifier.weight(1f),
+                                            contentPadding = PaddingValues(vertical = 6.dp)
+                                        ) {
+                                            Text(
+                                                text = "Tentar com 123456",
+                                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold, color = Color.White)
+                                            )
+                                        }
+                                        OutlinedButton(
+                                            onClick = {
+                                                resetPhoneInput = phoneInput
+                                                showForgotPasswordDialog = true
+                                            },
+                                            shape = RoundedCornerShape(8.dp),
+                                            border = BorderStroke(1.dp, Color(0xFFFCA5A5)),
+                                            modifier = Modifier.weight(1f),
+                                            contentPadding = PaddingValues(vertical = 6.dp)
+                                        ) {
+                                            Text(
+                                                text = "Redefinir Senha",
+                                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold, color = Color.White)
+                                            )
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -11564,6 +11659,132 @@ fun LoginScreen(
                 contentDescription = "Configurar Admin",
                 tint = Color(0xFF22D3EE),
                 modifier = Modifier.size(28.dp)
+            )
+        }
+
+        if (showForgotPasswordDialog) {
+            AlertDialog(
+                onDismissRequest = { showForgotPasswordDialog = false },
+                containerColor = Color(0xFF1E293B),
+                titleContentColor = Color.White,
+                textContentColor = Color(0xFF94A3B8),
+                shape = RoundedCornerShape(16.dp),
+                title = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.LockReset,
+                            contentDescription = null,
+                            tint = Color(0xFF22D3EE),
+                            modifier = Modifier.size(24.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Redefinir Senha de Acesso",
+                            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
+                        )
+                    }
+                },
+                text = {
+                    Column(
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = "Insira seu Telefone/ID cadastrado e defina sua nova senha de acesso:",
+                            style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF94A3B8))
+                        )
+
+                        OutlinedTextField(
+                            value = resetPhoneInput,
+                            onValueChange = { resetPhoneInput = it },
+                            label = { Text("Telefone ou ID") },
+                            placeholder = { Text("Ex: 841234567") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = Color(0xFF22D3EE),
+                                unfocusedBorderColor = Color(0xFF475569),
+                                focusedLabelColor = Color(0xFF22D3EE),
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White
+                            ),
+                            shape = RoundedCornerShape(10.dp)
+                        )
+
+                        OutlinedTextField(
+                            value = resetNewPasswordInput,
+                            onValueChange = { resetNewPasswordInput = it },
+                            label = { Text("Nova Senha") },
+                            placeholder = { Text("Mínimo 4 caracteres") },
+                            singleLine = true,
+                            visualTransformation = PasswordVisualTransformation(),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = Color(0xFF22D3EE),
+                                unfocusedBorderColor = Color(0xFF475569),
+                                focusedLabelColor = Color(0xFF22D3EE),
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White
+                            ),
+                            shape = RoundedCornerShape(10.dp)
+                        )
+
+                        OutlinedTextField(
+                            value = resetConfirmPasswordInput,
+                            onValueChange = { resetConfirmPasswordInput = it },
+                            label = { Text("Confirmar Nova Senha") },
+                            singleLine = true,
+                            visualTransformation = PasswordVisualTransformation(),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = Color(0xFF22D3EE),
+                                unfocusedBorderColor = Color(0xFF475569),
+                                focusedLabelColor = Color(0xFF22D3EE),
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White
+                            ),
+                            shape = RoundedCornerShape(10.dp)
+                        )
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            if (resetPhoneInput.isBlank() || resetNewPasswordInput.isBlank()) {
+                                return@Button
+                            }
+                            if (resetNewPasswordInput != resetConfirmPasswordInput) {
+                                return@Button
+                            }
+                            viewModel.resetPasswordFromLogin(resetPhoneInput, resetNewPasswordInput)
+                            showForgotPasswordDialog = false
+                            phoneInput = resetPhoneInput
+                            passwordInput = resetNewPasswordInput
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF22D3EE)),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Text(
+                            text = "Salvar e Atualizar",
+                            style = MaterialTheme.typography.labelMedium.copy(
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFF0F172A)
+                            )
+                        )
+                    }
+                },
+                dismissButton = {
+                    TextButton(
+                        onClick = { showForgotPasswordDialog = false }
+                    ) {
+                        Text(
+                            text = "Cancelar",
+                            style = MaterialTheme.typography.labelMedium.copy(color = Color(0xFF94A3B8))
+                        )
+                    }
+                }
             )
         }
     }

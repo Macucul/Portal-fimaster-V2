@@ -92,6 +92,7 @@ class PortalRepository(
     }
 
     val userProfile: Flow<UserProfile?> = userProfileDao.getUserProfile()
+    suspend fun getUserProfileDirect(): UserProfile? = userProfileDao.getUserProfileDirect()
     val refundRequests: Flow<List<RefundRequest>> = refundRequestDao.getAllRefundRequests()
 
     fun getLocalEventsFlow(accountId: String): Flow<List<EaRobotEvent>> {
@@ -168,8 +169,9 @@ class PortalRepository(
         val hash = mockPasswordHash ?: GithubUserParser.sha256("123456" + salt)
 
         val upperRaw = rawInput.uppercase()
-        if (phone9 == "842216571" || upperRaw == "USR000001" || upperRaw == "USR00001" || cleanDigits == "859423" || phone9 == "841234567" || phone9 == "999999999" || phone9 == "123") {
-            val mockId = if (phone9 == "842216571" || upperRaw == "USR000001" || upperRaw == "USR00001" || cleanDigits == "859423") "USR000001" else if (phone9 == "841234567") "USR000002" else "user_12345"
+        // Only return mock for explicit predefined demo accounts
+        if (phone9 == "842216571" || upperRaw == "USR000001" || upperRaw == "USR00001" || cleanDigits == "859423" || phone9 == "841234567") {
+            val mockId = if (phone9 == "842216571" || upperRaw == "USR000001" || upperRaw == "USR00001" || cleanDigits == "859423") "USR000001" else "USR000002"
             val mockName = if (mockId == "USR000001") "LINA LUIS CHISSAQUE" else "Jossias Fimaster"
 
             return GithubUser(
@@ -188,46 +190,6 @@ class PortalRepository(
                 ultimaAtualizacao = "2026-07-08 14:39:20",
                 mt5Registrado = true,
                 mt5IdConta = "859423",
-                licencaAtiva = true,
-                licencaProduto = "Fimaster",
-                licencaPlano = "Semestral",
-                licencaValidade = "2028-12-31",
-                licencaUltimaRenovacao = "2026-07-02 12:00:00",
-                licencaTotalRenovacoes = 1,
-                licencaHistorico = listOf(
-                    GithubUserHistorico("2026-07-02 12:00:00", 100.0, "Ativação Inicial")
-                ),
-                reembolsoSolicitado = mockRefundSolicitado ?: false,
-                reembolsoStatus = mockRefundStatus ?: "NENHUM",
-                autorizacaoStatus = "APROVADO",
-                autorizacaoAprovadoPor = "ADMIN",
-                autorizacaoDataAprovacao = "2026-07-02 12:00:00",
-                creditoGuardado = 0.0,
-                sha = "mock_sha",
-                filename = "$mockId.json"
-            )
-        }
-
-        if (rawInput.isNotBlank()) {
-            val mockId = if (upperRaw.startsWith("USR")) upperRaw else "USR_${cleanDigits.ifBlank { "000001" }}"
-            val userPhone = if (phone9.isNotBlank()) phone9 else cleanDigits.ifBlank { "842216571" }
-            val userMt5 = if (cleanDigits.length >= 5) cleanDigits else "859423"
-            return GithubUser(
-                id = mockId,
-                status = "ATIVO",
-                origem = "sms_fimaster",
-                numero = userPhone,
-                nome = "Utilizador $userPhone",
-                idTransacao = "TX_SMS_100",
-                saldo = 100000.0,
-                senhaHash = hash,
-                salt = salt,
-                tokenRecuperacao = "",
-                nivelAutorizacao = "CLIENTE",
-                dataRegistro = "2026-07-02 12:00:00",
-                ultimaAtualizacao = "2026-07-08 14:39:20",
-                mt5Registrado = true,
-                mt5IdConta = userMt5,
                 licencaAtiva = true,
                 licencaProduto = "Fimaster",
                 licencaPlano = "Semestral",
@@ -381,13 +343,13 @@ class PortalRepository(
                         }
                     }
 
-                    getMockUserForInput(rawInput, cleanDigits, phone9)
+                    null
                 } catch (e: Exception) {
                     e.printStackTrace()
-                    getMockUserForInput(rawInput, cleanDigits, phone9)
+                    null
                 }
             }
-        } ?: getMockUserForInput(rawInput, cleanDigits, phone9)
+        }
     }
 
     suspend fun saveUserToGithub(user: GithubUser, adminConfig: GitHubAdminConfig): Boolean {
@@ -861,14 +823,13 @@ class PortalRepository(
                         }
                     }
 
-                    // 5. Fallback Mock
-                    getMockUserForInput(rawInput, cleanDigits, phone9)
+                    null
                 } catch (e: Exception) {
                     e.printStackTrace()
-                    getMockUserForInput(rawInput, cleanDigits, phone9)
+                    null
                 }
             }
-        } ?: getMockUserForInput(rawInput, cleanDigits, phone9)
+        }
     }
 
     suspend fun fetchUserByUidFirebase(userId: String, firebaseUrl: String, authKey: String = ""): GithubUser? {

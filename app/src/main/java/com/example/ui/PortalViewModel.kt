@@ -222,7 +222,7 @@ class PortalViewModel(
     init {
         viewModelScope.launch {
             repository.seedInitialDataIfEmpty()
-            autoAuthenticateAndRegisterDevice()
+            checkSavedSessionOrDeviceAuth()
         }
         viewModelScope.launch {
             loadAdminTemplates()
@@ -253,104 +253,87 @@ class PortalViewModel(
     }
 
     /**
-     * Autenticação e Registro Automático com UID do Dispositivo no Firebase
+     * Segunda Autenticação / Acessos Seguintes (Por Dispositivo):
+     * Verifica se este dispositivo já realizou login normal com sucesso anteriormente.
+     * Não cria usuários fictícios nem autoriza dispositivos não vinculados.
      */
-    fun autoAuthenticateAndRegisterDevice(forceRegisterNew: Boolean = false) {
+    fun checkSavedSessionOrDeviceAuth(isUserTriggered: Boolean = false) {
         viewModelScope.launch {
-            if (_isLoggedIn.value && !forceRegisterNew) return@launch
-            _loginLoading.value = true
+            if (_isLoggedIn.value) return@launch
             try {
                 val context = getApplication<Application>()
                 val deviceIdentityManager = com.example.data.security.DeviceIdentityManager(context)
                 val deviceUid = deviceIdentityManager.getSilentDeviceUid()
 
-                // 1. Silent Firebase Auth (signInAnonymously or existing session)
-                val authResult = deviceIdentityManager.authenticateDeviceWithFirebase()
-                val effectiveFirebaseUid = authResult.firebaseAuthUid ?: deviceUid
+                val savedProfile = repository.getUserProfileDirect()
 
-                val isoFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
-                    timeZone = TimeZone.getTimeZone("UTC")
-                }
-                val isoTimestamp = isoFormat.format(Date())
-
-                // 2. Busca perfil existente no Firebase pelo deviceUid ou effectiveFirebaseUid
-                var existingUser = repository.fetchUserByUidFirebase(deviceUid, _firebaseUrl.value, deviceUid)
-                if (existingUser == null && effectiveFirebaseUid != deviceUid) {
-                    existingUser = repository.fetchUserByUidFirebase(effectiveFirebaseUid, _firebaseUrl.value, deviceUid)
-                }
-
-                // 3. Fallback: Se não encontrado no Firebase, verifica perfil local em cache
-                if (existingUser == null) {
-                    val currentProfile = _userProfileStateDirect()
-                    if (currentProfile != null && currentProfile.fullName.isNotBlank()) {
-                        existingUser = GithubUser(
-                            id = deviceUid,
-                            nome = currentProfile.fullName,
-                            numero = "",
-                            senhaHash = currentProfile.passwordHash,
-                            saldo = currentProfile.balanceMT,
-                            status = "ATIVO",
-                            mt5IdConta = currentProfile.mt5AccountId.ifBlank { "859423" },
-                            licencaAtiva = currentProfile.licenseStatus.equals("Ativa", ignoreCase = true),
-                            licencaPlano = "trial",
-                            licencaProduto = "Fimaster EA Pro",
-                            licencaValidade = currentProfile.licenseExpiryDate,
-                            auditoriaUltimoDispositivo = deviceUid,
-                            auditoriaUltimoLogin = isoTimestamp,
-                            dataRegistro = isoTimestamp,
-                            ultimaAtualizacao = isoTimestamp
-                        )
+                // Se não há sessão vinculada a este dispositivo, permanece na tela de login normal
+                if (savedProfile == null || savedProfile.deviceId.isBlank() || savedProfile.deviceId != deviceUid || savedProfile.fullName.isBlank()) {
+                    _isLoggedIn.value = false
+                    _loggedUser.value = null
+                    if (isUserTriggered) {
+                        _messageState.value = "Dispositivo ainda não vinculado. Faça o primeiro login com Telefone e Senha."
                     }
+                    return@launch
                 }
 
-                val finalUser = if (existingUser != null && !forceRegisterNew) {
-                    // Usuário já cadastrado para este dispositivo: atualiza auditoria e login
-                    val updated = existingUser.copy(
-                        auditoriaUltimoDispositivo = deviceUid,
-                        auditoriaUltimoLogin = isoTimestamp,
-                        ultimaAtualizacao = isoTimestamp
-                    )
-                    val targetId = updated.id.ifBlank { deviceUid }
-                    repository.updateSilentSecurityInFirebase(targetId, deviceUid, isoTimestamp, _firebaseUrl.value, deviceUid)
-                    repository.saveUserToFirebaseWithDetails(updated, _firebaseUrl.value, deviceUid)
-                    updated
+                _loginLoading.value = true
+
+                // Tenta validar e atualizar dados com o Firebase ou GitHub
+                val targetLookup = savedProfile.mt5AccountId.ifBlank { savedProfile.fullName }
+                val remoteUser = withTimeoutOrNull(3000L) {
+                    repository.searchUserByPhoneFirebase(targetLookup, _firebaseUrl.value, deviceUid)
+                } ?: withTimeoutOrNull(3000L) {
+                    repository.searchUserByPhone(targetLookup, _adminConfig.value)
+                }
+
+                val finalUser = if (remoteUser != null) {
+                    // Verifica integridade da licença e status
+                    if (!remoteUser.licencaAtiva || remoteUser.status != "ATIVO" || remoteUser.reembolsoStatus == "APROVADO") {
+                        _isLoggedIn.value = false
+                        _loggedUser.value = null
+                        _loginLoading.value = false
+                        if (isUserTriggered) {
+                            _messageState.value = "Licença inativa ou revogada para esta conta."
+                        }
+                        return@launch
+                    }
+                    remoteUser
                 } else {
-                    // Novo usuário: registra automaticamente no Firebase com UID do dispositivo
-                    val newUser = deviceIdentityManager.createDefaultDeviceUser(deviceUid, effectiveFirebaseUid)
-                    repository.saveUserToFirebaseWithDetails(newUser, _firebaseUrl.value, deviceUid)
-                    repository.updateSilentSecurityInFirebase(deviceUid, deviceUid, isoTimestamp, _firebaseUrl.value, deviceUid)
-                    newUser
+                    // Fallback para perfil local já autenticado previamente neste aparelho
+                    GithubUser(
+                        id = if (savedProfile.mt5AccountId.isNotBlank()) "USR_${savedProfile.mt5AccountId}" else "USR_LOCAL",
+                        nome = savedProfile.fullName,
+                        numero = "",
+                        senhaHash = savedProfile.passwordHash,
+                        saldo = savedProfile.balanceMT,
+                        status = "ATIVO",
+                        mt5IdConta = savedProfile.mt5AccountId,
+                        licencaAtiva = savedProfile.licenseStatus.equals("Ativa", ignoreCase = true),
+                        licencaPlano = "Ativo",
+                        licencaProduto = "Fimaster EA Pro",
+                        licencaValidade = savedProfile.licenseExpiryDate,
+                        auditoriaUltimoDispositivo = deviceUid,
+                        auditoriaUltimoLogin = "",
+                        dataRegistro = "",
+                        ultimaAtualizacao = ""
+                    )
                 }
 
-                // Efetiva Login e ativação de sessão
                 _loggedUser.value = finalUser
                 _isLoggedIn.value = true
 
-                // Salva/atualiza perfil no banco local Room
-                val localProfile = UserProfile(
-                    id = 1,
-                    fullName = finalUser.nome,
-                    mt5AccountId = finalUser.mt5IdConta,
-                    passwordHash = finalUser.senhaHash,
-                    licenseStatus = if (finalUser.licencaAtiva) "Ativa" else "Expirada",
-                    licenseExpiryDate = finalUser.licencaValidade,
-                    balanceMT = finalUser.saldo,
-                    githubToken = _adminConfig.value.token,
-                    githubRepo = _adminConfig.value.repository,
-                    githubBranch = _adminConfig.value.branch,
-                    deviceId = deviceUid
-                )
-                repository.insertOrUpdateProfileLocally(localProfile)
-
                 if (finalUser.mt5IdConta.isNotBlank()) {
-                    repository.insertOrUpdateEaConfigLocally(EaConfigEntity(mt5AccountId = finalUser.mt5IdConta))
                     startStatusPolling(finalUser.mt5IdConta)
                 }
-
-                _messageState.value = "Dispositivo autenticado com sucesso! Bem-vindo, ${finalUser.nome}."
+                if (isUserTriggered) {
+                    _messageState.value = "Dispositivo reconhecido! Bem-vindo de volta, ${finalUser.nome}."
+                }
             } catch (e: Exception) {
                 e.printStackTrace()
-                _messageState.value = "Erro na autenticação do dispositivo: ${e.localizedMessage}"
+                if (isUserTriggered) {
+                    _messageState.value = "Erro ao autenticar dispositivo: ${e.localizedMessage}"
+                }
             } finally {
                 _loginLoading.value = false
             }
@@ -582,28 +565,16 @@ class PortalViewModel(
                     return@launch
                 }
 
-                // Password verification (SHA-256 with salt, without salt, plain text, or master password)
+                // Cryptographic password verification (PBKDF2, SHA-256 + Salt, MD5, timing-attack resistant)
                 val cleanPassword = passwordText.trim()
-                val rawStoredHash = user.senhaHash.trim()
-
-                val hashParts = rawStoredHash.split(":")
-                val storedHash = hashParts[0].trim()
-                val saltFromHash = if (hashParts.size > 1) hashParts[1].trim() else ""
-                val effectiveSalt = user.salt.trim().ifBlank { saltFromHash }
-
-                val calculatedHashWithSalt = GithubUserParser.sha256(cleanPassword + effectiveSalt)
-                val calculatedHashNoSalt = GithubUserParser.sha256(cleanPassword)
-
-                val isPasswordValid = cleanPassword.equals(rawStoredHash, ignoreCase = true) ||
-                                     cleanPassword.equals(storedHash, ignoreCase = true) ||
-                                     calculatedHashWithSalt.equals(storedHash, ignoreCase = true) ||
-                                     calculatedHashWithSalt.equals(rawStoredHash, ignoreCase = true) ||
-                                     calculatedHashNoSalt.equals(storedHash, ignoreCase = true) ||
-                                     calculatedHashNoSalt.equals(rawStoredHash, ignoreCase = true) ||
-                                     rawStoredHash.isBlank()
+                val isPasswordValid = com.example.data.security.CryptoSecurity.verifyPassword(
+                    plainPassword = cleanPassword,
+                    storedHash = user.senhaHash,
+                    storedSalt = user.salt
+                )
 
                 if (!isPasswordValid) {
-                    _messageState.value = "Senha incorreta. Tente novamente."
+                    _messageState.value = "Senha incorreta. Verifique sua senha e tente novamente."
                     _loginLoading.value = false
                     return@launch
                 }
@@ -711,7 +682,84 @@ class PortalViewModel(
         stopStatusPolling()
         _loggedUser.value = null
         _isLoggedIn.value = false
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val current = repository.getUserProfileDirect()
+                if (current != null) {
+                    repository.insertOrUpdateProfileLocally(current.copy(deviceId = ""))
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
         _messageState.value = "Sessão encerrada com sucesso."
+    }
+
+    /**
+     * Redefinir senha de acesso diretamente da tela de Login
+     */
+    fun resetPasswordFromLogin(phoneOrId: String, newPasswordText: String) {
+        if (phoneOrId.isBlank() || newPasswordText.isBlank()) {
+            _messageState.value = "Informe o telefone/ID e a nova senha."
+            return
+        }
+        if (newPasswordText.length < 4) {
+            _messageState.value = "A nova senha deve ter no mínimo 4 caracteres."
+            return
+        }
+
+        viewModelScope.launch {
+            _loginLoading.value = true
+            _messageState.value = "Localizando conta para redefinição..."
+            try {
+                val context = getApplication<Application>()
+                val deviceIdentityManager = com.example.data.security.DeviceIdentityManager(context)
+                val currentSilentUid = deviceIdentityManager.getSilentDeviceUid()
+
+                val user = withTimeoutOrNull(4000L) {
+                    repository.searchUserByPhoneFirebase(phoneOrId, _firebaseUrl.value, currentSilentUid)
+                } ?: withTimeoutOrNull(4000L) {
+                    repository.searchUserByPhone(phoneOrId, _adminConfig.value)
+                }
+
+                if (user == null) {
+                    _messageState.value = "Conta não encontrada para o identificador informado."
+                    _loginLoading.value = false
+                    return@launch
+                }
+
+                val newSalt = if (user.salt.isNotBlank()) user.salt else GithubUserParser.generateSalt()
+                val newHash = GithubUserParser.sha256(newPasswordText.trim() + newSalt)
+
+                val isoFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
+                    timeZone = TimeZone.getTimeZone("UTC")
+                }
+                val isoTimestamp = isoFormat.format(Date())
+
+                val updatedUser = user.copy(
+                    senhaHash = newHash,
+                    salt = newSalt,
+                    ultimaAtualizacao = isoTimestamp
+                )
+
+                // Save to Firebase and GitHub
+                withTimeoutOrNull(3000L) {
+                    if (_dataSourceMode.value == "FIREBASE") {
+                        repository.saveUserToFirebaseWithDetails(updatedUser, _firebaseUrl.value, currentSilentUid)
+                    } else {
+                        repository.saveUserToGithub(updatedUser, _adminConfig.value)
+                    }
+                }
+
+                repository.updatePassword(newHash)
+
+                _messageState.value = "✅ Senha alterada com sucesso! Você já pode entrar com sua nova senha."
+            } catch (e: Exception) {
+                _messageState.value = "Erro ao redefinir senha: ${e.localizedMessage ?: "Falha na conexão"}"
+            } finally {
+                _loginLoading.value = false
+            }
+        }
     }
 
     // Edit MT5 ID Serverless
@@ -826,25 +874,13 @@ class PortalViewModel(
             return
         }
 
-        // Validate current password
+        // Validate current password with cryptographic verification
         val cleanCurrentPass = currentPass.trim()
-        val rawUserHash = user.senhaHash.trim()
-
-        val hashParts = rawUserHash.split(":")
-        val cleanUserHash = hashParts[0].trim()
-        val saltFromHash = if (hashParts.size > 1) hashParts[1].trim() else ""
-        val effectiveSalt = user.salt.trim().ifBlank { saltFromHash }
-
-        val calcHashWithSalt = GithubUserParser.sha256(cleanCurrentPass + effectiveSalt)
-        val calcHashNoSalt = GithubUserParser.sha256(cleanCurrentPass)
-
-        val isValidPass = cleanCurrentPass.equals(rawUserHash, ignoreCase = true) ||
-                cleanCurrentPass.equals(cleanUserHash, ignoreCase = true) ||
-                calcHashWithSalt.equals(cleanUserHash, ignoreCase = true) ||
-                calcHashWithSalt.equals(rawUserHash, ignoreCase = true) ||
-                calcHashNoSalt.equals(cleanUserHash, ignoreCase = true) ||
-                calcHashNoSalt.equals(rawUserHash, ignoreCase = true) ||
-                rawUserHash.isBlank()
+        val isValidPass = com.example.data.security.CryptoSecurity.verifyPassword(
+            plainPassword = cleanCurrentPass,
+            storedHash = user.senhaHash,
+            storedSalt = user.salt
+        )
 
         if (!isValidPass) {
             _messageState.value = "A senha atual digitada está incorreta."
